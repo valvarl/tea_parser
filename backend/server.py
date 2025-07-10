@@ -1468,18 +1468,30 @@ async def test_ozon_connection():
             "error": str(e)
         }
 
-@api_router.get("/debug/scraper-status")
-async def get_scraper_status():
-    """Get detailed scraper status and configuration"""
-    return {
-        "debug_mode": scraper.debug_mode,
-        "region_settings": scraper.region_settings,
-        "captcha_encounters": scraper.captcha_encounters,
-        "request_count": scraper.request_count,
-        "browser_initialized": scraper.browser is not None,
-        "rns_uuid": scraper.rns_uuid[:20] + "..." if scraper.rns_uuid else None,
-        "csrf_token": scraper.csrf_token[:20] + "..." if scraper.csrf_token else None
-    }
+@api_router.get("/export/csv")
+async def export_products_csv():
+    """Export products to CSV format"""
+    products = await db.tea_products.find().to_list(10000)
+    
+    # Convert to CSV-like format
+    csv_data = []
+    for product in products:
+        # Remove MongoDB ObjectId to avoid serialization issues
+        if "_id" in product:
+            del product["_id"]
+            
+        csv_data.append({
+            "id": product.get("id"),
+            "name": product.get("name"),
+            "price": product.get("price"),
+            "rating": product.get("rating"),
+            "tea_type": product.get("tea_type"),
+            "tea_region": product.get("tea_region"),
+            "is_pressed": product.get("is_pressed"),
+            "scraped_at": product.get("scraped_at")
+        })
+    
+    return {"data": csv_data, "count": len(csv_data)}
 
 # Include the router in the main app
 app.include_router(api_router)
