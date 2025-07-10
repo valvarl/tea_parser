@@ -1123,7 +1123,7 @@ def generate_search_queries(limit: int = 50) -> List[str]:
 
 # Background task for scraping
 async def scrape_tea_products_task(search_term: str, task_id: str):
-    """Background task for scraping tea products"""
+    """Background task for scraping tea products with improved error handling"""
     
     # Update task status
     await db.scraping_tasks.update_one(
@@ -1137,32 +1137,70 @@ async def scrape_tea_products_task(search_term: str, task_id: str):
     )
     
     try:
+        logger.info(f"🚀 Starting scraping task {task_id} for search term: {search_term}")
+        
         # Initialize browser
         await scraper.init_browser()
+        
+        logger.info(f"🔍 Searching for products with term: {search_term}")
         
         # Search for products
         products = await scraper.search_products(search_term, max_pages=3)
         
+        logger.info(f"📊 Found {len(products)} products to process")
+        
+        if not products:
+            logger.warning("⚠️ No products found - this might indicate geo-blocking or API changes")
+            
+            # Update task with warning
+            await db.scraping_tasks.update_one(
+                {"id": task_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "completed_at": datetime.utcnow(),
+                        "total_products": 0,
+                        "scraped_products": 0,
+                        "failed_products": 0,
+                        "error_message": "No products found - possible geo-blocking or API changes"
+                    }
+                }
+            )
+            return
+        
         scraped_count = 0
         failed_count = 0
         
-        for product_data in products:
+        for i, product_data in enumerate(products):
             try:
+                logger.info(f"📝 Processing product {i+1}/{len(products)}: {product_data.get('name', 'Unknown')[:50]}...")
+                
+                # Validate product data
+                if not product_data.get("name"):
+                    logger.warning(f"⚠️ Product {i+1} has no name, skipping")
+                    failed_count += 1
+                    continue
+                
                 # Create tea product
                 tea_product = TeaProduct(**product_data)
                 
                 # Check if product already exists
-                existing = await db.tea_products.find_one({"ozon_id": tea_product.ozon_id})
+                existing = None
+                if tea_product.ozon_id:
+                    existing = await db.tea_products.find_one({"ozon_id": tea_product.ozon_id})
                 
                 if existing:
                     # Update existing product
+                    tea_product.updated_at = datetime.utcnow()
                     await db.tea_products.update_one(
                         {"ozon_id": tea_product.ozon_id},
                         {"$set": tea_product.dict()}
                     )
+                    logger.info(f"✅ Updated existing product: {tea_product.ozon_id}")
                 else:
                     # Insert new product
                     await db.tea_products.insert_one(tea_product.dict())
+                    logger.info(f"✅ Inserted new product: {tea_product.name[:50]}...")
                 
                 scraped_count += 1
                 
@@ -1172,31 +1210,48 @@ async def scrape_tea_products_task(search_term: str, task_id: str):
                     {
                         "$set": {
                             "scraped_products": scraped_count,
-                            "failed_products": failed_count
+                            "failed_products": failed_count,
+                            "total_products": len(products)
                         }
                     }
                 )
                 
             except Exception as e:
-                logger.error(f"Error processing product: {e}")
+                logger.error(f"❌ Error processing product {i+1}: {e}")
                 failed_count += 1
+                
+                # Update task with current failure count
+                await db.scraping_tasks.update_one(
+                    {"id": task_id},
+                    {
+                        "$set": {
+                            "failed_products": failed_count
+                        }
+                    }
+                )
         
         # Update task completion
+        status = "completed" if scraped_count > 0 else "failed"
+        error_message = None if scraped_count > 0 else f"Failed to scrape any products out of {len(products)} found"
+        
         await db.scraping_tasks.update_one(
             {"id": task_id},
             {
                 "$set": {
-                    "status": "completed",
+                    "status": status,
                     "completed_at": datetime.utcnow(),
                     "total_products": len(products),
                     "scraped_products": scraped_count,
-                    "failed_products": failed_count
+                    "failed_products": failed_count,
+                    "error_message": error_message
                 }
             }
         )
         
+        logger.info(f"🎉 Task {task_id} completed: {scraped_count} products scraped, {failed_count} failed")
+        
     except Exception as e:
-        logger.error(f"Error in scraping task: {e}")
+        logger.error(f"❌ Critical error in scraping task {task_id}: {e}")
         
         # Update task failure
         await db.scraping_tasks.update_one(
@@ -1205,14 +1260,18 @@ async def scrape_tea_products_task(search_term: str, task_id: str):
                 "$set": {
                     "status": "failed",
                     "completed_at": datetime.utcnow(),
-                    "error_message": str(e)
+                    "error_message": f"Critical error: {str(e)}"
                 }
             }
         )
     
     finally:
         # Close browser
-        await scraper.close_browser()
+        try:
+            await scraper.close_browser()
+            logger.info(f"🔒 Browser closed for task {task_id}")
+        except Exception as e:
+            logger.error(f"Error closing browser for task {task_id}: {e}")
 
 # API Routes
 @api_router.get("/")
