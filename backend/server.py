@@ -750,6 +750,10 @@ async def get_tea_product(product_id: str):
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     
+    # Remove MongoDB ObjectId to avoid serialization issues
+    if "_id" in product:
+        del product["_id"]
+    
     return TeaProduct(**product)
 
 @api_router.delete("/products/{product_id}")
