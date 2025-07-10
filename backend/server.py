@@ -221,11 +221,24 @@ class OzonScraper:
         self.base_url = "https://www.ozon.ru"
         self.search_url = "https://www.ozon.ru/search/"
         self.api_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
+        self.graphql_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
         self.session = None
         self.browser = None
         self.page = None
         self.request_count = 0
         self.captcha_encounters = 0
+        self.debug_mode = True
+        self.rns_uuid = None
+        self.csrf_token = None
+        self.cookies = {}
+        
+        # Russian region settings (Moscow)
+        self.region_settings = {
+            "ozon_regions": "213000000",  # Moscow region code
+            "geo_region": "Moscow",
+            "timezone": "Europe/Moscow",
+            "accept_language": "ru-RU,ru;q=0.9,en;q=0.8"
+        }
         
     async def init_browser(self):
         """Initialize Playwright browser with stealth settings"""
