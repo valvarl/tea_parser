@@ -717,6 +717,12 @@ async def get_scraping_status(task_id: str):
 async def get_scraping_tasks():
     """Get all scraping tasks"""
     tasks = await db.scraping_tasks.find().sort("created_at", -1).to_list(100)
+    
+    # Remove MongoDB ObjectId to avoid serialization issues
+    for task in tasks:
+        if "_id" in task:
+            del task["_id"]
+    
     return tasks
 
 @api_router.get("/products", response_model=List[TeaProduct])
