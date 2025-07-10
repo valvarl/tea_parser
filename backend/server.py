@@ -1416,30 +1416,70 @@ async def bulk_delete_products(product_ids: List[str]):
         "message": f"Deleted {result.deleted_count} products"
     }
 
-@api_router.get("/export/csv")
-async def export_products_csv():
-    """Export products to CSV format"""
-    products = await db.tea_products.find().to_list(10000)
-    
-    # Convert to CSV-like format
-    csv_data = []
-    for product in products:
-        # Remove MongoDB ObjectId to avoid serialization issues
-        if "_id" in product:
-            del product["_id"]
-            
-        csv_data.append({
-            "id": product.get("id"),
-            "name": product.get("name"),
-            "price": product.get("price"),
-            "rating": product.get("rating"),
-            "tea_type": product.get("tea_type"),
-            "tea_region": product.get("tea_region"),
-            "is_pressed": product.get("is_pressed"),
-            "scraped_at": product.get("scraped_at")
-        })
-    
-    return {"data": csv_data, "count": len(csv_data)}
+@api_router.get("/debug/test-ozon")
+async def test_ozon_connection():
+    """Test endpoint to check Ozon connection and geo-blocking"""
+    try:
+        # Create a temporary scraper instance
+        test_scraper = OzonScraper()
+        await test_scraper.init_browser()
+        
+        # Test basic connection
+        await test_scraper.page.goto("https://www.ozon.ru", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        
+        # Check page content
+        title = await test_scraper.page.title()
+        url = test_scraper.page.url
+        
+        # Check for geo-blocking indicators
+        content = await test_scraper.page.content()
+        geo_blocked = any(indicator in content.lower() for indicator in [
+            "выберите ваш город", "choose your city", "select your region"
+        ])
+        
+        # Test search page
+        await test_scraper.page.goto("https://www.ozon.ru/search/?text=пуэр", wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        
+        search_content = await test_scraper.page.content()
+        no_products = "ничего не найдено" in search_content.lower()
+        
+        # Get cookies
+        cookies = await test_scraper.page.context.cookies()
+        cookie_info = {cookie['name']: cookie['value'][:20] + "..." for cookie in cookies}
+        
+        await test_scraper.close_browser()
+        
+        return {
+            "status": "success",
+            "title": title,
+            "url": url,
+            "geo_blocked": geo_blocked,
+            "no_products_found": no_products,
+            "cookies": cookie_info,
+            "rns_uuid": test_scraper.rns_uuid[:20] + "..." if test_scraper.rns_uuid else None,
+            "csrf_token": test_scraper.csrf_token[:20] + "..." if test_scraper.csrf_token else None
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+@api_router.get("/debug/scraper-status")
+async def get_scraper_status():
+    """Get detailed scraper status and configuration"""
+    return {
+        "debug_mode": scraper.debug_mode,
+        "region_settings": scraper.region_settings,
+        "captcha_encounters": scraper.captcha_encounters,
+        "request_count": scraper.request_count,
+        "browser_initialized": scraper.browser is not None,
+        "rns_uuid": scraper.rns_uuid[:20] + "..." if scraper.rns_uuid else None,
+        "csrf_token": scraper.csrf_token[:20] + "..." if scraper.csrf_token else None
+    }
 
 # Include the router in the main app
 app.include_router(api_router)
