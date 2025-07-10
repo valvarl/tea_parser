@@ -300,6 +300,34 @@ function App() {
               />
             </div>
 
+            {/* Geo-blocking Alert */}
+            {stats.total_products === 0 && stats.total_tasks > 0 && (
+              <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
+                <div className="flex items-start">
+                  <div className="text-yellow-600 text-2xl mr-4">⚠️</div>
+                  <div>
+                    <h3 className="text-lg font-semibold text-yellow-800 mb-2">
+                      Возможная проблема с гео-блокировкой
+                    </h3>
+                    <p className="text-yellow-700 mb-4">
+                      Все задачи парсинга завершаются с 0 товаров. Это может указывать на:
+                    </p>
+                    <ul className="text-yellow-700 space-y-1 mb-4">
+                      <li>• 🌍 <strong>Гео-блокировка:</strong> Ozon.ru блокирует не-российские IP адреса</li>
+                      <li>• 🔐 <strong>Отсутствие токенов:</strong> Нужны российские proxy и CSRF токены</li>
+                      <li>• 🏷️ <strong>Отсутствие региона:</strong> Требуется cookie ozon_regions=213000000 (Москва)</li>
+                    </ul>
+                    <div className="bg-yellow-100 p-3 rounded-lg">
+                      <p className="text-sm text-yellow-800">
+                        <strong>Рекомендация:</strong> Для полноценной работы парсера требуются российские proxy-серверы 
+                        и настройка региона. В текущем демо-режиме система обнаруживает и логирует проблемы доступа.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="bg-white rounded-lg shadow-md p-6">
               <h3 className="text-lg font-semibold mb-4">Последние задачи</h3>
               <div className="space-y-3">
@@ -308,6 +336,9 @@ function App() {
                     <div>
                       <p className="font-medium">{task.search_term}</p>
                       <p className="text-sm text-gray-500">{formatDate(task.created_at)}</p>
+                      {task.error_message && (
+                        <p className="text-sm text-red-600 mt-1">{task.error_message}</p>
+                      )}
                     </div>
                     <div className="flex items-center space-x-3">
                       <span className="text-sm text-gray-600">
