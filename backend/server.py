@@ -734,6 +734,12 @@ async def get_tea_products(skip: int = 0, limit: int = 50, tea_type: Optional[st
         query["tea_type"] = tea_type
     
     products = await db.tea_products.find(query).skip(skip).limit(limit).sort("scraped_at", -1).to_list(limit)
+    
+    # Remove MongoDB ObjectId to avoid serialization issues
+    for product in products:
+        if "_id" in product:
+            del product["_id"]
+    
     return [TeaProduct(**product) for product in products]
 
 @api_router.get("/products/{product_id}")
