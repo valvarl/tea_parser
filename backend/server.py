@@ -707,6 +707,10 @@ async def get_scraping_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    # Remove MongoDB ObjectId to avoid serialization issues
+    if "_id" in task:
+        del task["_id"]
+    
     return task
 
 @api_router.get("/scrape/tasks")
