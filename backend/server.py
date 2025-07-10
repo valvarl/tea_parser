@@ -832,6 +832,10 @@ async def export_products_csv():
     # Convert to CSV-like format
     csv_data = []
     for product in products:
+        # Remove MongoDB ObjectId to avoid serialization issues
+        if "_id" in product:
+            del product["_id"]
+            
         csv_data.append({
             "id": product.get("id"),
             "name": product.get("name"),
