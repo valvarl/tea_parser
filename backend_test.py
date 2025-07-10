@@ -523,10 +523,22 @@ class TeaScrapingAPITester:
         self.test_categories_endpoint()
         self.test_search_queries_endpoint()
         
-        # Scraping functionality
+        # Debug endpoints (NEW - for geo-blocking detection)
+        print("🔍 TESTING DEBUG ENDPOINTS FOR GEO-BLOCKING DETECTION")
+        print("-" * 50)
+        self.test_debug_ozon_endpoint()
+        self.test_debug_scraper_status_endpoint()
+        self.test_russian_region_settings()
+        print()
+        
+        # Scraping functionality with geo-blocking detection
+        print("🚀 TESTING SCRAPING WITH GEO-BLOCKING DETECTION")
+        print("-" * 50)
+        self.test_scraping_with_geo_blocking_detection()
         self.test_start_scraping()
         self.test_task_status()
         self.test_list_tasks()
+        print()
         
         # Export functionality
         self.test_export_csv()
