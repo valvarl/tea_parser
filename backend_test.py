@@ -577,6 +577,8 @@ class TeaScrapingAPITester:
         print("CRITICAL FUNCTIONALITY STATUS:")
         critical_tests = [
             "Root Endpoint",
+            "Debug Ozon Connection",
+            "Geo-blocking Detection in Task", 
             "Start Scraping", 
             "Task Status",
             "Products Endpoint",
