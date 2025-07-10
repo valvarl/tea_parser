@@ -530,12 +530,149 @@ class OzonScraper:
         return True
     
     async def search_products(self, query: str, max_pages: int = 5) -> List[Dict]:
-        """Search for tea products on Ozon"""
+        """Search for tea products on Ozon with improved data extraction"""
+        products = []
+        
+        try:
+            # First try API search
+            logger.info(f"Starting API search for: {query}")
+            
+            # Try to get category ID for tea products
+            tea_category_id = await self.get_tea_category_id()
+            
+            api_response = await self.search_products_api(query, tea_category_id)
+            
+            if api_response and 'data' in api_response:
+                search_data = api_response.get('data', {}).get('searchProducts', {})
+                api_products = search_data.get('products', [])
+                
+                if api_products:
+                    logger.info(f"API search found {len(api_products)} products")
+                    
+                    for product in api_products:
+                        try:
+                            product_data = await self.parse_api_product(product)
+                            if product_data:
+                                products.append(product_data)
+                        except Exception as e:
+                            logger.error(f"Error parsing API product: {e}")
+                            continue
+                    
+                    return products
+                else:
+                    logger.warning("API search returned empty products list")
+            
+            # Fallback to HTML scraping if API fails
+            logger.info("Falling back to HTML scraping")
+            return await self.search_products_html(query, max_pages)
+            
+        except Exception as e:
+            logger.error(f"Error in search_products: {e}")
+            # Try HTML scraping as final fallback
+            return await self.search_products_html(query, max_pages)
+    
+    async def get_tea_category_id(self) -> str:
+        """Get category ID for tea products"""
+        try:
+            # Navigate to tea category page
+            tea_url = "https://www.ozon.ru/category/chay-10498/"
+            await self.page.goto(tea_url, wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            
+            # Extract category ID from URL or page data
+            current_url = self.page.url
+            category_match = re.search(r'category/.*?-(\d+)/', current_url)
+            if category_match:
+                category_id = category_match.group(1)
+                logger.info(f"Found tea category ID: {category_id}")
+                return category_id
+            
+            # Try to find it in page data
+            content = await self.page.content()
+            category_match = re.search(r'"categoryId":"(\d+)"', content)
+            if category_match:
+                category_id = category_match.group(1)
+                logger.info(f"Extracted tea category ID from page: {category_id}")
+                return category_id
+            
+        except Exception as e:
+            logger.error(f"Error getting tea category ID: {e}")
+        
+        return "10498"  # Default tea category ID
+    
+    async def parse_api_product(self, product: Dict) -> Dict:
+        """Parse product data from API response"""
+        try:
+            product_data = {
+                "ozon_id": str(product.get("id", "")),
+                "name": product.get("title", ""),
+                "product_url": urljoin(self.base_url, product.get("url", "")),
+                "images": []
+            }
+            
+            # Parse price
+            price_data = product.get("price", {})
+            if price_data:
+                product_data["price"] = price_data.get("current")
+                product_data["original_price"] = price_data.get("original")
+            
+            # Parse rating
+            rating_data = product.get("rating", {})
+            if rating_data:
+                product_data["rating"] = rating_data.get("value")
+                product_data["reviews_count"] = rating_data.get("count")
+            
+            # Parse images
+            images = product.get("images", [])
+            if images:
+                product_data["images"] = [img.get("original") or img.get("thumbnail") for img in images if img]
+            
+            # Parse seller
+            seller_data = product.get("seller", {})
+            if seller_data:
+                product_data["seller"] = seller_data.get("name")
+            
+            # Parse availability
+            product_data["availability"] = product.get("availability", "")
+            
+            # Parse delivery
+            delivery_data = product.get("delivery", {})
+            if delivery_data:
+                product_data["delivery_info"] = delivery_data.get("text")
+            
+            # Parse attributes
+            attributes = product.get("attributes", [])
+            if attributes:
+                product_data["characteristics"] = {
+                    attr.get("name"): attr.get("value") 
+                    for attr in attributes if attr.get("name")
+                }
+            
+            # Set category
+            product_data["category_id"] = product.get("categoryId")
+            
+            # Classify tea type
+            if product_data["name"]:
+                product_data.update(self.classify_tea_type(product_data["name"]))
+            
+            # Store raw API data for debugging
+            product_data["raw_data"] = product
+            
+            return product_data
+            
+        except Exception as e:
+            logger.error(f"Error parsing API product: {e}")
+            return {}
+    
+    async def search_products_html(self, query: str, max_pages: int = 5) -> List[Dict]:
+        """Fallback HTML scraping method"""
         products = []
         
         try:
             # Navigate to search page
-            search_url = f"{self.search_url}?text={query}&category_id=&type=&page=1"
+            search_url = f"{self.search_url}?text={query}&category_id=10498"
+            logger.info(f"HTML search URL: {search_url}")
+            
             await self.page.goto(search_url, wait_until="domcontentloaded")
             
             # Handle initial anti-bot check
@@ -545,21 +682,31 @@ class OzonScraper:
                 return products
             
             # Wait for products to load
-            await asyncio.sleep(random.uniform(2, 5))
+            await asyncio.sleep(random.uniform(3, 6))
+            
+            # Check for "no products found" or region selection
+            if await self.check_for_no_products():
+                logger.warning("No products found - possible geo-blocking")
+                return products
             
             # Extract products from current page
             page_products = await self.extract_products_from_page()
             products.extend(page_products)
             
+            logger.info(f"Found {len(page_products)} products on page 1")
+            
             # Navigate through additional pages
             for page_num in range(2, max_pages + 1):
+                if len(products) >= 50:  # Reasonable limit
+                    break
+                    
                 try:
                     # Navigate to next page
-                    next_url = f"{self.search_url}?text={query}&category_id=&type=&page={page_num}"
+                    next_url = f"{self.search_url}?text={query}&category_id=10498&page={page_num}"
                     await self.page.goto(next_url, wait_until="domcontentloaded")
                     
                     # Random delay
-                    await asyncio.sleep(random.uniform(3, 7))
+                    await asyncio.sleep(random.uniform(4, 8))
                     
                     # Extract products
                     page_products = await self.extract_products_from_page()
@@ -567,18 +714,53 @@ class OzonScraper:
                         break
                     
                     products.extend(page_products)
+                    logger.info(f"Found {len(page_products)} products on page {page_num}")
                     
                     # Rate limiting
-                    await asyncio.sleep(random.uniform(2, 5))
+                    await asyncio.sleep(random.uniform(3, 6))
                     
                 except Exception as e:
                     logger.error(f"Error scraping page {page_num}: {e}")
                     break
                     
         except Exception as e:
-            logger.error(f"Error searching products: {e}")
+            logger.error(f"Error in HTML search: {e}")
         
         return products
+    
+    async def check_for_no_products(self) -> bool:
+        """Check if page shows no products found"""
+        try:
+            content = await self.page.content()
+            
+            # Check for various "no products" indicators
+            no_products_indicators = [
+                "ничего не найдено",
+                "товаров не найдено", 
+                "нет товаров",
+                "выберите ваш город",
+                "choose your city",
+                "nothing found",
+                "no products"
+            ]
+            
+            content_lower = content.lower()
+            for indicator in no_products_indicators:
+                if indicator in content_lower:
+                    logger.warning(f"No products indicator found: {indicator}")
+                    return True
+            
+            # Check for empty results container
+            results_container = await self.page.query_selector("[data-widget='searchResultsV2']")
+            if not results_container:
+                logger.warning("No search results container found")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking for no products: {e}")
+            return False
     
     async def extract_products_from_page(self) -> List[Dict]:
         """Extract product information from current page"""
