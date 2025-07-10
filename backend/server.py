@@ -763,23 +763,70 @@ class OzonScraper:
             return False
     
     async def extract_products_from_page(self) -> List[Dict]:
-        """Extract product information from current page"""
+        """Extract product information from current page with improved selectors"""
         products = []
         
         try:
-            # Wait for products to load
-            await self.page.wait_for_selector("[data-widget='searchResultsV2']", timeout=10000)
+            # Wait for products to load with multiple possible selectors
+            selectors_to_try = [
+                "[data-widget='searchResultsV2']",
+                "[data-widget='searchResults']", 
+                ".search-results",
+                ".product-card",
+                "[data-test-id='product-card']"
+            ]
             
-            # Extract product cards
-            product_cards = await self.page.query_selector_all("[data-widget='searchResultsV2'] [data-test-id='tile-clickable-element']")
+            container = None
+            for selector in selectors_to_try:
+                try:
+                    await self.page.wait_for_selector(selector, timeout=5000)
+                    container = await self.page.query_selector(selector)
+                    if container:
+                        logger.info(f"Found products container with selector: {selector}")
+                        break
+                except:
+                    continue
             
-            for card in product_cards:
+            if not container:
+                logger.warning("No products container found")
+                return products
+            
+            # Try different product card selectors
+            card_selectors = [
+                "[data-test-id='tile-clickable-element']",
+                "[data-widget='searchResultsV2'] > div",
+                ".product-card",
+                "[data-test-id='product-card']",
+                ".tile-clickable-element"
+            ]
+            
+            product_cards = []
+            for selector in card_selectors:
+                try:
+                    cards = await self.page.query_selector_all(selector)
+                    if cards:
+                        product_cards = cards
+                        logger.info(f"Found {len(cards)} product cards with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not product_cards:
+                # Try to find products in page content
+                content = await self.page.content()
+                await self.save_debug_html(content)
+                logger.warning("No product cards found with any selector")
+                return products
+            
+            # Extract data from each card
+            for i, card in enumerate(product_cards[:20]):  # Limit to first 20 for performance
                 try:
                     product_data = await self.extract_product_data(card)
-                    if product_data:
+                    if product_data and product_data.get("name"):
                         products.append(product_data)
+                        logger.info(f"Extracted product {i+1}: {product_data.get('name', 'Unknown')[:50]}...")
                 except Exception as e:
-                    logger.error(f"Error extracting product data: {e}")
+                    logger.error(f"Error extracting product data from card {i}: {e}")
                     continue
                     
         except Exception as e:
@@ -787,62 +834,157 @@ class OzonScraper:
         
         return products
     
+    async def save_debug_html(self, content: str):
+        """Save HTML content for debugging"""
+        try:
+            if self.debug_mode:
+                import aiofiles
+                debug_file = f"/tmp/ozon_debug_{int(time.time())}.html"
+                async with aiofiles.open(debug_file, 'w', encoding='utf-8') as f:
+                    await f.write(content)
+                logger.info(f"Debug HTML saved to: {debug_file}")
+        except Exception as e:
+            logger.error(f"Error saving debug HTML: {e}")
+    
     async def extract_product_data(self, card_element) -> Dict:
-        """Extract individual product data from card element"""
+        """Extract individual product data from card element with improved selectors"""
         product_data = {}
         
         try:
-            # Extract name
-            name_element = await card_element.query_selector("[data-test-id='tile-name']")
-            if name_element:
-                product_data["name"] = await name_element.text_content()
+            # Try multiple name selectors
+            name_selectors = [
+                "[data-test-id='tile-name']",
+                ".tile-name",
+                "[data-test-id='product-name']",
+                ".product-name",
+                "h3",
+                ".title"
+            ]
             
-            # Extract price
-            price_element = await card_element.query_selector("[data-test-id='tile-price']")
-            if price_element:
-                price_text = await price_element.text_content()
-                # Extract numeric price
-                price_match = re.search(r'(\d+)', price_text.replace(' ', ''))
-                if price_match:
-                    product_data["price"] = float(price_match.group(1))
+            for selector in name_selectors:
+                try:
+                    name_element = await card_element.query_selector(selector)
+                    if name_element:
+                        name = await name_element.text_content()
+                        if name and name.strip():
+                            product_data["name"] = name.strip()
+                            break
+                except:
+                    continue
             
-            # Extract rating
-            rating_element = await card_element.query_selector("[data-test-id='tile-rating']")
-            if rating_element:
-                rating_text = await rating_element.text_content()
-                rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                if rating_match:
-                    product_data["rating"] = float(rating_match.group(1))
+            # Try multiple price selectors
+            price_selectors = [
+                "[data-test-id='tile-price']",
+                ".tile-price", 
+                "[data-test-id='product-price']",
+                ".product-price",
+                ".price"
+            ]
             
-            # Extract reviews count
-            reviews_element = await card_element.query_selector("[data-test-id='tile-review-count']")
-            if reviews_element:
-                reviews_text = await reviews_element.text_content()
-                reviews_match = re.search(r'(\d+)', reviews_text)
-                if reviews_match:
-                    product_data["reviews_count"] = int(reviews_match.group(1))
+            for selector in price_selectors:
+                try:
+                    price_element = await card_element.query_selector(selector)
+                    if price_element:
+                        price_text = await price_element.text_content()
+                        if price_text:
+                            # Extract numeric price
+                            price_match = re.search(r'(\d+(?:\s?\d+)*)', price_text.replace(' ', ''))
+                            if price_match:
+                                product_data["price"] = float(price_match.group(1).replace(' ', ''))
+                                break
+                except:
+                    continue
             
-            # Extract product URL
-            link_element = await card_element.query_selector("a")
-            if link_element:
-                href = await link_element.get_attribute("href")
-                if href:
-                    product_data["product_url"] = urljoin(self.base_url, href)
-                    # Extract product ID from URL
-                    id_match = re.search(r'/product/.*?-(\d+)/', href)
-                    if id_match:
-                        product_data["ozon_id"] = id_match.group(1)
+            # Try multiple rating selectors
+            rating_selectors = [
+                "[data-test-id='tile-rating']",
+                ".tile-rating",
+                "[data-test-id='product-rating']", 
+                ".product-rating",
+                ".rating"
+            ]
             
-            # Extract image
-            img_element = await card_element.query_selector("img")
-            if img_element:
-                img_src = await img_element.get_attribute("src")
-                if img_src:
-                    product_data["images"] = [img_src]
+            for selector in rating_selectors:
+                try:
+                    rating_element = await card_element.query_selector(selector)
+                    if rating_element:
+                        rating_text = await rating_element.text_content()
+                        if rating_text:
+                            rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                            if rating_match:
+                                product_data["rating"] = float(rating_match.group(1))
+                                break
+                except:
+                    continue
+            
+            # Try multiple review count selectors
+            review_selectors = [
+                "[data-test-id='tile-review-count']",
+                ".tile-review-count",
+                "[data-test-id='product-reviews']",
+                ".product-reviews"
+            ]
+            
+            for selector in review_selectors:
+                try:
+                    reviews_element = await card_element.query_selector(selector)
+                    if reviews_element:
+                        reviews_text = await reviews_element.text_content()
+                        if reviews_text:
+                            reviews_match = re.search(r'(\d+)', reviews_text)
+                            if reviews_match:
+                                product_data["reviews_count"] = int(reviews_match.group(1))
+                                break
+                except:
+                    continue
+            
+            # Try multiple link selectors
+            link_selectors = [
+                "a",
+                "[data-test-id='tile-clickable']",
+                ".tile-clickable"
+            ]
+            
+            for selector in link_selectors:
+                try:
+                    link_element = await card_element.query_selector(selector)
+                    if link_element:
+                        href = await link_element.get_attribute("href")
+                        if href:
+                            product_data["product_url"] = urljoin(self.base_url, href)
+                            # Extract product ID from URL
+                            id_match = re.search(r'/product/.*?-(\d+)/', href)
+                            if id_match:
+                                product_data["ozon_id"] = id_match.group(1)
+                            break
+                except:
+                    continue
+            
+            # Try multiple image selectors
+            img_selectors = [
+                "img",
+                "[data-test-id='tile-image']",
+                ".tile-image"
+            ]
+            
+            for selector in img_selectors:
+                try:
+                    img_element = await card_element.query_selector(selector)
+                    if img_element:
+                        img_src = await img_element.get_attribute("src")
+                        if img_src:
+                            product_data["images"] = [img_src]
+                            break
+                except:
+                    continue
             
             # Classify tea type based on name
-            if "name" in product_data:
+            if product_data.get("name"):
                 product_data.update(self.classify_tea_type(product_data["name"]))
+            
+            # Add debug info
+            if self.debug_mode and product_data:
+                logger.info(f"🔍 DEBUG PRODUCT: {json.dumps(product_data, ensure_ascii=False, indent=2)}")
             
             return product_data
             
