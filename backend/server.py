@@ -1468,6 +1468,61 @@ async def test_ozon_connection():
             "error": str(e)
         }
 
+@api_router.get("/debug/scraper-status")
+async def get_scraper_status():
+    """Get current scraper configuration and status"""
+    try:
+        # Get current running tasks
+        running_tasks = await db.scraping_tasks.count_documents({"status": "running"})
+        
+        # Get scraper configuration
+        scraper_config = {
+            "base_url": scraper.base_url,
+            "search_url": scraper.search_url,
+            "debug_mode": scraper.debug_mode,
+            "region_settings": scraper.region_settings,
+            "request_count": scraper.request_count,
+            "captcha_encounters": scraper.captcha_encounters,
+            "captcha_solve_count": captcha_solver.solve_count,
+            "proxy_pool_size": len(proxy_pool.proxies),
+            "failed_proxies": len(proxy_pool.failed_proxies)
+        }
+        
+        # Get recent task statistics
+        recent_tasks = await db.scraping_tasks.find().sort("created_at", -1).limit(5).to_list(5)
+        task_summary = []
+        
+        for task in recent_tasks:
+            if "_id" in task:
+                del task["_id"]
+            task_summary.append({
+                "id": task.get("id"),
+                "status": task.get("status"),
+                "search_term": task.get("search_term"),
+                "total_products": task.get("total_products", 0),
+                "error_message": task.get("error_message")
+            })
+        
+        return {
+            "status": "active",
+            "running_tasks": running_tasks,
+            "scraper_config": scraper_config,
+            "recent_tasks": task_summary,
+            "tea_keywords_count": {
+                "base_terms": len(TEA_KEYWORDS["base_terms"]),
+                "forms": len(TEA_KEYWORDS["forms"]),
+                "regions": len(TEA_KEYWORDS["regions"]),
+                "grades": len(TEA_KEYWORDS["grades"]),
+                "years": len(TEA_KEYWORDS["years"])
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
 @api_router.get("/export/csv")
 async def export_products_csv():
     """Export products to CSV format"""
