@@ -241,10 +241,10 @@ class OzonScraper:
         }
         
     async def init_browser(self):
-        """Initialize Playwright browser with stealth settings"""
+        """Initialize Playwright browser with stealth settings and Russian region"""
         self.playwright = await async_playwright().start()
         
-        # Browser configuration for stealth
+        # Browser configuration for stealth with Russian locale
         self.browser = await self.playwright.chromium.launch(
             headless=True,
             args=[
@@ -255,17 +255,36 @@ class OzonScraper:
                 '--disable-gpu',
                 '--window-size=1920,1080',
                 '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
+                '--disable-features=VizDisplayCompositor',
+                '--lang=ru-RU'
             ]
         )
         
-        # Create context with stealth settings
+        # Create context with Russian settings
         context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
             user_agent=ua.random,
             locale='ru-RU',
-            timezone_id='Europe/Moscow'
+            timezone_id='Europe/Moscow',
+            extra_http_headers={
+                'Accept-Language': self.region_settings["accept_language"],
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
         )
+        
+        # Set Russian region cookie
+        await context.add_cookies([
+            {
+                'name': 'ozon_regions',
+                'value': self.region_settings["ozon_regions"],
+                'domain': '.ozon.ru',
+                'path': '/'
+            }
+        ])
         
         # Add stealth scripts
         await context.add_init_script("""
@@ -280,6 +299,13 @@ class OzonScraper:
             Object.defineProperty(navigator, 'languages', {
                 get: () => ['ru-RU', 'ru', 'en-US', 'en'],
             });
+            
+            // Mock timezone
+            Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {
+                value: function() {
+                    return { timeZone: 'Europe/Moscow' };
+                }
+            });
         """)
         
         self.page = await context.new_page()
@@ -288,6 +314,176 @@ class OzonScraper:
         proxy = proxy_pool.get_proxy()
         if proxy:
             logger.info(f"Using proxy: {proxy}")
+            
+        # Initialize session by visiting main page and getting tokens
+        await self.initialize_session()
+    
+    async def initialize_session(self):
+        """Initialize session with proper cookies and tokens"""
+        try:
+            logger.info("Initializing Ozon session...")
+            
+            # Visit main page to get cookies and tokens
+            await self.page.goto(self.base_url, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(2, 4))
+            
+            # Get cookies from browser
+            cookies = await self.page.context.cookies()
+            
+            # Extract important tokens
+            for cookie in cookies:
+                if cookie['name'] == '__Secure-rns_uuid':
+                    self.rns_uuid = cookie['value']
+                    logger.info(f"Got rns_uuid: {self.rns_uuid[:20]}...")
+                elif cookie['name'] == 'guest':
+                    self.csrf_token = cookie['value']
+                    logger.info(f"Got CSRF token: {self.csrf_token[:20]}...")
+                
+                self.cookies[cookie['name']] = cookie['value']
+            
+            # Check if region selection is required
+            content = await self.page.content()
+            if "выберите ваш город" in content.lower() or "choose your city" in content.lower():
+                logger.warning("Region selection required - attempting to set Moscow")
+                await self.set_moscow_region()
+                
+            logger.info("Session initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing session: {e}")
+    
+    async def set_moscow_region(self):
+        """Set Moscow as the region"""
+        try:
+            # Look for region selector
+            region_button = await self.page.query_selector("[data-widget='regionSelector']")
+            if region_button:
+                await region_button.click()
+                await asyncio.sleep(1)
+                
+                # Look for Moscow option
+                moscow_option = await self.page.query_selector("text=Москва")
+                if moscow_option:
+                    await moscow_option.click()
+                    await asyncio.sleep(2)
+                    logger.info("Moscow region set successfully")
+                    
+        except Exception as e:
+            logger.error(f"Error setting Moscow region: {e}")
+    
+    async def debug_log_request(self, url: str, method: str, payload: dict = None, response: dict = None):
+        """Log detailed request/response for debugging"""
+        if self.debug_mode:
+            logger.info(f"🔍 DEBUG REQUEST: {method} {url}")
+            if payload:
+                logger.info(f"📤 Payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+            if response:
+                logger.info(f"📥 Response: {json.dumps(response, indent=2, ensure_ascii=False)[:1000]}...")
+    
+    async def search_products_api(self, query: str, category_id: str = None, page: int = 1) -> Dict:
+        """Search products using Ozon API with proper authentication"""
+        try:
+            # Modern Ozon GraphQL search payload
+            payload = {
+                "operationName": "searchProducts",
+                "variables": {
+                    "query": query,
+                    "page": page,
+                    "categoryId": category_id or "",
+                    "sort": "score",
+                    "filters": [],
+                    "withPromo": True,
+                    "withInstallment": True,
+                    "withPremium": True
+                },
+                "query": '''
+                    query searchProducts($query: String!, $page: Int!, $categoryId: String, $sort: String, $filters: [FilterInput!], $withPromo: Boolean, $withInstallment: Boolean, $withPremium: Boolean) {
+                        searchProducts(
+                            query: $query
+                            page: $page
+                            categoryId: $categoryId
+                            sort: $sort
+                            filters: $filters
+                            withPromo: $withPromo
+                            withInstallment: $withInstallment
+                            withPremium: $withPremium
+                        ) {
+                            products {
+                                id
+                                title
+                                price {
+                                    original
+                                    current
+                                }
+                                rating {
+                                    value
+                                    count
+                                }
+                                images {
+                                    original
+                                    thumbnail
+                                }
+                                url
+                                seller {
+                                    name
+                                }
+                                categoryId
+                                availability
+                                delivery {
+                                    text
+                                }
+                                attributes {
+                                    name
+                                    value
+                                }
+                            }
+                            totalCount
+                            hasNextPage
+                        }
+                    }
+                '''
+            }
+            
+            # Headers with authentication
+            headers = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': self.region_settings["accept_language"],
+                'User-Agent': ua.random,
+                'Referer': f'https://www.ozon.ru/search/?text={query}',
+                'Origin': 'https://www.ozon.ru',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+            }
+            
+            # Add authentication headers
+            if self.rns_uuid:
+                headers['x-o3-rns_uuid'] = self.rns_uuid
+            if self.csrf_token:
+                headers['x-o3-csrf-token'] = self.csrf_token
+            
+            # Make API request
+            response = await self.page.evaluate(f'''
+                async () => {{
+                    const response = await fetch('{self.graphql_url}', {{
+                        method: 'POST',
+                        headers: {json.dumps(headers)},
+                        body: JSON.stringify({json.dumps(payload)})
+                    }});
+                    return await response.json();
+                }}
+            ''')
+            
+            await self.debug_log_request(self.graphql_url, "POST", payload, response)
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error in API search: {e}")
+            return {}
     
     async def close_browser(self):
         """Close browser and cleanup"""
