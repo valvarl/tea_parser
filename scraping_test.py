@@ -7,7 +7,7 @@ import requests
 import time
 import json
 
-BACKEND_URL = "https://55dcae2e-605d-4eee-8e34-b0c44591c936.preview.emergentagent.com/api"
+BACKEND_URL = "http://localhost:8000/api"
 
 def test_scraping_workflow():
     print("Testing complete scraping workflow...")

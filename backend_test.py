@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Any
 
 # Backend URL from frontend/.env
-BACKEND_URL = "https://55dcae2e-605d-4eee-8e34-b0c44591c936.preview.emergentagent.com/api"
+BACKEND_URL = "http://localhost:8000/api"
 
 class TeaScrapingAPITester:
     def __init__(self, base_url: str):
