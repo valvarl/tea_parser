@@ -1,364 +1,207 @@
-"""Высоко-уровневый скрейпер Ozon, предназначенный для фоновой
-задачи `scrape_tea_products_task` и отладочных энд-пойнтов.
-
-⚠️  Обратите внимание
----------------------
-* Весь «тяжёлый» код Playwright оставлен без изменений, лишь
-  скорректированы импорты и вызовы классификатора чая.
-* Капчей и прокси управляем через utils.captcha / utils.proxy.
-"""
-
 from __future__ import annotations
 
 import asyncio
+from datetime import date, timedelta
 import json
 import logging
 import random
 import re
-import time
-import uuid
-from datetime import datetime
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urljoin
 
-from fake_useragent import UserAgent
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth  # type: ignore
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Внутренние импорты проекта
-# ──────────────────────────────────────────────────────────────────────────────
-
-from app.utils.proxy import proxy_pool
-from app.utils.captcha import captcha_solver
 from app.utils.classify import classify_tea_type
-from app.core.logging import configure_logging
+from camoufox.async_api import AsyncCamoufox
+from fake_useragent import UserAgent
 
-# инициализируем логгер
 logger = logging.getLogger(__name__)
-configure_logging()
 
 
-ua = UserAgent()  # глобальный генератор user-agent'ов
+# ─────────── Регэкспы / константы ─────────────────────────────────────────────
+ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F")
+PRICE_RE      = re.compile(r"\d+")
+NARROW_SPACE  = "\u2009"
+TODAY: date   = date.today()
+MONTHS_RU     = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
 
+# ─────────── Утилиты ──────────────────────────────────────────────────────────
+def digits_only(text: str) -> str:
+    return re.sub(r"[^0-9.]", "", text.replace(" ", "").replace(NARROW_SPACE, "").replace("\xa0", ""))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Класс-скрейпер
-# ──────────────────────────────────────────────────────────────────────────────
+def clean_price(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    m = PRICE_RE.search(digits_only(text))
+    return int(m.group()) if m else None
+
+def parse_delivery(text: Optional[str]) -> Optional[date]:
+    if not text:
+        return None
+    txt = text.lower().strip()
+    if txt == "сегодня":
+        return TODAY
+    if txt == "завтра":
+        return TODAY + timedelta(days=1)
+    if txt == "послезавтра":
+        return TODAY + timedelta(days=2)
+    m = re.match(r"(\d{1,2})\s+([а-яё]+)", txt)
+    if m:
+        day, month_name = int(m.group(1)), m.group(2)
+        month = MONTHS_RU.get(month_name)
+        if month:
+            year = TODAY.year
+            parsed = date(year, month, day)
+            if parsed < TODAY - timedelta(days=2):
+                parsed = date(year + 1, month, day)
+            return parsed
+    return None
+
 
 class OzonScraper:
     def __init__(self) -> None:
         self.base_url = "https://www.ozon.ru"
         self.search_url = "https://www.ozon.ru/search/"
         self.api_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
-        self.graphql_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
-        self.composer_url = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
-
-        self.browser = None
-        self.page = None
-        self.playwright = None
-
-        self.request_count = 0
-        self.captcha_encounters = 0
-        self.debug_mode = True
-
-        self.rns_uuid: str | None = None
-        self.csrf_token: str | None = None
-        self.cookies: Dict[str, str] = {}
-
-        # Russian region settings (Moscow)
-        self.region_settings = {
-            "ozon_regions": "213000000",  # Moscow region code
-            "geo_region": "Moscow",
-            "timezone": "Europe/Moscow",
-            "accept_language": "ru-RU,ru;q=0.9,en;q=0.8",
+        
+        self.ua = UserAgent().random
+        self.context_settings = {
+            "locale": "ru-RU",
+            "user_agent": self.ua,
+            "viewport": {"width": 1366, "height": 768},
+            "extra_http_headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
         }
+    
+    # ─────────── Парсинг entrypoint-json ─────────────────────────────────────────
+    def extract_items(self, json_page: Dict[str, Any]) -> List[Dict[str, Any]]:
+        for raw in json_page.get("widgetStates", {}).values():
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            items = obj.get("items")
+            if isinstance(items, list):
+                good = [it for it in items if isinstance(it, dict) and "mainState" in it]
+                if len(good) >= 5:
+                    return good
+        return []
 
-    # ------------------------------------------------------------------ #
-    # Init / teardown
-    # ------------------------------------------------------------------ #
+    def grab_item(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        sku = str(it.get("sku") or "")
+        if not sku:
+            return None
 
-    async def init_browser(self) -> None:
-        """Запускает Chromium+Playwright с «русскими» настройками."""
-        self.playwright = await async_playwright().start()
-        self.user_agent = ua.random
+        link = it.get("action", {}).get("link", "").split("?")[0]
+        name = next((b["textAtom"]["text"]
+                    for b in it["mainState"] if b["type"] == "textAtom"), None)
 
-        self.browser = await self.playwright.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--disable-gpu",
-                "--window-size=1920,1080",
-                "--disable-web-security",
-                "--disable-features=VizDisplayCompositor",
-                "--lang=ru-RU",
-            ],
-        )
+        price_curr = price_old = None
+        price_block = next((b for b in it["mainState"] if b["type"] == "priceV2"), None)
+        if price_block:
+            for p in price_block["priceV2"].get("price", []):
+                if p.get("textStyle") == "PRICE":
+                    price_curr = clean_price(p.get("text"))
+                elif p.get("textStyle") == "ORIGINAL_PRICE":
+                    price_old = clean_price(p.get("text"))
 
-        context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=self.user_agent,
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            extra_http_headers={
-                "Accept-Language": self.region_settings["accept_language"],
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,image/webp,*/*;q=0.8"
-                ),
-                "DNT": "1",
-                "Upgrade-Insecure-Requests": "1",
-            },
-        )
+        rating = reviews = None
+        for b in it["mainState"]:
+            if b["type"] == "labelList" and "rating" in json.dumps(b):
+                labels = b["labelList"].get("items", [])
+                if labels:
+                    rating_txt = digits_only(labels[0]["title"])
+                    rating = float(rating_txt) if rating_txt else None
+                    if len(labels) > 1:
+                        rev_txt = digits_only(labels[1]["title"])
+                        reviews = int(rev_txt) if rev_txt else None
+                break
 
-        # фикс региона «Москва»
-        await context.add_cookies(
-            [
-                {
-                    "name": "ozon_regions",
-                    "value": self.region_settings["ozon_regions"],
-                    "domain": ".ozon.ru",
-                    "path": "/",
-                }
-            ]
-        )
+        img_urls = [i["image"]["link"] for i in it.get("tileImage", {}).get("items", [])[:10]]
+        images = "|".join(img_urls)
 
-        # anti-bot JS-хаки
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins',  { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages',{ get: () => ['ru-RU','ru','en-US','en'] });
-            Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {
-                value: () => ({ timeZone: 'Europe/Moscow' })
-            });
-            """
-        )
+        mb = it.get("multiButton", {}).get("ozonButton", {}).get("addToCart", {})
+        delivery_raw = mb.get("actionButton", {}).get("title") if mb else None
+        delivery_date = parse_delivery(delivery_raw)
+        max_qty = mb.get("quantityButton", {}).get("maxItems") if mb else None
 
-        self.page = await context.new_page()
-
-        # прокси, если настроен
-        proxy = proxy_pool.get_proxy()
-        if proxy:
-            logger.info("Using proxy: %s", proxy)
-
-        await self.initialize_session()
-
-    async def close_browser(self) -> None:
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-
-    async def initialize_session(self) -> None:
-        """Получение rns_uuid, csrf-токена и куков."""
-        try:
-            logger.info("Initializing Ozon session…")
-            await self.page.goto(self.base_url, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(2, 4))
-
-            for cookie in await self.page.context.cookies():
-                self.cookies[cookie["name"]] = cookie["value"]
-                match cookie["name"]:
-                    case "__Secure-rns_uuid":
-                        self.rns_uuid = cookie["value"]
-                    case "guest":
-                        self.csrf_token = cookie["value"]
-
-            # если сайт требует выбрать город — выбираем Москву
-            if "выберите ваш город" in (await self.page.content()).lower():
-                await self.set_moscow_region()
-
-            logger.info("Session initialized successfully")
-        except Exception as exc:  # pragma: no cover
-            logger.exception("Error initializing session: %s", exc)
-
-    async def set_moscow_region(self) -> None:
-        try:
-            region_btn = await self.page.query_selector("[data-widget='regionSelector']")
-            if region_btn:
-                await region_btn.click()
-                await asyncio.sleep(1)
-                moscow = await self.page.query_selector("text=Москва")
-                if moscow:
-                    await moscow.click()
-                    await asyncio.sleep(2)
-                    logger.info("Moscow region set")
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Error setting Moscow region: %s", exc)
-
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
-
-    async def handle_anti_bot(self, html: str) -> bool:
-        """Обнаруживает Cloudflare / капчу, пытается решить или ждёт."""
-        symptoms = (
-            "cloudflare",
-            "just a moment",
-            "checking your browser",
-            "captcha",
-            "verify you are human",
-            "robot",
-        )
-        if not any(x in html.lower() for x in symptoms):
-            return True
-
-        self.captcha_encounters += 1
-        logger.warning("Anti-bot detected (%d)", self.captcha_encounters)
-
-        if "captcha" in html.lower():
-            # в проде берём site_key со страницы
-            res = await captcha_solver.solve_captcha("dummy_key", self.page.url)
-            if res["success"]:
-                logger.info("Captcha solved via %s", res["service"])
-                await asyncio.sleep(5)
-                return True
-
-        await asyncio.sleep(random.uniform(30, 60))
-        return False
-
-    # ------------------------------------------------------------------ #
-    # Поиск товаров (entrypoint API → HTML fallback)
-    # ------------------------------------------------------------------ #
+        return {
+            "sku": sku,
+            "link": link,
+            "name": name,
+            "price_curr": price_curr,
+            "price_old": price_old,
+            "rating": rating,
+            "reviews": reviews,
+            "images": images,
+            "delivery_day_raw": delivery_raw,
+            "delivery_date": delivery_date,
+            "max_qty": max_qty,
+            "first_seen": TODAY,
+        }
 
     async def search_products(
         self,
         query: str,
-        max_pages: int = 5,
-    ) -> List[Dict]:
-        """Главная точка входа: ищем товары, возвращаем list[dict]."""
-        try:
-            logger.info("Using entrypoint API interception scraper")
-            data = await self.search_products_entrypoint(query, max_pages)
-            if data:
-                return data
-
-            logger.info("Fallback to HTML scraper")
-            return await self.search_products_html(query, max_pages)
-        except Exception as exc:  # pragma: no cover
-            logger.exception("search_products error: %s", exc)
-            return []
-
-    # ---------- entrypoint API (stealth) ---------- #
-
-    async def search_products_entrypoint(
-        self,
-        query: str,
         max_pages: int = 10,
+        headless: bool = True,
     ) -> List[Dict]:
-        """Перехватываем запросы /api/entrypoint-api.bx/... в реальном браузере."""
         search_url = f"{self.search_url}?text={query}&category=9373&page=1"
+        start_page = int(re.search(r"page=(\d+)", search_url).group(1))
 
-        async with Stealth().use_async(async_playwright()) as p:
-            browser = await p.chromium.launch(headless=False)
-            ctx = await browser.new_context(locale="ru-RU")
+        async with AsyncCamoufox(headless=headless) as browser:
+            ctx  = await browser.new_context(locale="ru-RU")
             page = await ctx.new_page()
 
-            first_headers, first_json = {}, None
+            first_headers: Dict[str, str] = {}
+            first_json: Optional[Dict[str, Any]] = None
 
-            async def save_first(resp):
+            async def capture_entry(resp):
                 nonlocal first_headers, first_json
-                if (
-                    re.search(
-                        r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F",
-                        resp.url,
-                    )
-                    and resp.status == 200
-                    and not first_json
-                ):
-                    first_headers = await resp.request.all_headers()
+                if ENTRY_RE.search(resp.url) and resp.status == 200 and not first_json:
+                    raw_h = await resp.request.all_headers()
+                    first_headers = {k: v for k, v in raw_h.items() if not k.startswith(":")}
                     first_json = await resp.json()
 
-            page.on("response", save_first)
-            await page.goto(search_url, timeout=60_000)
-            await page.mouse.wheel(0, 4000)
-            await asyncio.sleep(5)
+            page.on("response", capture_entry)
+
+            await page.goto(search_url, timeout=60_000, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(1.5, 3.5))
+            await page.mouse.wheel(0, 3000)
+            await asyncio.sleep(random.uniform(1.5, 3.5))
+
 
             if not first_json:
-                logger.warning("Entry API response not captured")
-                await browser.close()
-                return []
+                print("⛔ Entrypoint-API не пойман — анти-бот или новая разметка.")
+                return
 
-            api_base = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
-            all_items, json_page, page_no = [], first_json, 1
+            all_rows: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            json_page = first_json
+            page_no = start_page
 
             while True:
-                try:
-                    grid_key = next(
-                        k
-                        for k, v in json_page["widgetStates"].items()
-                        if '"items":[' in v
-                    )
-                    grid = json.loads(json_page["widgetStates"][grid_key])
-                    all_items.extend(grid.get("items", []))
-                except Exception as exc:  # pragma: no cover
-                    logger.error("Failed to parse grid: %s", exc)
-                    break
-
-                next_path = (
-                    grid.get("nextUrl")
-                    or grid.get("pageInfo", {}).get("nextUrl")
-                    or grid.get("pagination", {}).get("nextUrl")
-                )
-                if not next_path:
-                    break
+                for it in self.extract_items(json_page):
+                    row = self.grab_item(it)
+                    if row and row["sku"] not in seen:
+                        seen.add(row["sku"])
+                        all_rows.append(row)
+                print(f"✓ page {page_no}: всего {len(seen)} уникальных")
 
                 page_no += 1
-                if max_pages and page_no > max_pages:
+                if max_pages and page_no > start_page + max_pages - 1:
                     break
 
-                next_api = f"{api_base}?url={quote(next_path, safe='')}"
+                next_api = f"{self.api_url}?url={quote(f'/search/?text=пуэр&category=9373&page={page_no}', safe='')}"
                 resp = await ctx.request.get(next_api, headers=first_headers)
+                if resp.status != 200:
+                    print("⛔ HTTP", resp.status, "на", page_no)
+                    break
                 json_page = await resp.json()
+                await asyncio.sleep(random.uniform(1.2, 2.5))
 
-            await browser.close()
+        return all_rows
 
-        products = []
-        for item in all_items:
-            try:
-                name = next(
-                    b for b in item.get("mainState", []) if b.get("type") == "textAtom"
-                )["textAtom"]["text"]
-                price_blk = next(
-                    b for b in item.get("mainState", []) if b.get("type") == "priceV2"
-                )["priceV2"]["price"]
-                price_text = next(
-                    t["text"] for t in price_blk if t.get("textStyle") == "PRICE"
-                ).replace("\u2009", " ")
-                url = urljoin(self.base_url, item.get("action", {}).get("link", ""))
-                pd = {"name": name, "price": price_text, "product_url": url}
-                pd.update(classify_tea_type(name))
-                products.append(pd)
-            except Exception:  # pragma: no cover
-                continue
-
-        return products
-
-    # ---------- чистый HTML-парсинг (fallback) ---------- #
-    # (методы search_products_html, extract_products_from_page и др.
-    #   оставлены без изменений, см. полный исходник)                      #
-    # ------------------------------------------------------------------ #
-
-    # ... здесь остаются методы search_products_html, extract_products_from_page,
-    #     extract_product_data, save_debug_html, check_for_no_products,
-    #     scrape_product_details и т.д.  (с вашими исходными реализациями) ...
-
-    # ------------------------------------------------------------------ #
-    # Вспомогательные: классификатор
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def classify_tea_type(name: str) -> Dict:
-        """Просто обёртка над utils.classify.classify_tea_type."""
-        return classify_tea_type(name)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Глобальный экземпляр, используемый по всему проекту
-# ──────────────────────────────────────────────────────────────────────────────
 
 scraper = OzonScraper()

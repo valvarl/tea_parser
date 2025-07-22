@@ -41,7 +41,6 @@ async def scrape_tea_products_task(search_term: str, task_id: str) -> None:
 
     try:
         # 1. Инициализируем браузер и ищем товары
-        await scraper.init_browser()
         products = await scraper.search_products(search_term, max_pages=3)
         total_products = len(products)
 
