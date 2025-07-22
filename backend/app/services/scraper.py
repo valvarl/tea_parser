@@ -144,14 +144,15 @@ class OzonScraper:
     async def search_products(
         self,
         query: str,
+        category: str = "9373",
+        start_page: int = 1,
         max_pages: int = 10,
         headless: bool = True,
     ) -> List[Dict]:
-        search_url = f"{self.search_url}?text={query}&category=9373&page=1"
-        start_page = int(re.search(r"page=(\d+)", search_url).group(1))
+        search_url = f"{self.search_url}?text={query}&category={category}&page={start_page}"
 
         async with AsyncCamoufox(headless=headless) as browser:
-            ctx  = await browser.new_context(locale="ru-RU")
+            ctx  = await browser.new_context(self.context_settings)
             page = await ctx.new_page()
 
             first_headers: Dict[str, str] = {}
@@ -193,7 +194,7 @@ class OzonScraper:
                 if max_pages and page_no > start_page + max_pages - 1:
                     break
 
-                next_api = f"{self.api_url}?url={quote(f'/search/?text=пуэр&category=9373&page={page_no}', safe='')}"
+                next_api = f"{self.api_url}?url={quote(f'/search/?text={query}&category={category}&page={page_no}', safe='')}"
                 resp = await ctx.request.get(next_api, headers=first_headers)
                 if resp.status != 200:
                     print("⛔ HTTP", resp.status, "на", page_no)
