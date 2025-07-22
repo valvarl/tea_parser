@@ -16,11 +16,17 @@ import random
 import time
 from fake_useragent import UserAgent
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 import httpx
 from bs4 import BeautifulSoup
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 import base64
+import hmac, hashlib, time, base64
+import socket
+import requests
+
+SECRET = "Tz178Fksyu4oAs14"
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -39,6 +45,15 @@ api_router = APIRouter(prefix="/api")
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def get_public_ip():
+    try:
+        return requests.get("https://api.ipify.org").text
+    except:
+        return "unknown"
+
+logger.warning(f"⚠️ Current IP: {get_public_ip()}")
+
 
 # User agent rotation
 ua = UserAgent()
@@ -222,6 +237,7 @@ class OzonScraper:
         self.search_url = "https://www.ozon.ru/search/"
         self.api_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
         self.graphql_url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
+        self.composer_url = "https://www.ozon.ru/api/composer-api.bx/page/json/v2"
         self.session = None
         self.browser = None
         self.page = None
@@ -243,6 +259,8 @@ class OzonScraper:
     async def init_browser(self):
         """Initialize Playwright browser with stealth settings and Russian region"""
         self.playwright = await async_playwright().start()
+
+        self.user_agent = ua.random
         
         # Browser configuration for stealth with Russian locale
         self.browser = await self.playwright.chromium.launch(
@@ -263,7 +281,7 @@ class OzonScraper:
         # Create context with Russian settings
         context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent=ua.random,
+            user_agent=self.user_agent,
             locale='ru-RU',
             timezone_id='Europe/Moscow',
             extra_http_headers={
@@ -338,8 +356,13 @@ class OzonScraper:
                 elif cookie['name'] == 'guest':
                     self.csrf_token = cookie['value']
                     logger.info(f"Got CSRF token: {self.csrf_token[:20]}...")
+                elif cookie['name'] == 'device_uid':
+                    self.device_uid = cookie['value']
                 
                 self.cookies[cookie['name']] = cookie['value']
+            
+            if not hasattr(self, "device_uid"):
+                self.device_uid = str(uuid.uuid4())
             
             # Check if region selection is required
             content = await self.page.content()
@@ -535,39 +558,51 @@ class OzonScraper:
         
         try:
             # First try API search
-            logger.info(f"Starting API search for: {query}")
+            # logger.info(f"Starting API search for: {query}")
             
             # Try to get category ID for tea products
-            tea_category_id = await self.get_tea_category_id()
+            # tea_category_id = await self.get_tea_category_id()
             
-            api_response = await self.search_products_api(query, tea_category_id)
+            # api_response = await self.search_products_api(query, tea_category_id)
             
-            if api_response and 'data' in api_response:
-                search_data = api_response.get('data', {}).get('searchProducts', {})
-                api_products = search_data.get('products', [])
+            # if api_response and 'data' in api_response:
+            #     search_data = api_response.get('data', {}).get('searchProducts', {})
+            #     api_products = search_data.get('products', [])
                 
-                if api_products:
-                    logger.info(f"API search found {len(api_products)} products")
+            #     if api_products:
+            #         logger.info(f"API search found {len(api_products)} products")
                     
-                    for product in api_products:
-                        try:
-                            product_data = await self.parse_api_product(product)
-                            if product_data:
-                                products.append(product_data)
-                        except Exception as e:
-                            logger.error(f"Error parsing API product: {e}")
-                            continue
+            #         for product in api_products:
+            #             try:
+            #                 product_data = await self.parse_api_product(product)
+            #                 if product_data:
+            #                     products.append(product_data)
+            #             except Exception as e:
+            #                 logger.error(f"Error parsing API product: {e}")
+            #                 continue
                     
-                    return products
-                else:
-                    logger.warning("API search returned empty products list")
+            #         return products
+            #     else:
+            #         logger.warning("API search returned empty products list")
             
-            # Fallback to HTML scraping if API fails
+            # Try entrypoint API interception if API search fails
+            logger.info("Trying entrypoint API interception scraper")
+            entry_products = await self.search_products_entrypoint(query, max_pages)
+            if entry_products:
+                logger.info(f"Entrypoint scraper found {len(entry_products)} products")
+                return entry_products
+
+            # Fallback to HTML scraping if all else fails
             logger.info("Falling back to HTML scraping")
             return await self.search_products_html(query, max_pages)
             
         except Exception as e:
             logger.error(f"Error in search_products: {e}")
+            entry_products = await self.search_products_entrypoint(query, max_pages)
+            if entry_products:
+                logger.info(f"Entrypoint scraper recovered {len(entry_products)} products after error")
+                return entry_products
+            
             # Try HTML scraping as final fallback
             return await self.search_products_html(query, max_pages)
     
@@ -575,7 +610,7 @@ class OzonScraper:
         """Get category ID for tea products"""
         try:
             # Navigate to tea category page
-            tea_url = "https://www.ozon.ru/category/chay-10498/"
+            tea_url = "https://www.ozon.ru/category/chay-9373/"
             await self.page.goto(tea_url, wait_until="domcontentloaded")
             await asyncio.sleep(2)
             
@@ -598,7 +633,7 @@ class OzonScraper:
         except Exception as e:
             logger.error(f"Error getting tea category ID: {e}")
         
-        return "10498"  # Default tea category ID
+        return "9373"  # Default tea category ID
     
     async def parse_api_product(self, product: Dict) -> Dict:
         """Parse product data from API response"""
@@ -670,7 +705,7 @@ class OzonScraper:
         
         try:
             # Navigate to search page
-            search_url = f"{self.search_url}?text={query}&category_id=10498"
+            search_url = f"{self.search_url}?text={query}&category=9373"
             logger.info(f"HTML search URL: {search_url}")
             
             await self.page.goto(search_url, wait_until="domcontentloaded")
@@ -702,7 +737,7 @@ class OzonScraper:
                     
                 try:
                     # Navigate to next page
-                    next_url = f"{self.search_url}?text={query}&category_id=10498&page={page_num}"
+                    next_url = f"{self.search_url}?text={query}&category=9373&page={page_num}"
                     await self.page.goto(next_url, wait_until="domcontentloaded")
                     
                     # Random delay
@@ -726,6 +761,78 @@ class OzonScraper:
         except Exception as e:
             logger.error(f"Error in HTML search: {e}")
         
+        return products
+    
+    async def search_products_entrypoint(self, query: str, max_pages: int = 10) -> List[Dict]:
+        """Scrape products using entrypoint API interception (fallback)."""
+        search_url = f"{self.search_url}?text={query}&category=9373&page=1"
+
+        async with Stealth().use_async(async_playwright()) as p:
+            browser = await p.chromium.launch(headless=False)
+            ctx = await browser.new_context(locale="ru-RU")
+            page = await ctx.new_page()
+
+            first_headers, first_json = {}, None
+
+            async def save_first(resp):
+                nonlocal first_headers, first_json
+                if re.search(r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F", resp.url) and resp.status == 200 and not first_json:
+                    first_headers = await resp.request.all_headers()
+                    first_json = await resp.json()
+
+            page.on("response", save_first)
+            await page.goto(search_url, timeout=60000)
+            await page.mouse.wheel(0, 4000)
+            await asyncio.sleep(5)
+
+            if not first_json:
+                logger.warning("Entry API response not captured")
+                await browser.close()
+                return []
+
+            api_base = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
+            all_items, json_page, page_no = [], first_json, 1
+
+            while True:
+                try:
+                    grid_key = next(k for k, v in json_page["widgetStates"].items() if '"items":[' in v)
+                    grid = json.loads(json_page["widgetStates"][grid_key])
+                    all_items.extend(grid.get("items", []))
+                except Exception as e:
+                    logger.error(f"Failed to parse grid: {e}")
+                    break
+
+                if "nextUrl" in grid:
+                    next_path = grid["nextUrl"]
+                elif "pageInfo" in grid and "nextUrl" in grid["pageInfo"]:
+                    next_path = grid["pageInfo"]["nextUrl"]
+                elif "pagination" in grid and "nextUrl" in grid["pagination"]:
+                    next_path = grid["pagination"]["nextUrl"]
+                else:
+                    break
+
+                page_no += 1
+                if max_pages and page_no > max_pages:
+                    break
+
+                next_api = f"{api_base}?url={quote(next_path, safe='')}"
+                resp = await ctx.request.get(next_api, headers=first_headers)
+                json_page = await resp.json()
+
+            await browser.close()
+
+        products = []
+        for it in all_items:
+            print(it)
+            try:
+                name = next(b for b in it.get("mainState", []) if b.get("type") == "textAtom")["textAtom"]["text"]
+                price_blk = next(b for b in it.get("mainState", []) if b.get("type") == "priceV2")["priceV2"]["price"]
+                price_text = next(t["text"] for t in price_blk if t.get("textStyle") == "PRICE").replace("\u2009", " ")
+                url = urljoin(self.base_url, it.get("action", {}).get("link", ""))
+                products.append({"name": name, "price": price_text, "product_url": url})
+            except Exception:
+                continue
+
         return products
     
     async def check_for_no_products(self) -> bool:
@@ -1173,6 +1280,8 @@ async def scrape_tea_products_task(search_term: str, task_id: str):
         
         for i, product_data in enumerate(products):
             try:
+                print(product_data)
+
                 logger.info(f"📝 Processing product {i+1}/{len(products)}: {product_data.get('name', 'Unknown')[:50]}...")
                 
                 # Validate product data
