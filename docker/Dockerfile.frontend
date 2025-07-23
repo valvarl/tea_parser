@@ -1,9 +1,9 @@
-FROM node:20
+FROM node:20-alpine
 
 WORKDIR /app
 
 COPY frontend/package.json frontend/yarn.lock ./
-RUN corepack enable && yarn install
+RUN corepack enable && yarn install --frozen-lockfile
 
 COPY frontend /app
 

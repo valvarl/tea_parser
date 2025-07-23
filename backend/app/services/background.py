@@ -15,7 +15,7 @@ from typing import Dict
 from app.db.mongo import db
 from app.models.task import ScrapingTask
 from app.models.tea import TeaProduct
-from app.services.scraper import scraper  # глобальный экземпляр OzonScraper
+from app.services.indexer import indexer  # глобальный экземпляр ProductIndexer
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ async def scrape_tea_products_task(search_term: str, task_id: str) -> None:
 
     try:
         # 1. Инициализируем браузер и ищем товары
-        products = await scraper.search_products(search_term, max_pages=3)
+        products = await indexer.search_products(search_term, max_pages=3)
         total_products = len(products)
 
         logger.info("📊 %d products found for query '%s'", total_products, search_term)
@@ -120,7 +120,7 @@ async def scrape_tea_products_task(search_term: str, task_id: str) -> None:
     finally:
         # 4. Обязательно закрываем браузер
         try:
-            await scraper.close_browser()
+            await indexer.close_browser()
         except Exception:  # pragma: no cover
             logger.warning("could not close browser in task %s", task_id)
 

@@ -60,7 +60,7 @@ def parse_delivery(text: Optional[str]) -> Optional[date]:
     return None
 
 
-class OzonScraper:
+class ProductIndexer:
     def __init__(self) -> None:
         self.base_url = "https://www.ozon.ru"
         self.search_url = "https://www.ozon.ru/search/"
@@ -152,7 +152,7 @@ class OzonScraper:
         search_url = f"{self.search_url}?text={query}&category={category}&page={start_page}"
 
         async with AsyncCamoufox(headless=headless) as browser:
-            ctx  = await browser.new_context(self.context_settings)
+            ctx  = await browser.new_context(**self.context_settings)
             page = await ctx.new_page()
 
             first_headers: Dict[str, str] = {}
@@ -205,4 +205,4 @@ class OzonScraper:
         return all_rows
 
 
-scraper = OzonScraper()
+indexer = ProductIndexer()

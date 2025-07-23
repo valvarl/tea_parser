@@ -1,4 +1,28 @@
 services:
+  # ─────────────────────────── Kafka ────────────────────────────
+  kafka:
+    image: bitnami/kafka:3.7              # Kafka в режиме KRaft
+    hostname: kafka
+    container_name: kafka
+    restart: always
+    ports:
+      - "9092:9092"                       # для локальных клиентов
+    environment:
+      # базовая конфигурация «всё-в-одном»
+      - KAFKA_KRAFT_CLUSTER_ID=kraft-cluster
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      # упрощённый advertised.host для хоста-разработки
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+    volumes:
+      - kafka_data:/bitnami/kafka
+
+  # ────────────────────────── MongoDB ───────────────────────────
   mongo:
     image: mongo:6
     restart: always
@@ -11,38 +35,44 @@ services:
     volumes:
       - ../mongo:/data/db
 
+  # ────────────────────────── Back-end ──────────────────────────
   backend:
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
+    env_file:
+      - .env                           # Mongo-/Kafka-vars приходят отсюда
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+      - kafka
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000"]
       interval: 10s
       timeout: 1s
       retries: 1
       start_period: 5s
-    env_file:
-      - ../.env
-    ports:
-      - "8000:8000"
-    depends_on:
-      - mongo
-    command: uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 
+  # ───────────────────────── Front-end ──────────────────────────
   frontend:
     build:
       context: ..
       dockerfile: docker/Dockerfile.frontend
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - backend
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 10s
       timeout: 1s
       retries: 1
       start_period: 5s
-    env_file:
-      - ../.env
-    ports:
-      - "3000:3000"
-    stdin_open: true
-    tty: true
-    command: yarn start
+
+volumes:
+  kafka_data: {}
