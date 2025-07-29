@@ -1,7 +1,3 @@
-"""
-Listens topic <index_requests>, runs ProductIndexer, pushes rows to <product_raw>
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,24 +9,25 @@ from typing import Any, Dict, List
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from app.core.logging import configure_logging
 from app.db.mongo import db
-from app.services.indexer import ProductIndexer  # ваш класс выше
+from app.services.enricher import ProductEnricher  # ваш класс выше
 
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
-TOPIC_INDEXER_STATUS = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
+TOPIC_ENRICHER_CMD = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
+TOPIC_ENRICHER_STATUS = os.getenv("TOPIC_ENRICHER_STATUS", "enricher_status")
+
 MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 3))
 CATEGORY_DEF  = os.getenv("INDEX_CATEGORY_ID", "9373")
 
 configure_logging()
-logger = logging.getLogger("indexer-worker")
-indexer = ProductIndexer()                               # один экземпляр
+logger = logging.getLogger("enricher-worker")
+enricher = ProductEnricher()                               # один экземпляр
 
 
 async def main() -> None:
     cons = AIOKafkaConsumer(
-        TOPIC_INDEXER_CMD,
+        TOPIC_ENRICHER_CMD,
         bootstrap_servers=BOOT,
-        group_id="indexer-worker",
+        group_id="enricher-worker",
         value_deserializer=lambda x: json.loads(x.decode()),
         auto_offset_reset="earliest",
     )
@@ -44,25 +41,23 @@ async def main() -> None:
         async for msg in cons:
             task_id = msg.value["task_id"]
             search  = msg.value["search_term"]
-            category = msg.value.get("category_id", CATEGORY_DEF)
-            max_pages = msg.value.get("max_pages", MAX_PAGES_DEF)
             try:
-                await handle(task_id, search, category, max_pages, prod)
+                await handle(task_id, search, prod)
             except Exception as exc:          # не коммитим → ретрай
                 logger.exception("task failed: %s", exc)
     finally:
         await cons.stop(); await prod.stop()
 
 
-async def handle(task_id: str, query: str, category: str, max_pages: int, prod: AIOKafkaProducer) -> None:
+async def handle(task_id: str, query: str, prod: AIOKafkaProducer) -> None:
     try:
-        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running"})
-        logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, category, max_pages)
-        products: List[Dict] = await indexer.search_products(
+        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {"task_id": task_id, "status": "running"})
+        logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, CATEGORY_DEF, MAX_PAGES_DEF)
+        products: List[Dict] = await enricher.search_products(
             query=query,
-            category=category,
+            category=CATEGORY_DEF,
             start_page=1,
-            max_pages=max_pages,
+            max_pages=MAX_PAGES_DEF,
             headless=True,
         )
         total = len(products)
@@ -81,7 +76,7 @@ async def handle(task_id: str, query: str, category: str, max_pages: int, prod: 
             # каждые 10 товаров отдаём прогресс
             if idx % 10 == 0 or idx == total:
                 await prod.send_and_wait(
-                    TOPIC_INDEXER_STATUS,
+                    TOPIC_ENRICHER_STATUS,
                     {
                         "task_id": task_id,
                         "status": "running",
@@ -92,7 +87,7 @@ async def handle(task_id: str, query: str, category: str, max_pages: int, prod: 
                 )
 
         await prod.send_and_wait(
-            TOPIC_INDEXER_STATUS,
+            TOPIC_ENRICHER_STATUS,
             {
                 "task_id": task_id,
                 "status": "completed",
@@ -103,7 +98,7 @@ async def handle(task_id: str, query: str, category: str, max_pages: int, prod: 
         )
     except Exception as e:
         await prod.send_and_wait(
-            TOPIC_INDEXER_STATUS,
+            TOPIC_ENRICHER_STATUS,
             {"task_id": task_id, "status": "failed", "error_message": str(e)},
         )
 

@@ -76,6 +76,20 @@ services:
         condition: service_started
     restart: on-failure
 
+  enricher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    command: ["python", "app/services/enricher_worker.py"]
+    env_file:
+      - .env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+    restart: on-failure
+
   # ───────────────────────── Front-end ──────────────────────────
   frontend:
     build:

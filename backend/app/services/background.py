@@ -6,171 +6,118 @@ from typing import Dict, Any
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from app.db.mongo import db
-from app.models.task import ScrapingTask
 
 logger = logging.getLogger(__name__)
 
-BOOT      = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
-TOPIC_ST  = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
+BOOT                    = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+TOPIC_INDEXER_CMD       = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
+TOPIC_INDEXER_STATUS    = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
+TOPIC_ENRICHER_CMD      = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
+TOPIC_ENRICHER_STATUS   = os.getenv("TOPIC_ENRICHER_STATUS", "enricher_status")
+
+# ────────────────────────── helpers ──────────────────────────
+def dumps(x): return json.dumps(x).encode()
+def loads(x): return json.loads(x.decode())
 
 
-async def scrape_tea_products_task(search_term: str, task_id: str) -> None:
-    """
-    Отправляем команду indexer-воркеру и слушаем статус-ивенты.
-    MongoDB-insert сам воркер; здесь лишь обновление ScrapingTask.
-    """
+async def _patch(task_id: str, patch: Dict[str, Any]) -> None:
+    patch["updated_at"] = datetime.utcnow()
+    await db.scraping_tasks.update_one({"id": task_id}, {"$set": patch})
 
-    async def patch(p: Dict[str, Any]) -> None:
-        await db.scraping_tasks.update_one({"id": task_id}, {"$set": p})
 
-    # 0. фиксируем факт задачи
-    await patch({"status": "queued", "created_at": datetime.utcnow()})
+async def _new_producer() -> AIOKafkaProducer:
+    prod = AIOKafkaProducer(bootstrap_servers=BOOT,
+                            value_serializer=dumps,
+                            enable_idempotence=True)
+    await prod.start()
+    return prod
 
-    # 1. Producer → command
-    producer = AIOKafkaProducer(
+
+def _new_consumer(topic: str, group: str) -> AIOKafkaConsumer:
+    return AIOKafkaConsumer(
+        topic,
         bootstrap_servers=BOOT,
-        value_serializer=lambda x: json.dumps(x).encode(),
-        acks="all",
-        enable_idempotence=True,
-    )
-    await producer.start()
-    await producer.send_and_wait(
-        TOPIC_CMD,
-        {"task_id": task_id, "search_term": search_term},
-    )
-    await producer.stop()
-    logger.info("📤 sent command for task %s (%s)", task_id, search_term)
-
-    # 2. Consumer ← status
-    consumer = AIOKafkaConsumer(
-        TOPIC_ST,
-        bootstrap_servers=BOOT,
-        group_id=f"task-monitor-{uuid.uuid4()}",
-        value_deserializer=lambda x: json.loads(x.decode()),
+        group_id=group,
+        value_deserializer=loads,
         auto_offset_reset="earliest",
         enable_auto_commit=True,
     )
-    await consumer.start()
 
-    try:
-        async for msg in consumer:
-            st: Dict[str, Any] = msg.value
+
+# ────────────────────── public entrypoint ────────────────────
+async def scrape_tea_products_task(
+    search_term: str, 
+    task_id: str, 
+    category_id: str = "9373", 
+    max_pages: int = 3
+) -> None:
+    # create DB stub
+    await _patch(task_id, {"status": "queued", "search_term": search_term})
+
+    # ─── 1. посылаем команду indexer ───
+    prod_cmd = await _new_producer()
+    await prod_cmd.send_and_wait(TOPIC_INDEXER_CMD, {"task_id": task_id,
+                                                     "search_term": search_term,
+                                                     "category_id": category_id,
+                                                     "max_pages": max_pages})
+    await prod_cmd.stop()
+    logger.info("📤 indexer command sent (task=%s, q='%s')", task_id, search_term)
+
+    # ─── 2. поднимаем два consumer’а ───
+    c_idx = _new_consumer(TOPIC_INDEXER_STATUS,  f"indexer-monitor-{uuid.uuid4()}")
+    c_enr = _new_consumer(TOPIC_ENRICHER_STATUS,  f"enricher-monitor-{uuid.uuid4()}")
+    await asyncio.gather(c_idx.start(), c_enr.start())
+
+    # 2а. producer для пересылки batch’ей в enricher
+    prod_enr = await _new_producer()
+
+    idx_done = enr_done = False
+
+    async def watch_indexer():
+        nonlocal idx_done
+        async for m in c_idx:
+            st: dict = m.value
             if st.get("task_id") != task_id:
-                continue                              # другое задание
+                continue
 
-            # прогресс или финал — патчим документ
-            await patch(st | {"updated_at": datetime.utcnow()})
+            # если пришёл batch – пересылаем в enricher
+            if st.get("status") == "batch_ready":
+                batch = st["batch_data"]
+                await prod_enr.send_and_wait(TOPIC_ENRICHER_CMD,
+                                             {"task_id": task_id,
+                                              "batch": batch})
+                logger.info("→ batch %s forwarded to enricher", batch.get("batch_id"))
+
+            await _patch(task_id, {"indexer": st})
 
             if st.get("status") in {"completed", "failed"}:
-                logger.info("🏁 task %s finished (%s)", task_id, st["status"])
+                idx_done = True
                 break
-    finally:
-        await consumer.stop()
 
-# async def scrape_tea_products_task(search_term: str, task_id: str) -> None:
-    # """
-    # Запускается в фоне из энд-пойнта `/scrape/start`.
+    async def watch_enricher():
+        nonlocal enr_done
+        async for m in c_enr:
+            st: dict = m.value
+            if st.get("task_id") != task_id:
+                continue
 
-    # Аргументы:
-    #     search_term: строка для поиска на Ozon
-    #     task_id:     идентификатор ScrapingTask в Mongo
-    # """
+            await _patch(task_id, {"enricher": st})
 
-    # async def _update_task(patch: Dict) -> None:
-    #     """Удобный хелпер для патчей в коллекции `scraping_tasks`."""
-    #     await db.scraping_tasks.update_one({"id": task_id}, {"$set": patch})
+            if st.get("status") in {"completed", "failed"}:
+                enr_done = True
+                break
 
-    # # ——— статус «running» ——— #
-    # await _update_task({"status": "running", "started_at": datetime.utcnow()})
-    # logger.info("🚀 Scraping task %s started (query='%s')", task_id, search_term)
+    # ─── 3. параллельно ждём оба стрима ───
+    await asyncio.gather(watch_indexer(), watch_enricher())
 
-    # scraped_count = failed_count = 0
+    # ─── 4. финал ───
+    final_status = (
+        "completed"
+        if idx_done and enr_done
+        else "failed"
+    )
+    await _patch(task_id, {"status": final_status,
+                           "completed_at": datetime.utcnow()})
 
-    # try:
-    #     # 1. Инициализируем браузер и ищем товары
-    #     products = await indexer.search_products(search_term, max_pages=3)
-    #     total_products = len(products)
-
-    #     logger.info("📊 %d products found for query '%s'", total_products, search_term)
-
-    #     if not products:
-    #         await _update_task(
-    #             {
-    #                 "status": "completed",
-    #                 "completed_at": datetime.utcnow(),
-    #                 "total_products": 0,
-    #                 "error_message": "No products found (geo-blocking or API change?)",
-    #             }
-    #         )
-    #         return
-
-    #     # 2. Обрабатываем каждый товар
-    #     for idx, prod in enumerate(products, 1):
-    #         try:
-    #             if not prod.get("name"):
-    #                 raise ValueError("product without name")
-
-    #             tea = TeaProduct(**prod)
-
-    #             # upsert по ozon_id (если есть) либо по id (fallback)
-    #             query = {"ozon_id": tea.ozon_id} if tea.ozon_id else {"id": tea.id}
-    #             exists = await db.tea_products.find_one(query)
-
-    #             if exists:
-    #                 tea.updated_at = datetime.utcnow()
-    #                 await db.tea_products.update_one(query, {"$set": tea.dict()})
-    #             else:
-    #                 await db.tea_products.insert_one(tea.dict())
-
-    #             scraped_count += 1
-    #         except Exception as exc:  # pragma: no cover
-    #             logger.exception("❌ error on product %d/%d: %s", idx, total_products, exc)
-    #             failed_count += 1
-    #         finally:
-    #             # прогресс каждые 5 элементов или в самом конце
-    #             if idx % 5 == 0 or idx == total_products:
-    #                 await _update_task(
-    #                     {
-    #                         "scraped_products": scraped_count,
-    #                         "failed_products": failed_count,
-    #                         "total_products": total_products,
-    #                     }
-    #                 )
-
-    #     # 3. Финальный статус
-    #     await _update_task(
-    #         {
-    #             "status": "completed",
-    #             "completed_at": datetime.utcnow(),
-    #             "scraped_products": scraped_count,
-    #             "failed_products": failed_count,
-    #             "total_products": total_products,
-    #         }
-    #     )
-    #     logger.info(
-    #         "🎉 Task %s finished: %d scraped, %d failed",
-    #         task_id,
-    #         scraped_count,
-    #         failed_count,
-    #     )
-
-    # except Exception as exc:  # pragma: no cover
-    #     logger.exception("🔥 critical error in task %s: %s", task_id, exc)
-    #     await _update_task(
-    #         {
-    #             "status": "failed",
-    #             "completed_at": datetime.utcnow(),
-    #             "error_message": str(exc),
-    #         }
-    #     )
-
-    # finally:
-    #     # 4. Обязательно закрываем браузер
-    #     try:
-    #         await indexer.close_browser()
-    #     except Exception:  # pragma: no cover
-    #         logger.warning("could not close browser in task %s", task_id)
-
-    #     # небольшая пауза, чтобы фоновый поток FastAPI дошёл до конца
-    #     await asyncio.sleep(0.1)
+    await asyncio.gather(c_idx.stop(), c_enr.stop(), prod_enr.stop())
+    logger.info("🏁 scraping task %s finished (%s)", task_id, final_status)
