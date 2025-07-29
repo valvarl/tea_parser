@@ -4,7 +4,7 @@ import asyncio
 
 from fastapi import APIRouter
 
-from app.services.indexer import indexer
+# from app.services.indexer import indexer
 from app.utils.proxy import proxy_pool
 from app.utils.captcha import captcha_solver
 from app.utils.ozon_ping import ozon_ping
@@ -29,18 +29,22 @@ async def get_scraper_status():
     for t in recent:
         t.pop("_id", None)
 
+    # return {
+    #     "status": "active",
+    #     "running_tasks": running,
+    #     "scraper_config": {
+    #         "base_url": indexer.base_url,
+    #         "search_url": indexer.search_url,
+    #         "debug_mode": indexer.debug_mode,
+    #         "request_count": indexer.request_count,
+    #         "captcha_encounters": indexer.captcha_encounters,
+    #         "captcha_solved": captcha_solver.solve_count,
+    #         "proxy_pool": len(proxy_pool.proxies),
+    #         "failed_proxies": len(proxy_pool.failed_proxies),
+    #     },
+    #     "recent_tasks": recent,
+    # }
+
     return {
         "status": "active",
-        "running_tasks": running,
-        "scraper_config": {
-            "base_url": indexer.base_url,
-            "search_url": indexer.search_url,
-            "debug_mode": indexer.debug_mode,
-            "request_count": indexer.request_count,
-            "captcha_encounters": indexer.captcha_encounters,
-            "captcha_solved": captcha_solver.solve_count,
-            "proxy_pool": len(proxy_pool.proxies),
-            "failed_proxies": len(proxy_pool.failed_proxies),
-        },
-        "recent_tasks": recent,
     }

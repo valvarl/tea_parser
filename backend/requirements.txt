@@ -13,3 +13,4 @@ aiofiles
 playwright
 playwright-stealth
 camoufox
+aiokafka

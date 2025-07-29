@@ -203,6 +203,3 @@ class ProductIndexer:
                 await asyncio.sleep(random.uniform(1.2, 2.5))
 
         return all_rows
-
-
-indexer = ProductIndexer()

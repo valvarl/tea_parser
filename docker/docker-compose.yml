@@ -19,6 +19,11 @@ services:
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
       # упрощённый advertised.host для хоста-разработки
       - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "host.docker.internal:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
     volumes:
       - kafka_data:/bitnami/kafka
 
@@ -40,19 +45,36 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
+    command: ["python", "main.py"]
     env_file:
       - .env                           # Mongo-/Kafka-vars приходят отсюда
     ports:
       - "8000:8000"
     depends_on:
-      - mongo
-      - kafka
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000"]
       interval: 10s
       timeout: 1s
       retries: 1
       start_period: 5s
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    command: ["python", "app/services/indexer_worker.py"]
+    env_file:
+      - .env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+    restart: on-failure
 
   # ───────────────────────── Front-end ──────────────────────────
   frontend:
