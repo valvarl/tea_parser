@@ -1,7 +1,7 @@
 """
 Listens to <enricher_cmd> Kafka topic, runs ProductEnricher on the specified
 SKU‑list (or on all products lacking PDP‑fields), pushes the enriched data
-into MongoDB collections <tea_products> and <tea_reviews>, and emits progress
+into MongoDB collections <candidates> and <tea_reviews>, and emits progress
 updates to <enricher_status>.
 
 Message schema (JSON, UTF‑8):
@@ -13,7 +13,7 @@ Message schema (JSON, UTF‑8):
     "concurrency": 8            # optional, default via env
 }
 
-* If **skus** not provided, worker takes every product from tea_products
+* If **skus** not provided, worker takes every product from index
   where charcs_json == null OR description == null.
 * Enrichment progress is reported every 10 processed items (or at the end).
 """
@@ -86,11 +86,11 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
     try:
         # 1. Выбираем товары для обогащения
         if skus:
-            base_rows = await db.tea_products.find(
+            base_rows = await db.index.find(
                 {"sku": {"$in": skus}}, {"_id": 0}
             ).to_list(None)
         else:
-            base_rows = await db.tea_products.find(
+            base_rows = await db.index.find(
                 {
                     "task_id": task_id,
                     "$or": [
@@ -130,7 +130,7 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
         scraped = failed = 0
         for idx, row in enumerate(rows_plus, 1):
             try:
-                await db.tea_products.update_one({"sku": row["sku"]}, {"$set": row}, upsert=True)
+                await db.candidates.update_one({"sku": row["sku"]}, {"$set": row}, upsert=True)
                 scraped += 1
             except Exception:
                 failed += 1
