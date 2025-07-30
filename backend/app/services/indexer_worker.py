@@ -33,6 +33,7 @@ async def main() -> None:
         group_id="indexer-worker",
         value_deserializer=lambda x: json.loads(x.decode()),
         auto_offset_reset="earliest",
+        enable_auto_commit=False,
     )
     prod = AIOKafkaProducer(
         bootstrap_servers=BOOT,
@@ -58,39 +59,39 @@ async def handle(task_id: str, query: str, category: str, max_pages: int, prod: 
     try:
         await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running"})
         logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, category, max_pages)
-        products: List[Dict] = await indexer.search_products(
+        scraped = failed = page_no = 0
+        async for batch in indexer.iter_products(
             query=query,
             category=category,
             start_page=1,
             max_pages=max_pages,
             headless=True,
-        )
-        total = len(products)
-        logger.info("→ %d products", total)
+        ):
+            page_no += 1
+            batch_skus: List[str] = []
+            for p in batch:
+                try:
+                    p["task_id"] = task_id
+                    await db.tea_products.update_one(
+                        {"sku": p.get("sku")}, {"$set": p}, upsert=True
+                    )
+                    scraped += 1
+                    batch_skus.append(p.get("sku"))
+                except Exception:
+                    failed += 1
 
-        scraped = failed = 0
-        for idx, p in enumerate(products, 1):
-            try:
-                await db.tea_products.update_one(
-                    {"ozon_id": p.get("ozon_id")}, {"$set": p}, upsert=True
-                )
-                scraped += 1
-            except Exception:
-                failed += 1
+            await prod.send_and_wait(
+                TOPIC_INDEXER_STATUS,
+                {
+                    "task_id": task_id,
+                    "status": "batch_ready",
+                    "batch_data": {"batch_id": page_no, "skus": batch_skus},
+                    "scraped_products": scraped,
+                    "failed_products": failed,
+                },
+            )
 
-            # каждые 10 товаров отдаём прогресс
-            if idx % 10 == 0 or idx == total:
-                await prod.send_and_wait(
-                    TOPIC_INDEXER_STATUS,
-                    {
-                        "task_id": task_id,
-                        "status": "running",
-                        "scraped_products": scraped,
-                        "failed_products": failed,
-                        "total_products": total,
-                    },
-                )
-
+        total = scraped + failed
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
             {

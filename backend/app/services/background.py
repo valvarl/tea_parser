@@ -39,7 +39,7 @@ def _new_consumer(topic: str, group: str) -> AIOKafkaConsumer:
         bootstrap_servers=BOOT,
         group_id=group,
         value_deserializer=loads,
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         enable_auto_commit=True,
     )
 
@@ -68,27 +68,37 @@ async def scrape_tea_products_task(
     c_enr = _new_consumer(TOPIC_ENRICHER_STATUS,  f"enricher-monitor-{uuid.uuid4()}")
     await asyncio.gather(c_idx.start(), c_enr.start())
 
-    # 2а. producer для пересылки batch’ей в enricher
+    # 2а. producer для команд к enricher
     prod_enr = await _new_producer()
 
     idx_done = enr_done = False
 
     async def watch_indexer():
         nonlocal idx_done
-        async for m in c_idx:
+        while True:
+            try:
+                m = await asyncio.wait_for(c_idx.getone(), timeout=300)
+            except asyncio.TimeoutError:
+                logger.error("indexer status timeout")
+                break
+
             st: dict = m.value
             if st.get("task_id") != task_id:
                 continue
 
-            # если пришёл batch – пересылаем в enricher
+            await _patch(task_id, {"indexer": st})
+
             if st.get("status") == "batch_ready":
                 batch = st["batch_data"]
-                await prod_enr.send_and_wait(TOPIC_ENRICHER_CMD,
-                                             {"task_id": task_id,
-                                              "batch": batch})
+                await prod_enr.send_and_wait(
+                    TOPIC_ENRICHER_CMD,
+                    {"task_id": task_id, "skus": batch.get("skus", [])},
+                )
                 logger.info("→ batch %s forwarded to enricher", batch.get("batch_id"))
 
-            await _patch(task_id, {"indexer": st})
+            if st.get("status") == "completed":
+                await prod_enr.send_and_wait(TOPIC_ENRICHER_CMD, {"task_id": task_id})
+                logger.info("➡ enricher command sent for task %s", task_id)
 
             if st.get("status") in {"completed", "failed"}:
                 idx_done = True
@@ -96,7 +106,13 @@ async def scrape_tea_products_task(
 
     async def watch_enricher():
         nonlocal enr_done
-        async for m in c_enr:
+        while True:
+            try:
+                m = await asyncio.wait_for(c_enr.getone(), timeout=300)
+            except asyncio.TimeoutError:
+                logger.error("enricher status timeout")
+                break
+
             st: dict = m.value
             if st.get("task_id") != task_id:
                 continue
@@ -108,7 +124,10 @@ async def scrape_tea_products_task(
                 break
 
     # ─── 3. параллельно ждём оба стрима ───
-    await asyncio.gather(watch_indexer(), watch_enricher())
+    try:
+        await asyncio.gather(watch_indexer(), watch_enricher())
+    finally:
+        await asyncio.gather(c_idx.stop(), c_enr.stop(), prod_enr.stop())
 
     # ─── 4. финал ───
     final_status = (
@@ -119,5 +138,4 @@ async def scrape_tea_products_task(
     await _patch(task_id, {"status": final_status,
                            "completed_at": datetime.utcnow()})
 
-    await asyncio.gather(c_idx.stop(), c_enr.stop(), prod_enr.stop())
     logger.info("🏁 scraping task %s finished (%s)", task_id, final_status)
