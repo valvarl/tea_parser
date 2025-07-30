@@ -1,3 +1,23 @@
+"""
+Listens to <enricher_cmd> Kafka topic, runs ProductEnricher on the specified
+SKU‑list (or on all products lacking PDP‑fields), pushes the enriched data
+into MongoDB collections <tea_products> and <tea_reviews>, and emits progress
+updates to <enricher_status>.
+
+Message schema (JSON, UTF‑8):
+{
+    "task_id": "uuid",
+    "skus": ["123456789", "987654321", ...],   # optional; if omitted → auto‑detect
+    "reviews": true,            # optional, default: false
+    "reviews_limit": 30,        # optional, default: 20
+    "concurrency": 8            # optional, default via env
+}
+
+* If **skus** not provided, worker takes every product from tea_products
+  where charcs_json == null OR description == null.
+* Enrichment progress is reported every 10 processed items (or at the end).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,18 +29,23 @@ from typing import Any, Dict, List
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from app.core.logging import configure_logging
 from app.db.mongo import db
-from app.services.enricher import ProductEnricher  # ваш класс выше
+from app.services.enricher import ProductEnricher  # класс из enricher.py
 
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_ENRICHER_CMD = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
+TOPIC_ENRICHER_CMD    = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
 TOPIC_ENRICHER_STATUS = os.getenv("TOPIC_ENRICHER_STATUS", "enricher_status")
-
-MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 3))
-CATEGORY_DEF  = os.getenv("INDEX_CATEGORY_ID", "9373")
+CONCURRENCY_DEF  = int(os.getenv("ENRICH_CONCURRENCY", 6))
+REVIEWS_DEF      = os.getenv("ENRICH_REVIEWS", "false").lower() == "true"
+REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
 
 configure_logging()
 logger = logging.getLogger("enricher-worker")
-enricher = ProductEnricher()                               # один экземпляр
+
+# Один экземпляр на процесс ─ переиспользуем сессии Camoufox.
+enricher = ProductEnricher(concurrency=CONCURRENCY_DEF,
+                           headless=True,
+                           reviews=REVIEWS_DEF,
+                           reviews_limit=REVIEWS_LIMIT_DEF)
 
 
 async def main() -> None:
@@ -39,68 +64,105 @@ async def main() -> None:
     await cons.start(); await prod.start()
     try:
         async for msg in cons:
-            task_id = msg.value["task_id"]
-            search  = msg.value["search_term"]
+            cmd: Dict[str, Any] = msg.value
+            task_id = cmd["task_id"]
+            skus: List[str] | None = cmd.get("skus")
+            want_reviews = bool(cmd.get("reviews", REVIEWS_DEF))
+            reviews_limit = int(cmd.get("reviews_limit", REVIEWS_LIMIT_DEF))
+            concurrency = int(cmd.get("concurrency", CONCURRENCY_DEF))
             try:
-                await handle(task_id, search, prod)
-            except Exception as exc:          # не коммитим → ретрай
+                await handle(task_id, skus, want_reviews, reviews_limit, concurrency, prod)
+            except Exception as exc:
                 logger.exception("task failed: %s", exc)
+                # не коммитим → kafka ретрай
     finally:
         await cons.stop(); await prod.stop()
 
 
-async def handle(task_id: str, query: str, prod: AIOKafkaProducer) -> None:
+async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
+                 reviews_limit: int, concurrency: int,
+                 prod: AIOKafkaProducer) -> None:
     try:
-        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {"task_id": task_id, "status": "running"})
-        logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, CATEGORY_DEF, MAX_PAGES_DEF)
-        products: List[Dict] = await enricher.search_products(
-            query=query,
-            category=CATEGORY_DEF,
-            start_page=1,
-            max_pages=MAX_PAGES_DEF,
-            headless=True,
-        )
-        total = len(products)
-        logger.info("→ %d products", total)
+        # 1. Выбираем товары для обогащения
+        if skus:
+            base_rows = list(db.tea_products.find({"sku": {"$in": skus}}, {"_id": 0}))
+        else:
+            base_rows = list(db.tea_products.find({
+                "$or": [
+                    {"charcs_json": {"$exists": False}},
+                    {"description": {"$exists": False}},
+                ]
+            }, {"_id": 0}))
+        total = len(base_rows)
+        if not total:
+            await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
+                "task_id": task_id,
+                "status": "completed",
+                "scraped_products": 0,
+                "failed_products": 0,
+                "total_products": 0,
+            })
+            logger.info("task %s — nothing to enrich", task_id)
+            return
 
+        # 2. Настраиваем enricher под параметры задачи (thread‑safe)
+        enricher.concurrency   = concurrency
+        enricher.want_reviews  = want_reviews
+        enricher.reviews_limit = reviews_limit
+
+        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
+            "task_id": task_id,
+            "status": "running",
+        })
+        logger.info("⚙️  enriching %d products (reviews=%s)", total, want_reviews)
+
+        # 3. Запускаем enrichment
+        rows_plus, reviews = await enricher.enrich(base_rows)
+
+        # 4. Сохранение в MongoDB с прогресс‑репортом
         scraped = failed = 0
-        for idx, p in enumerate(products, 1):
+        for idx, row in enumerate(rows_plus, 1):
             try:
-                await db.tea_products.update_one(
-                    {"ozon_id": p.get("ozon_id")}, {"$set": p}, upsert=True
-                )
+                db.tea_products.update_one({"sku": row["sku"]}, {"$set": row}, upsert=True)
                 scraped += 1
             except Exception:
                 failed += 1
 
-            # каждые 10 товаров отдаём прогресс
             if idx % 10 == 0 or idx == total:
-                await prod.send_and_wait(
-                    TOPIC_ENRICHER_STATUS,
-                    {
-                        "task_id": task_id,
-                        "status": "running",
-                        "scraped_products": scraped,
-                        "failed_products": failed,
-                        "total_products": total,
-                    },
-                )
+                await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
+                    "task_id": task_id,
+                    "status": "running",
+                    "scraped_products": scraped,
+                    "failed_products": failed,
+                    "total_products": total,
+                })
 
-        await prod.send_and_wait(
-            TOPIC_ENRICHER_STATUS,
-            {
-                "task_id": task_id,
-                "status": "completed",
-                "scraped_products": scraped,
-                "failed_products": failed,
-                "total_products": total,
-            },
-        )
+        # 4b. Отзывы — в отдельную коллекцию
+        if want_reviews and reviews:
+            for rv in reviews:
+                try:
+                    db.tea_reviews.update_one(
+                        {"sku": rv["sku"], "author": rv["author"], "date": rv["date"]},
+                        {"$set": rv}, upsert=True)
+                except Exception:
+                    logger.warning("failed to upsert review for %s", rv.get("sku"))
+
+        # 5. Финальное сообщение
+        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
+            "task_id": task_id,
+            "status": "completed",
+            "scraped_products": scraped,
+            "failed_products": failed,
+            "total_products": total,
+            "saved_reviews": len(reviews) if want_reviews else 0,
+        })
     except Exception as e:
-        await prod.send_and_wait(
-            TOPIC_ENRICHER_STATUS,
-            {"task_id": task_id, "status": "failed", "error_message": str(e)},
-        )
+        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
+            "task_id": task_id,
+            "status": "failed",
+            "error_message": str(e),
+        })
+        raise
 
 
 if __name__ == "__main__":
