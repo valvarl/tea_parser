@@ -86,22 +86,20 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
     try:
         # 1. Выбираем товары для обогащения
         if skus:
-            base_rows = list(
-                db.tea_products.find({"sku": {"$in": skus}}, {"_id": 0})
-            )
+            base_rows = await db.tea_products.find(
+                {"sku": {"$in": skus}}, {"_id": 0}
+            ).to_list(None)
         else:
-            base_rows = list(
-                db.tea_products.find(
-                    {
-                        "task_id": task_id,
-                        "$or": [
-                            {"charcs_json": {"$exists": False}},
-                            {"description": {"$exists": False}},
-                        ],
-                    },
-                    {"_id": 0},
-                )
-            )
+            base_rows = await db.tea_products.find(
+                {
+                    "task_id": task_id,
+                    "$or": [
+                        {"charcs_json": {"$exists": False}},
+                        {"description": {"$exists": False}},
+                    ],
+                },
+                {"_id": 0},
+            ).to_list(None)
         total = len(base_rows)
         if not total:
             await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
@@ -132,7 +130,7 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
         scraped = failed = 0
         for idx, row in enumerate(rows_plus, 1):
             try:
-                db.tea_products.update_one({"sku": row["sku"]}, {"$set": row}, upsert=True)
+                await db.tea_products.update_one({"sku": row["sku"]}, {"$set": row}, upsert=True)
                 scraped += 1
             except Exception:
                 failed += 1
@@ -150,7 +148,7 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
         if want_reviews and reviews:
             for rv in reviews:
                 try:
-                    db.tea_reviews.update_one(
+                    await db.tea_reviews.update_one(
                         {"sku": rv["sku"], "author": rv["author"], "date": rv["date"]},
                         {"$set": rv}, upsert=True)
                 except Exception:
