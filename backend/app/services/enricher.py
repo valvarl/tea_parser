@@ -105,6 +105,9 @@ class ProductEnricher:
 
     def __init__(self, *, concurrency: int = 6, headless: bool = True,
                  reviews: bool = False, reviews_limit: int = 20) -> None:
+        
+        self.base_url      = "https://www.ozon.ru"
+
         self.concurrency   = max(1, concurrency)
         self.headless      = headless
         self.want_reviews  = reviews
@@ -163,7 +166,7 @@ class ProductEnricher:
 
             # Открываем первый товар лишь для захвата cookies/headers
             page.on("response", capture_entry)
-            await page.goto(rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
+            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
             await asyncio.sleep(random.uniform(1.0, 1.8))
             # -- если не удалось поймать headers: всё равно попробуем
 

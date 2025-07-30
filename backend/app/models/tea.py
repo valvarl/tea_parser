@@ -1,5 +1,5 @@
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator  
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime
@@ -16,7 +16,7 @@ class TeaProduct(BaseModel):
     reviews_count: Optional[int] = None
     description: Optional[str] = None
     characteristics: Optional[Dict[str, Any]] = None
-    images: List[str] = []
+    images: List[str] = Field(default_factory=list)
     category_path: Optional[str] = None
     category_id: Optional[str] = None
     brand: Optional[str] = None
@@ -32,6 +32,17 @@ class TeaProduct(BaseModel):
     raw_data: Optional[Dict[str, Any]] = None
     scraped_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: Optional[datetime] = None
+
+    @field_validator("images", mode="before")
+    @classmethod
+    def _images_to_list(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [url for url in v.split("|") if url]
+        if isinstance(v, list):
+            return v
+        raise TypeError("images must be list or '|'-separated string")
 
 class TeaProductCreate(BaseModel):
     name: str
