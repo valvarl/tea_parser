@@ -55,6 +55,7 @@ async def main() -> None:
         group_id="enricher-worker",
         value_deserializer=lambda x: json.loads(x.decode()),
         auto_offset_reset="earliest",
+        enable_auto_commit=False,
     )
     prod = AIOKafkaProducer(
         bootstrap_servers=BOOT,
@@ -85,14 +86,22 @@ async def handle(task_id: str, skus: List[str] | None, want_reviews: bool,
     try:
         # 1. Выбираем товары для обогащения
         if skus:
-            base_rows = list(db.tea_products.find({"sku": {"$in": skus}}, {"_id": 0}))
+            base_rows = list(
+                db.tea_products.find({"sku": {"$in": skus}}, {"_id": 0})
+            )
         else:
-            base_rows = list(db.tea_products.find({
-                "$or": [
-                    {"charcs_json": {"$exists": False}},
-                    {"description": {"$exists": False}},
-                ]
-            }, {"_id": 0}))
+            base_rows = list(
+                db.tea_products.find(
+                    {
+                        "task_id": task_id,
+                        "$or": [
+                            {"charcs_json": {"$exists": False}},
+                            {"description": {"$exists": False}},
+                        ],
+                    },
+                    {"_id": 0},
+                )
+            )
         total = len(base_rows)
         if not total:
             await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {

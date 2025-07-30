@@ -141,14 +141,15 @@ class ProductIndexer:
             "first_seen": TODAY,
         }
 
-    async def search_products(
+    async def iter_products(
         self,
         query: str,
         category: str = "9373",
         start_page: int = 1,
         max_pages: int = 10,
         headless: bool = True,
-    ) -> List[Dict]:
+    ) -> AsyncIterator[List[Dict]]:
+        """Yield product batches page by page."""
         search_url = f"{self.search_url}?text={query}&category={category}&page={start_page}"
 
         async with AsyncCamoufox(headless=headless) as browser:
@@ -177,18 +178,20 @@ class ProductIndexer:
                 print("⛔ Entrypoint-API не пойман — анти-бот или новая разметка.")
                 return
 
-            all_rows: List[Dict[str, Any]] = []
             seen: set[str] = set()
             json_page = first_json
             page_no = start_page
 
             while True:
+                batch_rows: List[Dict[str, Any]] = []
                 for it in self.extract_items(json_page):
                     row = self.grab_item(it)
                     if row and row["sku"] not in seen:
                         seen.add(row["sku"])
-                        all_rows.append(row)
+                        batch_rows.append(row)
                 print(f"✓ page {page_no}: всего {len(seen)} уникальных")
+                if batch_rows:
+                    yield batch_rows
 
                 page_no += 1
                 if max_pages and page_no > start_page + max_pages - 1:
@@ -202,4 +205,22 @@ class ProductIndexer:
                 json_page = await resp.json()
                 await asyncio.sleep(random.uniform(1.2, 2.5))
 
-        return all_rows
+    async def search_products(
+        self,
+        query: str,
+        category: str = "9373",
+        start_page: int = 1,
+        max_pages: int = 10,
+        headless: bool = True,
+    ) -> List[Dict]:
+        """Return all products across the requested pages."""
+        result: List[Dict] = []
+        async for batch in self.iter_products(
+            query=query,
+            category=category,
+            start_page=start_page,
+            max_pages=max_pages,
+            headless=headless,
+        ):
+            result.extend(batch)
+        return result
