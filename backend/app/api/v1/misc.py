@@ -35,7 +35,7 @@ async def get_scraping_stats():
     completed = await db.scraping_tasks.count_documents({"status": "completed"})
     failed = await db.scraping_tasks.count_documents({"status": "failed"})
 
-    products_total = await db.tea_products.count_documents({})
+    products_total = await db.candidates.count_documents({})
     error_rate = (failed / total * 100) if total else 0
 
     return ScrapingStats(
@@ -55,7 +55,7 @@ async def get_tea_categories():
         {"$group": {"_id": "$tea_type", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
     ]
-    cats = await db.tea_products.aggregate(pipeline).to_list(100)
+    cats = await db.candidates.aggregate(pipeline).to_list(100)
     return {"categories": cats, "total_types": len(cats)}
 
 
@@ -64,7 +64,7 @@ async def get_tea_categories():
 
 @router.get("/export/csv")
 async def export_products_csv():
-    products = await db.tea_products.find().to_list(10_000)
+    products = await db.candidates.find().to_list(10_000)
     for p in products:
         p.pop("_id", None)
     return {"data": products, "count": len(products)}

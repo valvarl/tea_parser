@@ -72,7 +72,7 @@ async def handle(task_id: str, query: str, category: str, max_pages: int, prod: 
             for p in batch:
                 try:
                     p["task_id"] = task_id
-                    await db.tea_products.update_one(
+                    await db.index.update_one(
                         {"sku": p.get("sku")}, {"$set": p}, upsert=True
                     )
                     scraped += 1

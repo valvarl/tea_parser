@@ -19,7 +19,7 @@ async def get_tea_products(
 ):
     query = {"tea_type": tea_type} if tea_type else {}
     products = (
-        await db.tea_products.find(query)
+        await db.candidates.find(query)
         .skip(skip)
         .limit(limit)
         .sort("scraped_at", -1)
@@ -32,7 +32,7 @@ async def get_tea_products(
 
 @router.get("/{product_id}", response_model=TeaProduct)
 async def get_tea_product(product_id: str):
-    product = await db.tea_products.find_one({"id": product_id})
+    product = await db.candidates.find_one({"id": product_id})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     product.pop("_id", None)
@@ -41,7 +41,7 @@ async def get_tea_product(product_id: str):
 
 @router.delete("/{product_id}")
 async def delete_tea_product(product_id: str):
-    res = await db.tea_products.delete_one({"id": product_id})
+    res = await db.candidates.delete_one({"id": product_id})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
     return {"message": "Product deleted successfully"}
@@ -49,7 +49,7 @@ async def delete_tea_product(product_id: str):
 
 @router.post("/bulk-delete")
 async def bulk_delete_products(product_ids: List[str]):
-    res = await db.tea_products.delete_many({"id": {"$in": product_ids}})
+    res = await db.candidates.delete_many({"id": {"$in": product_ids}})
     return {
         "deleted_count": res.deleted_count,
         "message": f"Deleted {res.deleted_count} products",
