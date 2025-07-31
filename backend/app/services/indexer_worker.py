@@ -78,6 +78,7 @@ async def handle(
         logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, category, max_pages)
 
         scraped = failed = page_no = 0
+        inserted = updated = 0
         now = datetime.utcnow()
 
         async for batch in indexer.iter_products(
@@ -93,11 +94,12 @@ async def handle(
                 sku = p.get("sku")
                 if not sku:
                     continue
-
+                
+                first_seen_at = _prepare_for_mongo(p["first_seen"])
                 prepared_doc: Dict[str, Any] = {
                     "sku": sku,
-                    "first_seen_at": _prepare_for_mongo(p["first_seen"]),
-                    "last_seen_at": now,
+                    "first_seen_at": first_seen_at,
+                    "last_seen_at": max(now, first_seen_at),
                     "is_active": True,
                     "task_id": task_id,
                     "candidate_id": None,
@@ -116,6 +118,10 @@ async def handle(
                         },
                         upsert=True,
                     )
+                    if res.upserted_id is not None:   # ← добавлено впервые
+                        inserted += 1
+                    else:                             # ← уже было, просто «подмигнули»
+                        updated += 1
                     duration = time.perf_counter() - start
                     logger.debug("Mongo upsert sku=%s OK (%.3fs)", sku, duration)
                     scraped += 1
@@ -136,6 +142,8 @@ async def handle(
                     "batch_data": {"batch_id": page_no, "skus": batch_skus},
                     "scraped_products": scraped,
                     "failed_products": failed,
+                    "inserted_products": inserted,
+                    "updated_products": updated,
                 },
             )
             logger.info(
@@ -154,6 +162,8 @@ async def handle(
                 "status": "completed",
                 "scraped_products": scraped,
                 "failed_products": failed,
+                "inserted_products": inserted,
+                "updated_products": updated,
                 "total_products": total,
             },
         )

@@ -71,6 +71,24 @@ enricher = ProductEnricher(
 # Helpers
 # --------------------------------------------------------------------------
 
+IMMUTABLE_ON_INSERT = ("created_at",)
+
+def _split_update(doc: dict) -> tuple[dict, dict]:
+    """
+    Возвращает (set_on_insert, set_always).
+    Всё, что нельзя трогать при апдейте (created_at …), уходит
+    **только** в $setOnInsert.
+    """
+    soi, sa = {}, {}
+    for k, v in doc.items():
+        if k in IMMUTABLE_ON_INSERT:
+            soi[k] = v
+        else:
+            sa[k] = v
+    # обновляем «дата последнего парсинга»
+    sa["updated_at"] = datetime.utcnow()
+    return soi, sa
+
 def _now() -> datetime:
     return datetime.utcnow()
 
@@ -211,15 +229,19 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer):
         sku = row["sku"]
         first_seen_at = next((it.get("first_seen_at") for it in base_rows if it["sku"] == sku), None)
         candidate_doc = _mk_candidate_doc(row, first_seen_at)
+        soi, sa = _split_update(candidate_doc)
         try:
             res = await db.candidates.update_one(
-                {"sku": sku},
-                {"$set": candidate_doc, "$setOnInsert": {"created_at": candidate_doc["created_at"]}},
+                {"sku": candidate_doc["sku"]},
+                {"$set": sa, "$setOnInsert": soi},
                 upsert=True,
             )
             candidate_id = res.upserted_id or (await db.candidates.find_one({"sku": sku}, {"_id": 1}))['_id']
             # link back from index → candidates
-            await db.index.update_one({"sku": sku}, {"$set": {"candidate_id": candidate_id}})
+            await db.index.update_one(
+                {"sku": candidate_doc["sku"]},
+                {"$set": {"candidate_id": candidate_id}},
+            )
             # price history
             await _save_price_snapshot(candidate_id, candidate_doc["basic"]["price_current"], candidate_doc["basic"]["price_old"])
             scraped += 1
@@ -244,7 +266,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer):
     # ------------------------------------------------------------------
     await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
         "task_id": task_id,
-        "status": "completed",
+        "status": "batch_ready",
         "scraped_products": scraped,
         "failed_products": failed,
         "total_products": total,
