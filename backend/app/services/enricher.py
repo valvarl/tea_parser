@@ -22,55 +22,12 @@ import json
 import random
 import re
 import urllib.parse as u
-from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from camoufox.async_api import AsyncCamoufox
 
 # ─────────── Константы / regexp ─────────────────────────────────────────────
 ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
-TODAY: date   = date.today()
-
-# ─────────── Вспомогательные утилиты (скопированы из indexer) ───────────────
-NARROW_SPACE  = "\u2009"
-PRICE_RE      = re.compile(r"\d+")
-MONTHS_RU     = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-}
-
-def digits_only(text: str) -> str:
-    return re.sub(r"[^0-9.]", "", text.replace(" ", "")
-                 .replace(NARROW_SPACE, "").replace("\xa0", ""))
-
-def clean_price(text: Optional[str]) -> Optional[int]:
-    if not text:
-        return None
-    m = PRICE_RE.search(digits_only(text))
-    return int(m.group()) if m else None
-
-def parse_delivery(text: Optional[str]) -> Optional[date]:
-    if not text:
-        return None
-    txt = text.lower().strip()
-    if txt == "сегодня":
-        return TODAY
-    if txt == "завтра":
-        return TODAY + timedelta(days=1)
-    if txt == "послезавтра":
-        return TODAY + timedelta(days=2)
-    m = re.match(r"(\d{1,2})\s+([а-яё]+)", txt)
-    if m:
-        day, month_name = int(m.group(1)), m.group(2)
-        month = MONTHS_RU.get(month_name)
-        if month:
-            year = TODAY.year
-            parsed = date(year, month, day)
-            if parsed < TODAY - timedelta(days=2):
-                parsed = date(year + 1, month, day)
-            return parsed
-    return None
 
 # ─────────── PDP helpers ────────────────────────────────────────────────────
 
@@ -181,5 +138,3 @@ class ProductEnricher:
 
             await asyncio.gather(*(worker(dict(r)) for r in rows))
             return enriched, all_reviews
-
-# ─────────── Точек входа больше нет ─────────────────────────────────────────

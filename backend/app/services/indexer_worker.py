@@ -1,10 +1,3 @@
-"""
-Listens topic <index_requests>, runs ProductIndexer, pushes rows to <product_raw>
-Now includes detailed debug-level logging around MongoDB operations and
-conversion of unsupported Python types (e.g. datetime.date) before the upsert
-so that they don't trigger encoding errors.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,12 +6,14 @@ import logging
 import os
 import time
 from datetime import date, datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from app.core.logging import configure_logging
 from app.db.mongo import db
 from app.services.indexer import ProductIndexer  # ваш класс выше
+
+from bson import ObjectId
 
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
@@ -28,33 +23,20 @@ CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
 
 configure_logging()
 logger = logging.getLogger("indexer-worker")
-indexer = ProductIndexer()  # один экземпляр
+indexer = ProductIndexer()
 
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
 
 def _prepare_for_mongo(obj: Any) -> Any:
-    """Recursively convert Python objects that PyMongo can't encode (e.g. ``date``)
-    into types it understands (``datetime``).
-    """
     if isinstance(obj, dict):
         return {k: _prepare_for_mongo(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_prepare_for_mongo(v) for v in obj]
-    # Convert ``datetime.date`` (not ``datetime``) to midnight UTC ``datetime``
     if isinstance(obj, date) and not isinstance(obj, datetime):
         return datetime(obj.year, obj.month, obj.day)
     return obj
 
 
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
-
 async def main() -> None:
-    """Entry point that blocks consuming Kafka until interrupted."""
     cons = AIOKafkaConsumer(
         TOPIC_INDEXER_CMD,
         bootstrap_servers=BOOT,
@@ -77,8 +59,8 @@ async def main() -> None:
             max_pages = msg.value.get("max_pages", MAX_PAGES_DEF)
             try:
                 await handle(task_id, search, category, max_pages, prod)
-                await cons.commit()  # зафиксируем offset, если всё без ошибок
-            except Exception as exc:  # не коммитим → ретрай
+                await cons.commit()
+            except Exception as exc:
                 logger.exception("task failed: %s", exc)
     finally:
         await cons.stop(); await prod.stop()
@@ -91,12 +73,13 @@ async def handle(
     max_pages: int,
     prod: AIOKafkaProducer,
 ) -> None:
-    """Orchestrates a single indexing task and pushes progress to Kafka."""
     try:
         await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running"})
         logger.info("🔍 indexing '%s' (cat=%s, pages=%s)", query, category, max_pages)
 
         scraped = failed = page_no = 0
+        now = datetime.utcnow()
+
         async for batch in indexer.iter_products(
             query=query,
             category=category,
@@ -107,14 +90,32 @@ async def handle(
             page_no += 1
             batch_skus: List[str] = []
             for p in batch:
-                p["task_id"] = task_id
                 sku = p.get("sku")
+                if not sku:
+                    continue
 
-                # --- MongoDB interaction with detailed timing & outcome logging ---
-                prepared_doc: Dict[str, Any] = _prepare_for_mongo(p)
+                prepared_doc: Dict[str, Any] = {
+                    "sku": sku,
+                    "first_seen_at": _prepare_for_mongo(p["first_seen"]),
+                    "last_seen_at": now,
+                    "is_active": True,
+                    "task_id": task_id,
+                    "candidate_id": None,
+                }
+
                 start = time.perf_counter()
                 try:
-                    await db.index.update_one({"sku": sku}, {"$set": prepared_doc}, upsert=True)
+                    res = await db.index.update_one(
+                        {"sku": sku},
+                        {
+                            "$set": {"last_seen_at": prepared_doc["last_seen_at"], "is_active": True},
+                            "$setOnInsert": {
+                                "first_seen_at": prepared_doc["first_seen_at"],
+                                "candidate_id": None,
+                            },
+                        },
+                        upsert=True,
+                    )
                     duration = time.perf_counter() - start
                     logger.debug("Mongo upsert sku=%s OK (%.3fs)", sku, duration)
                     scraped += 1
@@ -126,9 +127,7 @@ async def handle(
                         exc_info=True,
                     )
                     failed += 1
-                # -----------------------------------------------------------------
 
-            # send batch status – useful for downstream consumers
             await prod.send_and_wait(
                 TOPIC_INDEXER_STATUS,
                 {
