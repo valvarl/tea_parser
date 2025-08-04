@@ -40,7 +40,8 @@ HEADLESS     = False
 # ─────────── Регэкспы / константы ────────────────────────────────────────────
 ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F")
 PRICE_RE      = re.compile(r"\d+")
-REVIEW_WIDGET_RE = re.compile(r"^webListReviews-.*-reviewshelfpaginator-\d+")
+# REVIEW_WIDGET_RE = re.compile(r"^webListReviews-.*-reviewshelfpaginator-\d+")
+REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")
 NARROW_SPACE  = "\u2009"
 TODAY: date   = date.today()
 MONTHS_RU     = {
@@ -195,43 +196,60 @@ def collect_characteristics(json_page: Dict[str, Any]) -> str:
 
 # 3.  Итеративный сбор отзывов ------------------------------------------------
 
-async def fetch_reviews_shelf(ctx, headers: Dict[str, str], path_part: str, sku: str,
-                              limit: int | None = None) -> None:
-    """Скачать все страницы reviewshelfpaginator и сохранить «сырые» JSON-строки.
-
-    Пока ограничений на количество отзывов/страниц нет. Если limit>0,
-    останавливаемся как только соберём >= limit (на будущее).
+async def fetch_reviews_shelf(
+    ctx,
+    headers: Dict[str, str],
+    path_part: str,
+    sku: str,
+    limit: int | None = None,
+) -> None:
     """
-    page_no = 1
+    Скачиваем все страницы виджета reviewshelfpaginator и сохраняем «сырые» JSON-строки.
+    Если limit > 0 — прекращаем, как только сохранили не меньше limit страниц.
+    """
+    # URL первой страницы формируем по-старому
+    next_path: str | None = (
+        f"{path_part}?layout_container=reviewshelfpaginator"
+        "&layout_page_index=1&reviewsVariantMode=1"
+    )
+
+    page_no = 1           # счётчик, только чтобы красиво именовать файлы
     total_saved = 0
-    while True:
+
+    while next_path:
         shelf_api = (
-            "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" +
-            u.quote(
-                f"{path_part}?layout_container=reviewshelfpaginator&layout_page_index={page_no}&reviewsVariantMode=1",
-                safe=""
-            )
+            "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
+            + u.quote(next_path, safe="")
         )
+
         resp = await ctx.request.get(shelf_api, headers=headers)
         if resp.status != 200:
-            break  # закончили (404/500 и т.п.)
+            break                     # 404/500 — дальше идти нельзя
 
         data = await resp.json()
 
-        # ищем JSON-строку виджета «webListReviews-*-reviewshelfpaginator-*»
-        raw_widget = next((v for k, v in data.get("widgetStates", {}).items()
-                           if REVIEW_WIDGET_RE.match(k)), None)
+        # «Сырой» JSON самого виджета
+        raw_widget = next(
+            (
+                v
+                for k, v in data.get("widgetStates", {}).items()
+                if REVIEW_WIDGET_RE.match(k)
+            ),
+            None,
+        )
         if not raw_widget:
-            break  # виджета нет — дальше отзывов нет
+            break                     # больше отзывов нет
 
         save_reviews_raw(sku, page_no, raw_widget)
         total_saved += 1
 
-        # Limit-счётчик (пока только по страницам, т.к. мы не знаем кол-во ревью в строке)
         if limit and total_saved >= limit:
-            break
+            break                    # достигли предела страниц
 
+        # --- готовим URL следующей страницы ---
+        next_path = data.get("nextPage") or data.get("pageInfo", {}).get("url")
         page_no += 1
+
         await asyncio.sleep(random.uniform(0.9, 1.5))
 
 # 4.  Основной PDP граббер ----------------------------------------------------
