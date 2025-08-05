@@ -1,81 +1,183 @@
-from __future__ import annotations
-"""ProductEnricher — модуль «второго прохода» для Ozon‑парсера.
-
-Этот файл больше **не** содержит CLI‑обёртки: теперь он предоставляет
-только класс `ProductEnricher`, который можно вызывать из другого кода.
-
-Пример использования:
-```python
-from indexer import ProductIndexer
-from enricher import ProductEnricher
-
-idx = ProductIndexer()
-base_rows = await idx.search_products("пуэр")
-
-enricher = ProductEnricher(reviews=True, reviews_limit=30)
-rows_plus, reviews = await enricher.enrich(base_rows)
-```
 """
+enricher.py
+
+Пример:
+    enr = ProductEnricher(
+        reviews=True, reviews_limit=40,
+        states=True, state_ids=["state-searchResultsV2", r"state-pdp.*"], state_regex=True
+    )
+    rows_plus, reviews = await enr.enrich(base_rows)
+"""
+
+from __future__ import annotations
 
 import asyncio
 import json
 import random
 import re
 import urllib.parse as u
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import BrowserContext, Page
 
-# ─────────── Константы / regexp ─────────────────────────────────────────────
+from .utils import collect_raw_widgets, clear_widget_meta
+
 ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
+REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")   
 
-# ─────────── PDP helpers ────────────────────────────────────────────────────
+_JS_PULL = """
+({ids = [], useRegex = false} = {}) => {
+  const ok = id =>
+    !ids.length ||
+    ids.some(p => useRegex ? new RegExp(p).test(id)
+                           : (id === p || id.includes(p)));
 
-def collect_raw_widget(json_page: Dict[str, Any], prefix: str) -> str:
-    """Вернуть JSON‑строку widgetStates, чей ключ начинается с prefix."""
-    for k, raw in json_page.get("widgetStates", {}).items():
-        if k.startswith(prefix):
-            return raw
-    return ""
+  const out = {};
+  document.querySelectorAll('div[data-state]').forEach(el => {
+    if (!ok(el.id)) return;
+    const raw = el.dataset.state;
+    if (!raw) return;
+    try { out[el.id] = JSON.parse(raw); }
+    catch { out[el.id] = raw; }
+  });
+  return out;
+}
+"""
 
-def collect_description(json_page: Dict[str, Any]) -> str:
-    return collect_raw_widget(json_page, "webDescription-")
-
-def collect_characteristics(json_page: Dict[str, Any]) -> str:
-    return collect_raw_widget(json_page, "webCharacteristics-")
-
-def extract_reviews(obj: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for rev in obj.get("productReviewList", []):
-        if len(out) >= limit:
-            break
-        text = rev.get("text", "").strip()
-        rating = rev.get("grade")
-        author = rev.get("author") or ""
-        dt_str = rev.get("date") or ""
-        out.append({"author": author, "rating": rating, "date": dt_str, "text": text})
-    return out
-
-# ─────────── Класс Enricher ────────────────────────────────────────────────
 class ProductEnricher:
-    """Асинхронный обогатитель SKU‑карточек из списка indexer.py."""
+    """Асинхронный обогатитель SKU-карточек: описание, характеристики, отзывы, state-div-ы."""
 
-    def __init__(self, *, concurrency: int = 6, headless: bool = True,
-                 reviews: bool = False, reviews_limit: int = 20) -> None:
+    def __init__(
+        self,
+        *,
+        concurrency: int = 6,
+        headless: bool = True,
+        # reviews
+        reviews: bool = False,
+        reviews_limit: int = 0,
+        # state-div
+        states: bool = False,
+        state_ids: Optional[List[str]] = None,
+        state_regex: bool = False,
+        state_wait: int = 7_000,
+    ) -> None:
         
         self.base_url      = "https://www.ozon.ru"
 
         self.concurrency   = max(1, concurrency)
         self.headless      = headless
+
         self.want_reviews  = reviews
         self.reviews_limit = reviews_limit
 
-    # ------------------------------------------------------------------
-    async def _grab_pdp(self, ctx, headers: Dict[str, str], row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        self.want_states   = states
+        self.state_ids     = state_ids or []
+        self.state_regex   = state_regex
+        self.state_wait    = max(1_000, state_wait)     # ≥1 с
+
+    def _filter_reviews(self, rev: Dict[str, Any]) -> Dict[str, Any]:
+        """Оставляем только нужные поля + нормализуем дату."""
+        return {
+            "author":       rev.get("author"),         # dict
+            "content":      rev.get("content"),        # dict
+            "comments":     rev.get("comments"),       # dict
+            "usefulness":   rev.get("usefulness"),     # dict
+            "created_at":   rev.get("createdAt"),
+            "published_at": rev.get("publishedAt"),
+            "updated_at":   rev.get("updatedAt"),
+            "is_purchased": rev.get("isItemPurchased"),
+            "uuid":         rev.get("uuid"),
+            "version":      rev.get("version"),
+        }
+
+    async def _collect_reviews_shelf(self, ctx, headers, path_part, sku) -> List[Dict[str, Any]]:
+        reviews: List[Dict[str, Any]] = []
+        next_path: Optional[str] = (
+            f"{path_part}?layout_container=reviewshelfpaginator"
+            "&layout_page_index=1&reviewsVariantMode=1"
+        )
+
+        total_reviews = -1
+        reviews_limit = self.reviews_limit
+
+        while next_path and (reviews_limit == 0 or len(reviews) < reviews_limit):
+            shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + \
+                        u.quote(next_path, safe="")
+            resp = await ctx.request.get(shelf_api, headers=headers)
+            if resp.status != 200: break
+            data = await resp.json()
+
+            raw_widget = next((v for k, v in data.get("widgetStates", {}).items()
+                               if REVIEW_WIDGET_RE.match(k)), None)
+            if not raw_widget: break
+            try:
+                widget_obj = json.loads(raw_widget)
+            except Exception:
+                widget_obj = {}
+
+            if total_reviews == -1:
+                total_reviews = widget_obj.get("paging", {}).get("total", 0)
+                if total_reviews < 1:
+                    return []
+                reviews_limit = min(total_reviews, reviews_limit)
+
+            for rev in widget_obj.get("reviews", []):
+                review_parsed = {**self._filter_reviews(rev), "sku": sku}
+                if review_parsed.get("content", {}).get("comment", "") == "":
+                    break
+                reviews.append(review_parsed)
+                if len(reviews) >= self.reviews_limit:
+                    break
+
+            next_path = data.get("nextPage") or data.get("pageInfo", {}).get("url")
+            await asyncio.sleep(random.uniform(0.9, 1.5))
+
+        return reviews[:reviews_limit]
+    
+    async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = .8):
+        h = await page.evaluate("()=>document.body.scrollHeight")
+        for _ in range(steps):
+            await page.mouse.wheel(0, h // steps)
+            await asyncio.sleep(pause)
+
+    async def _collect_states_divs(
+        self,
+        ctx: BrowserContext,
+        url: str,
+        ids: List[str],
+        use_regex: bool,
+        wait_ms: int,
+    ) -> Dict[str, Any]:
+        page = await ctx.new_page()
+        await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+        await asyncio.sleep(1.5)
+        await self._gentle_scroll(page)
+        await asyncio.sleep(1.0)
+
+        try:
+            await page.wait_for_selector("div[data-state]", state="attached", timeout=wait_ms)
+            await page.wait_for_function(
+                "document.querySelectorAll('div[data-state]').length > 0", timeout=0
+            )
+        except Exception:
+            # ничего страшного — просто не нашли state-div
+            return {}
+
+        payload = {"ids": ids, "useRegex": use_regex}
+        return await page.evaluate(_JS_PULL, payload)
+    
+    async def _grab_pdp(
+        self,
+        ctx,
+        headers: Dict[str, str],
+        row: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """Скачать PDP‑данные + (опц.) отзывы."""
         path_part = row["link"].split("ozon.ru")[-1]
-        pdp_api = ("https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" +
-                   u.quote(f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""))
+        pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + \
+                  u.quote(f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe="")
 
         resp = await ctx.request.get(pdp_api, headers=headers)
         if resp.status != 200:
@@ -83,27 +185,29 @@ class ProductEnricher:
         pdp_json = await resp.json()
 
         # raw widgets
-        row["charcs_json"] = collect_characteristics(pdp_json) or None
-        row["description"] = collect_description(pdp_json) or None
+        row.update(self._collect_raw_widgets(pdp_json))
 
+        # reviews
         reviews: List[Dict[str, Any]] = []
         if self.want_reviews:
-            reviews_api = ("https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" +
-                           u.quote(f"{path_part}?layout_container=pdpReviews&layout_page_index=2", safe=""))
-            r2 = await ctx.request.get(reviews_api, headers=headers)
-            if r2.status == 200:
-                rev_json = await r2.json()
-                rev_obj = next((json.loads(raw) for raw in rev_json.get("widgetStates", {}).values()
-                                if "productReviewList" in raw), {})
-                reviews = extract_reviews(rev_obj or {}, self.reviews_limit)
-                for rv in reviews:
-                    rv["sku"] = row["sku"]
-        # небольшая задержка → имитируем человекоподобность
+            reviews = await self._collect_reviews_shelf(ctx, headers, path_part, row["sku"])
+
+        # state-div
+        if self.want_states:
+            url_full = self.base_url + row["link"]
+            states = await self._collect_states_divs(
+                ctx, url_full, self.state_ids, self.state_regex, self.state_wait
+            )
+            clear_widget_meta(states)
+            row["states"] = states
+
         await asyncio.sleep(random.uniform(0.7, 1.4))
         return row, reviews
 
-    # ------------------------------------------------------------------
-    async def enrich(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def enrich(
+        self,
+        rows: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Обогатить список товаров. Возвращает (rows_plus, reviews)."""
         if not rows:
             return [], []
@@ -123,9 +227,9 @@ class ProductEnricher:
 
             # Открываем первый товар лишь для захвата cookies/headers
             page.on("response", capture_entry)
-            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
+            await page.goto(self.base_url + rows[0]["link"],
+                            timeout=60_000, wait_until="domcontentloaded")
             await asyncio.sleep(random.uniform(1.0, 1.8))
-            # -- если не удалось поймать headers: всё равно попробуем
 
             sem = asyncio.Semaphore(self.concurrency)
             enriched, all_reviews = [], []
@@ -138,3 +242,28 @@ class ProductEnricher:
 
             await asyncio.gather(*(worker(dict(r)) for r in rows))
             return enriched, all_reviews
+        
+    def _collect_raw_widgets(self, json_page: Dict[str, Any]):
+        charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")
+        descr_blocks = collect_raw_widgets(json_page, "webDescription-")
+
+        if descr_blocks is None:
+            descr_json = {}
+        elif len(descr_blocks) == 2:
+            if 'richAnnotationJson' in descr_blocks[0]:
+                descr_json = {"annotation": descr_blocks[0]["richAnnotationJson"]}
+                descr_json.update(descr_blocks[1])
+            elif 'richAnnotationJson' in descr_blocks[1]:
+                descr_json = {"annotation": descr_blocks[1]["richAnnotationJson"]}
+                descr_json.update(descr_blocks[0])
+            else:
+                raise RuntimeError("No richAnnotationJson collected")
+        elif len(descr_blocks) == 1:
+            if 'richAnnotationJson' in descr_blocks[0]:
+                descr_json = {"annotation": descr_blocks[0]["richAnnotationJson"]}
+            else:
+                raise RuntimeError("No richAnnotationJson collected")
+        else:
+            raise RuntimeError("Somethig wierd during richAnnotationJson collecting")
+        
+        return {"characteristics": charcs_json, "description": descr_json}

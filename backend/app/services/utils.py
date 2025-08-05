@@ -1,9 +1,10 @@
 # utils.py
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 # ─────────── Константы ────────────────────────────────────────────────
 PRICE_RE      = re.compile(r"\d+")
@@ -58,3 +59,33 @@ def parse_delivery(label: Optional[str]) -> Optional[date]:
                 parsed = date(year + 1, month, day)
             return parsed
     return None
+
+COMMON_WIDGET_META = ["lexemes", "params"]
+
+def clear_widget_meta(node: Any) -> None:
+    """Рекурсивно удаляет ключи 'lexemes' и 'params' из словарей внутри node."""
+    if isinstance(node, dict):
+        for k in COMMON_WIDGET_META:
+            node.pop(k, None)
+        for v in node.values():
+            clear_widget_meta(v)
+    elif isinstance(node, list):
+        for item in node:
+            clear_widget_meta(item)
+
+def collect_raw_widgets(json_page: Dict[str, Any], prefix: str, clear_meta=True) -> List[Dict[str, Any]]:
+    """
+    Вернуть список всех widgetStates-элементов, чьи ключи начинаются с `prefix`.
+    """
+    widgets: List[Dict[str, Any]] = []
+    for k, raw in json_page.get("widgetStates", {}).items():
+        if not k.startswith(prefix):
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if clear_meta:
+            clear_widget_meta(obj)
+        widgets.append(obj)
+    return widgets
