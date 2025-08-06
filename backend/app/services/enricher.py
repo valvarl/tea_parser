@@ -173,7 +173,7 @@ class ProductEnricher:
         attr = states.pop(key) if key else None
         return attr
     
-    def _process_charcs(self, property: Dict[str, Any]) -> tuple[str, list[str]]:
+    def _process_charcs(self, property: Dict[str, Any]) -> dict[str, Any]:
         return {
             "id": property.get("id", "").split("_")[0],
             "title": property.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
@@ -268,6 +268,18 @@ class ProductEnricher:
 
         async with AsyncCamoufox(headless=self.headless) as browser:
             ctx = await browser.new_context(locale="ru-RU")
+
+            async def _block_media(route):
+                r = route.request
+                if (
+                    r.resource_type in ("image", "media", "font") or
+                    re.search(r"\.(?:png|jpe?g|webp|gif|svg|mp4|webm|mov)(?:\?|$)", r.url)
+                ):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await ctx.route("**/*", _block_media)
+
             page = await ctx.new_page()
 
             first_headers: Dict[str, str] = {}
@@ -296,9 +308,23 @@ class ProductEnricher:
 
             await asyncio.gather(*(worker(dict(r)) for r in rows))
             return enriched, all_reviews
-        
+
+    def _process_charcs_widget(self, property: Dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": property.get("key", ""),
+            "title": property.get("name", {}).lower(),
+            "values": [v.get("text", "").lower() for v in property.get("values", [])]
+        } 
+
     def _collect_raw_widgets(self, json_page: Dict[str, Any]):
-        charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")
+        charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")[0]
+        characteristics = charcs_json.get("characteristics", [])
+        if len(characteristics) != 1:
+            raise RuntimeError("Characteristics len > 1")
+        if len(characteristics[0]) != 1 or "short" not in characteristics[0]:
+            raise RuntimeError("'short' must be in characteristics")
+        charcs = [self._process_charcs_widget(property) for property in characteristics[0].get("short", [])]
+
         descr_blocks = collect_raw_widgets(json_page, "webDescription-")
 
         if descr_blocks is None:
@@ -320,4 +346,4 @@ class ProductEnricher:
         else:
             raise RuntimeError("Somethig wierd during richAnnotationJson collecting")
         
-        return {"characteristics": charcs_json, "description": descr_json}
+        return {"characteristics": charcs, "description": descr_json}
