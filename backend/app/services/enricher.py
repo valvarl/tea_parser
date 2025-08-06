@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import BrowserContext, Page
 
-from .utils import collect_raw_widgets, clear_widget_meta
+from .utils import collect_raw_widgets, clear_widget_meta, digits_only
 
 ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
 REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")   
@@ -168,6 +168,59 @@ class ProductEnricher:
         payload = {"ids": ids, "useRegex": use_regex}
         return await page.evaluate(_JS_PULL, payload)
     
+    def _extract_states_divs(self, states: Dict[str, Any], name: str):
+        key = next((k for k in states if re.search(fr'{name}', k)), None)
+        attr = states.pop(key) if key else None
+        return attr
+    
+    def _process_charcs(self, property: Dict[str, Any]) -> tuple[str, list[str]]:
+        return {
+            "id": property.get("id", "").split("_")[0],
+            "title": property.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
+            "values": [v.get("text", "").split(",")[0].lower() for v in property.get("values", [])]
+        } 
+    
+    def _process_aspects(self, aspect: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "aspectKey": aspect.get("aspectKey", None),
+            "aspectName": aspect.get("aspectName", None),
+            "variants": [
+                {
+                    "sku": v["sku"],
+                    "title": v.get("data", {}).get("title", ""),
+                    "coverImage": v.get("data", {}).get("coverImage", None),
+                }
+                for v in aspect.get("variants", [])
+            ]
+        }
+
+    def _clear_states_divs(self, states: Dict[str, Any]) -> Dict[str, Any]:
+        gallery = self._extract_states_divs(states, "webGallery")
+        if gallery is not None:
+            states["gallery"] = {key: gallery.get(key) for key in ("coverImage", "images", "videos")}
+
+        _ = self._extract_states_divs(states, "webPriceDecreasedCompact")
+        price = self._extract_states_divs(states, "webPrice")
+        if price is not None:
+            states["price"] = {
+                "cardPrice": digits_only(price.get("cardPrice", None)),
+                "originalPrice": digits_only(price.get("originalPrice", None)),
+                "price": digits_only(price.get("price", None)),
+                "pricePerUnit": digits_only(price.get("pricePerUnit")),
+                "measurePerUnit": price.get("measurePerUnit", None)
+            }
+
+        short_charcs = self._extract_states_divs(states, "webShortCharacteristics")
+        if short_charcs is not None:
+            short_charcs = short_charcs.get("characteristics", [])
+            states["shortCharacteristics"] = [self._process_charcs(property) for property in short_charcs]
+
+        aspects = self._extract_states_divs(states, "webAspects")
+        if aspects is not None:
+            states["aspects"] = [self._process_aspects(aspect) for aspect in aspects.get("aspects", [])]
+
+        return states
+    
     async def _grab_pdp(
         self,
         ctx,
@@ -199,6 +252,7 @@ class ProductEnricher:
                 ctx, url_full, self.state_ids, self.state_regex, self.state_wait
             )
             clear_widget_meta(states)
+            states = self._clear_states_divs(states)
             row["states"] = states
 
         await asyncio.sleep(random.uniform(0.7, 1.4))
