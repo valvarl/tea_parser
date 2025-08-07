@@ -23,6 +23,7 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import BrowserContext, Page
 
 from .utils import collect_raw_widgets, clear_widget_meta, digits_only
+from .validation import DataParsingError, Validator as V
 
 ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
 REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")   
@@ -45,6 +46,22 @@ _JS_PULL = """
   return out;
 }
 """
+
+import json, time, logging
+from playwright.async_api import TimeoutError as PWTimeout
+
+logger = logging.getLogger(__name__)
+
+def _parse(raw):
+    """Строку-JSON превращаем в dict, предварительно убрав двойные слэши."""
+    if isinstance(raw, str):
+        # \\u002F → / ,  а просто двойные backslash-escape → один
+        cleaned = raw.replace("\\u002F", "/").replace("\\\\", "\\")
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass                      # если всё ещё не JSON — вернём как есть
+    return cleaned or {}
 
 class ProductEnricher:
     """Асинхронный обогатитель SKU-карточек: описание, характеристики, отзывы, state-div-ы."""
@@ -149,6 +166,7 @@ class ProductEnricher:
         ids: List[str],
         use_regex: bool,
         wait_ms: int,
+        collect_nuxt: bool = True,
     ) -> Dict[str, Any]:
         page = await ctx.new_page()
         await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
@@ -166,7 +184,13 @@ class ProductEnricher:
             return {}
 
         payload = {"ids": ids, "useRegex": use_regex}
-        return await page.evaluate(_JS_PULL, payload)
+        div_states = await page.evaluate(_JS_PULL, payload)
+        
+        nuxt_state = {}
+        if collect_nuxt:
+            nuxt_state  = await self._collect_nuxt_state(page)
+        
+        return {"__NUXT__": nuxt_state, **div_states}
     
     def _extract_states_divs(self, states: Dict[str, Any], name: str):
         key = next((k for k in states if re.search(fr'{name}', k)), None)
@@ -219,7 +243,65 @@ class ProductEnricher:
         if aspects is not None:
             states["aspects"] = [self._process_aspects(aspect) for aspect in aspects.get("aspects", [])]
 
+        nuxt = self._extract_states_divs(states, "__NUXT__")
+        if nuxt is not None:
+            seo = nuxt.get("seo", {}).get("script", [])
+            if not seo:
+                raise RuntimeError("seo must have at least one element")
+            seo = json.loads(seo[0].get("innerHTML", ""))
+            states["seo"] = seo
+
         return states
+    
+    async def _collect_nuxt_state(self, page, *, debug: bool = False,
+                                hydrate_timeout: int = 1_500) -> dict:
+        """
+        Быстро возвращает window.__NUXT__.state.
+        • сперва direct-read;
+        • затем парсим inline-скрипт (самый частый fallback);
+        • только если не нашли — ждём hydrate (≤ hydrate_timeout мс, по умолчанию 1.5 с).
+        debug=True → подробный лог.
+        """
+        t0 = time.perf_counter()
+        def log(msg):                      # лёгкий shim-логгер
+            if debug: logger.debug(msg)
+
+        # ─ 1. прямое чтение ─────────────
+        raw = await page.evaluate(
+            "() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)"
+        )
+        if raw is not None:
+            log(f"step1 direct — {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse(raw)
+
+        # ─ 2. inline-скрипт (почти мгновенно) ─
+        raw = await page.evaluate(
+            """() => {
+                const m = [...document.scripts]
+                .map(s => s.textContent.match(
+                        /window\\.__NUXT__\\.state\\s*=\\s*(['"`]?)(.*?)\\1[;\\n]/s))
+                .find(Boolean);
+                return m ? m[2] : null;
+            }"""
+        )
+        if raw is not None:
+            log(f"step2 inline — {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse(raw)
+
+        # ─ 3. ждём hydrate (редко нужно) ───
+        try:
+            await page.wait_for_function(
+                "() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)",
+                timeout=hydrate_timeout,
+            )
+            raw = await page.evaluate(
+                "() => window.__NUXT__.state ?? window.__NUXT__._state"
+            )
+            log(f"step3 hydrate — {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse(raw)
+        except PWTimeout:
+            log(f"step3 timeout ({hydrate_timeout} ms)")
+            return {}
     
     async def _grab_pdp(
         self,
@@ -314,36 +396,92 @@ class ProductEnricher:
             "id": property.get("key", ""),
             "title": property.get("name", {}).lower(),
             "values": [v.get("text", "").lower() for v in property.get("values", [])]
-        } 
+        }
+    
+    def _process_description(self, description: dict[str, Any], *, sku: str) -> list[dict[str, str]]:
+        """
+        Превращает richAnnotationJson → flat-список блоков.
+
+        • Если в content-элементе нет `blocks`, но он сам «похож на блок»
+        (есть img / text / title) — используем его как одиночный блок.
+        • Если нет ни `blocks`, ни признаков блока — бросаем DataParsingError.
+        """
+        content_list = V.get_key(  # description.richAnnotationJson.content
+            V.get_key(description, "richAnnotationJson", entity_id=sku, field_path="description"),
+            "content",
+            entity_id=sku,
+            field_path="description.richAnnotationJson",
+        )
+
+        blocks_out: list[dict[str, str]] = []
+
+        for idx, content in enumerate(
+            V.require_non_empty_list(  # → error, если content пуст
+                content_list,
+                entity_id=sku,
+                field_path="description.richAnnotationJson.content",
+            )
+        ):
+            # ──────────────────────────────────────────────────────────────
+            # 1. Определяем, с чем работаем: blocks[] или «одиночный» блок
+            # ──────────────────────────────────────────────────────────────
+            blocks = content.get("blocks")
+            if blocks is None:  # fallback-логика
+                looks_like_block = any(k in content for k in ("img", "text", "title"))
+                if looks_like_block:
+                    blocks = [content]          # делаем псевдо-блок
+                else:
+                    raise DataParsingError(
+                        code="missing_blocks",
+                        message="No `blocks` key and content is not a block",
+                        entity_id=sku,
+                        field_path=f"description.richAnnotationJson.content[{idx}]",
+                        actual=content,
+                    )
+
+            # ──────────────────────────────────────────────────────────────
+            # 2. Обрабатываем сами блоки
+            # ──────────────────────────────────────────────────────────────
+            for block in V.require_non_empty_list(  # error, если blocks пуст
+                blocks,
+                entity_id=sku,
+                field_path=f"description.richAnnotationJson.content[{idx}].blocks",
+            ):
+                blocks_out.append(
+                    {
+                        "img": {
+                            "alt": block.get("img", {}).get("alt", ""),
+                            "src": block.get("img", {}).get("src", ""),
+                        },
+                        "text": block.get("text", {}).get("content", ""),
+                        "title": block.get("title", {}).get("content", ""),
+                    }
+                )
+
+        return blocks_out
 
     def _collect_raw_widgets(self, json_page: Dict[str, Any]):
-        charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")[0]
-        characteristics = charcs_json.get("characteristics", [])
-        if len(characteristics) != 1:
-            raise RuntimeError("Characteristics len > 1")
-        if len(characteristics[0]) != 1 or "short" not in characteristics[0]:
-            raise RuntimeError("'short' must be in characteristics")
-        charcs = [self._process_charcs_widget(property) for property in characteristics[0].get("short", [])]
+        charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")
+        charcs_json = V.require_non_empty_list(charcs_json)[0]
+        charcs_json = V.require_non_empty_list(V.get_key(charcs_json, "characteristics"))
+        charcs_json = [self._process_charcs_widget(prop) for ch in charcs_json for prop in V.get_key(ch, "short")]
 
         descr_blocks = collect_raw_widgets(json_page, "webDescription-")
+        descr_blocks = V.require_non_empty_list(descr_blocks)
 
-        if descr_blocks is None:
-            descr_json = {}
-        elif len(descr_blocks) == 2:
+        if len(descr_blocks) == 2:
             if 'richAnnotationJson' in descr_blocks[0]:
-                descr_json = {"annotation": descr_blocks[0]["richAnnotationJson"]}
-                descr_json.update(descr_blocks[1])
-            elif 'richAnnotationJson' in descr_blocks[1]:
-                descr_json = {"annotation": descr_blocks[1]["richAnnotationJson"]}
-                descr_json.update(descr_blocks[0])
+                content_blocks, specs = descr_blocks
             else:
-                raise RuntimeError("No richAnnotationJson collected")
+                specs, content_blocks = descr_blocks
         elif len(descr_blocks) == 1:
-            if 'richAnnotationJson' in descr_blocks[0]:
-                descr_json = {"annotation": descr_blocks[0]["richAnnotationJson"]}
-            else:
-                raise RuntimeError("No richAnnotationJson collected")
+            content_blocks, specs = descr_blocks[0], None
         else:
             raise RuntimeError("Somethig wierd during richAnnotationJson collecting")
         
-        return {"characteristics": charcs, "description": descr_json}
+        descr_json = {
+            "content_blocks": self._process_description(content_blocks, sku=56),
+            "specs": V.get_key(specs, "characteristics"),
+        }        
+        
+        return {"characteristics": charcs_json, "description": descr_json}
