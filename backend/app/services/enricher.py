@@ -46,6 +46,7 @@ _JS_PULL = """
 
 # -------- helpers --------
 
+
 def _parse_json_maybe(raw: Any) -> Any:
     if isinstance(raw, str):
         cleaned = raw.replace("\\u002F", "/").replace("\\\\", "\\")
@@ -64,6 +65,7 @@ def _regex_search_key(d: Dict[str, Any], pat: str) -> Optional[str]:
 
 
 # -------- main class --------
+
 
 class ProductEnricher:
     def __init__(
@@ -91,7 +93,7 @@ class ProductEnricher:
         self.state_regex = state_regex
         self.state_wait = max(1_000, state_wait)
 
-        self.want_similar_offers = similar_offers 
+        self.want_similar_offers = similar_offers
 
     # ----- public -----
 
@@ -123,7 +125,7 @@ class ProductEnricher:
 
             await asyncio.gather(*(worker(r) for r in rows))
             return enriched, collected_reviews
-        
+
     # ----- network / page ops -----
 
     async def _capture_entry_headers(self, resp, sink: Dict[str, str]) -> None:
@@ -157,7 +159,7 @@ class ProductEnricher:
         if resp.status != 200:
             await asyncio.sleep(random.uniform(0.7, 1.4))
             return row, []
-        
+
         pdp_json = await resp.json()
 
         # raw widgets
@@ -190,7 +192,7 @@ class ProductEnricher:
 
         await asyncio.sleep(random.uniform(0.7, 1.4))
         return row, reviews
-    
+
     async def _collect_reviews(
         self, ctx: BrowserContext, headers: Dict[str, str], path_part: str, *, sku: str
     ) -> List[Dict[str, Any]]:
@@ -212,7 +214,7 @@ class ProductEnricher:
             raw_widget = next((v for k, v in data.get("widgetStates", {}).items() if REVIEW_WIDGET_RE.match(k)), None)
             if not raw_widget:
                 break
-            
+
             try:
                 widget = json.loads(raw_widget)
             except Exception:
@@ -236,7 +238,7 @@ class ProductEnricher:
             await asyncio.sleep(random.uniform(0.9, 1.5))
 
         return out[: int(hard_limit) if hard_limit != float("inf") else None]
-    
+
     async def _collect_state_divs(
         self,
         ctx: BrowserContext,
@@ -266,13 +268,13 @@ class ProductEnricher:
             nuxt_state = await self._read_nuxt_state(page)
 
         return {"__NUXT__": nuxt_state, **div_states}
-    
+
     async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = 0.8) -> None:
         h = await page.evaluate("()=>document.body.scrollHeight")
         for _ in range(steps):
             await page.mouse.wheel(0, h // steps)
             await asyncio.sleep(pause)
-    
+
     async def _read_nuxt_state(self, page: Page, *, debug: bool = False, hydrate_timeout: int = 1_500) -> dict:
         t0 = time.perf_counter()
 
@@ -312,7 +314,7 @@ class ProductEnricher:
         except PWTimeout:
             dbg(f"nuxt timeout ({hydrate_timeout} ms)")
             return {}
-        
+
     async def _collect_similar_offers(
         self,
         ctx: BrowserContext,
@@ -357,7 +359,7 @@ class ProductEnricher:
         ]
 
         return results or None
-        
+
     # ----- data shaping -----
 
     def _filter_review(self, rev: Dict[str, Any]) -> Dict[str, Any]:
@@ -373,12 +375,12 @@ class ProductEnricher:
             "uuid": rev.get("uuid"),
             "version": rev.get("version"),
         }
-    
+
     def _normalize_states(self, states: Dict[str, Any], *, sku) -> Dict[str, Any]:
         def pop_match(pat: str) -> Optional[Any]:
             key = _regex_search_key(states, pat)
             return states.pop(key) if key else None
-        
+
         gallery = pop_match("webGallery")
         if gallery is not None:
             states["gallery"] = {k: gallery.get(k) for k in ("coverImage", "images", "videos")}
@@ -419,14 +421,14 @@ class ProductEnricher:
             states["seo"] = seo_json
 
         return states
-    
+
     def _shape_short_char(self, prop: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": prop.get("id", "").split("_")[0],
             "title": prop.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
             "values": [v.get("text", "").split(",")[0].lower() for v in prop.get("values", [])],
         }
-    
+
     def _shape_aspect(self, aspect: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "aspectKey": aspect.get("aspectKey"),
@@ -440,7 +442,7 @@ class ProductEnricher:
                 for v in aspect.get("variants", [])
             ],
         }
-    
+
     def _shape_collection(self, tile: Dict[str, Any]) -> Dict[str, Any]:
         return {"sku": V.get_key(tile, "sku"), "picture": V.get_key(tile, "picture")}
 
@@ -450,7 +452,7 @@ class ProductEnricher:
             "title": (prop.get("name", "") or "").lower(),
             "values": [v.get("text", "").lower() for v in prop.get("values", [])],
         }
-    
+
     def _collect_widgets(self, json_page: Dict[str, Any], *, sku: str) -> Dict[str, Any]:
         # Characteristics
         charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")
