@@ -13,20 +13,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import re
+import time
 import urllib.parse as u
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import BrowserContext, Page
+from playwright.async_api import TimeoutError as PWTimeout
 
-from .utils import collect_raw_widgets, clear_widget_meta, digits_only
-from .validation import DataParsingError, Validator as V
+from .utils import clear_widget_meta, collect_raw_widgets, digits_only
+from .validation import DataParsingError
+from .validation import Validator as V
 
-ENTRY_RE      = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
-REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")   
+logger = logging.getLogger(__name__)
+
+ENTRY_RE = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
+REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")
 
 _JS_PULL = """
 ({ids = [], useRegex = false} = {}) => {
@@ -47,10 +52,6 @@ _JS_PULL = """
 }
 """
 
-import json, time, logging
-from playwright.async_api import TimeoutError as PWTimeout
-
-logger = logging.getLogger(__name__)
 
 def _parse(raw):
     """Строку-JSON превращаем в dict, предварительно убрав двойные слэши."""
@@ -60,8 +61,9 @@ def _parse(raw):
         try:
             return json.loads(cleaned)
         except Exception:
-            pass                      # если всё ещё не JSON — вернём как есть
+            pass  # если всё ещё не JSON — вернём как есть
     return cleaned or {}
+
 
 class ProductEnricher:
     """Асинхронный обогатитель SKU-карточек: описание, характеристики, отзывы, state-div-ы."""
@@ -80,55 +82,54 @@ class ProductEnricher:
         state_regex: bool = False,
         state_wait: int = 7_000,
     ) -> None:
-        
-        self.base_url      = "https://www.ozon.ru"
 
-        self.concurrency   = max(1, concurrency)
-        self.headless      = headless
+        self.base_url = "https://www.ozon.ru"
 
-        self.want_reviews  = reviews
+        self.concurrency = max(1, concurrency)
+        self.headless = headless
+
+        self.want_reviews = reviews
         self.reviews_limit = reviews_limit
 
-        self.want_states   = states
-        self.state_ids     = state_ids or []
-        self.state_regex   = state_regex
-        self.state_wait    = max(1_000, state_wait)     # ≥1 с
+        self.want_states = states
+        self.state_ids = state_ids or []
+        self.state_regex = state_regex
+        self.state_wait = max(1_000, state_wait)  # ≥1 с
 
     def _filter_reviews(self, rev: Dict[str, Any]) -> Dict[str, Any]:
         """Оставляем только нужные поля + нормализуем дату."""
         return {
-            "author":       rev.get("author"),         # dict
-            "content":      rev.get("content"),        # dict
-            "comments":     rev.get("comments"),       # dict
-            "usefulness":   rev.get("usefulness"),     # dict
-            "created_at":   rev.get("createdAt"),
+            "author": rev.get("author"),  # dict
+            "content": rev.get("content"),  # dict
+            "comments": rev.get("comments"),  # dict
+            "usefulness": rev.get("usefulness"),  # dict
+            "created_at": rev.get("createdAt"),
             "published_at": rev.get("publishedAt"),
-            "updated_at":   rev.get("updatedAt"),
+            "updated_at": rev.get("updatedAt"),
             "is_purchased": rev.get("isItemPurchased"),
-            "uuid":         rev.get("uuid"),
-            "version":      rev.get("version"),
+            "uuid": rev.get("uuid"),
+            "version": rev.get("version"),
         }
 
     async def _collect_reviews_shelf(self, ctx, headers, path_part, sku) -> List[Dict[str, Any]]:
         reviews: List[Dict[str, Any]] = []
         next_path: Optional[str] = (
-            f"{path_part}?layout_container=reviewshelfpaginator"
-            "&layout_page_index=1&reviewsVariantMode=1"
+            f"{path_part}?layout_container=reviewshelfpaginator&layout_page_index=1&reviewsVariantMode=1"
         )
 
         total_reviews = -1
         reviews_limit = self.reviews_limit
 
         while next_path and (reviews_limit == 0 or len(reviews) < reviews_limit):
-            shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + \
-                        u.quote(next_path, safe="")
+            shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(next_path, safe="")
             resp = await ctx.request.get(shelf_api, headers=headers)
-            if resp.status != 200: break
+            if resp.status != 200:
+                break
             data = await resp.json()
 
-            raw_widget = next((v for k, v in data.get("widgetStates", {}).items()
-                               if REVIEW_WIDGET_RE.match(k)), None)
-            if not raw_widget: break
+            raw_widget = next((v for k, v in data.get("widgetStates", {}).items() if REVIEW_WIDGET_RE.match(k)), None)
+            if not raw_widget:
+                break
             try:
                 widget_obj = json.loads(raw_widget)
             except Exception:
@@ -152,8 +153,8 @@ class ProductEnricher:
             await asyncio.sleep(random.uniform(0.9, 1.5))
 
         return reviews[:reviews_limit]
-    
-    async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = .8):
+
+    async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = 0.8):
         h = await page.evaluate("()=>document.body.scrollHeight")
         for _ in range(steps):
             await page.mouse.wheel(0, h // steps)
@@ -176,34 +177,32 @@ class ProductEnricher:
 
         try:
             await page.wait_for_selector("div[data-state]", state="attached", timeout=wait_ms)
-            await page.wait_for_function(
-                "document.querySelectorAll('div[data-state]').length > 0", timeout=0
-            )
+            await page.wait_for_function("document.querySelectorAll('div[data-state]').length > 0", timeout=0)
         except Exception:
             # ничего страшного — просто не нашли state-div
             return {}
 
         payload = {"ids": ids, "useRegex": use_regex}
         div_states = await page.evaluate(_JS_PULL, payload)
-        
+
         nuxt_state = {}
         if collect_nuxt:
-            nuxt_state  = await self._collect_nuxt_state(page)
-        
+            nuxt_state = await self._collect_nuxt_state(page)
+
         return {"__NUXT__": nuxt_state, **div_states}
-    
+
     def _extract_states_divs(self, states: Dict[str, Any], name: str):
-        key = next((k for k in states if re.search(fr'{name}', k)), None)
+        key = next((k for k in states if re.search(rf"{name}", k)), None)
         attr = states.pop(key) if key else None
         return attr
-    
+
     def _process_charcs(self, property: Dict[str, Any]) -> dict[str, Any]:
         return {
             "id": property.get("id", "").split("_")[0],
             "title": property.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
-            "values": [v.get("text", "").split(",")[0].lower() for v in property.get("values", [])]
-        } 
-    
+            "values": [v.get("text", "").split(",")[0].lower() for v in property.get("values", [])],
+        }
+
     def _process_aspects(self, aspect: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "aspectKey": aspect.get("aspectKey", None),
@@ -215,7 +214,7 @@ class ProductEnricher:
                     "coverImage": v.get("data", {}).get("coverImage", None),
                 }
                 for v in aspect.get("variants", [])
-            ]
+            ],
         }
 
     def _clear_states_divs(self, states: Dict[str, Any]) -> Dict[str, Any]:
@@ -231,7 +230,7 @@ class ProductEnricher:
                 "originalPrice": digits_only(price.get("originalPrice", None)),
                 "price": digits_only(price.get("price", None)),
                 "pricePerUnit": digits_only(price.get("pricePerUnit")),
-                "measurePerUnit": price.get("measurePerUnit", None)
+                "measurePerUnit": price.get("measurePerUnit", None),
             }
 
         short_charcs = self._extract_states_divs(states, "webShortCharacteristics")
@@ -252,9 +251,8 @@ class ProductEnricher:
             states["seo"] = seo
 
         return states
-    
-    async def _collect_nuxt_state(self, page, *, debug: bool = False,
-                                hydrate_timeout: int = 1_500) -> dict:
+
+    async def _collect_nuxt_state(self, page, *, debug: bool = False, hydrate_timeout: int = 1_500) -> dict:
         """
         Быстро возвращает window.__NUXT__.state.
         • сперва direct-read;
@@ -263,13 +261,13 @@ class ProductEnricher:
         debug=True → подробный лог.
         """
         t0 = time.perf_counter()
-        def log(msg):                      # лёгкий shim-логгер
-            if debug: logger.debug(msg)
+
+        def log(msg):  # лёгкий shim-логгер
+            if debug:
+                logger.debug(msg)
 
         # ─ 1. прямое чтение ─────────────
-        raw = await page.evaluate(
-            "() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)"
-        )
+        raw = await page.evaluate("() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)")
         if raw is not None:
             log(f"step1 direct — {(time.perf_counter()-t0)*1000:.1f} ms")
             return _parse(raw)
@@ -294,25 +292,21 @@ class ProductEnricher:
                 "() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)",
                 timeout=hydrate_timeout,
             )
-            raw = await page.evaluate(
-                "() => window.__NUXT__.state ?? window.__NUXT__._state"
-            )
+            raw = await page.evaluate("() => window.__NUXT__.state ?? window.__NUXT__._state")
             log(f"step3 hydrate — {(time.perf_counter()-t0)*1000:.1f} ms")
             return _parse(raw)
         except PWTimeout:
             log(f"step3 timeout ({hydrate_timeout} ms)")
             return {}
-    
+
     async def _grab_pdp(
-        self,
-        ctx,
-        headers: Dict[str, str],
-        row: Dict[str, Any]
+        self, ctx, headers: Dict[str, str], row: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """Скачать PDP‑данные + (опц.) отзывы."""
         path_part = row["link"].split("ozon.ru")[-1]
-        pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + \
-                  u.quote(f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe="")
+        pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(
+            f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
+        )
 
         resp = await ctx.request.get(pdp_api, headers=headers)
         if resp.status != 200:
@@ -330,9 +324,7 @@ class ProductEnricher:
         # state-div
         if self.want_states:
             url_full = self.base_url + row["link"]
-            states = await self._collect_states_divs(
-                ctx, url_full, self.state_ids, self.state_regex, self.state_wait
-            )
+            states = await self._collect_states_divs(ctx, url_full, self.state_ids, self.state_regex, self.state_wait)
             clear_widget_meta(states)
             states = self._clear_states_divs(states)
             row["states"] = states
@@ -353,13 +345,13 @@ class ProductEnricher:
 
             async def _block_media(route):
                 r = route.request
-                if (
-                    r.resource_type in ("image", "media", "font") or
-                    re.search(r"\.(?:png|jpe?g|webp|gif|svg|mp4|webm|mov)(?:\?|$)", r.url)
+                if r.resource_type in ("image", "media", "font") or re.search(
+                    r"\.(?:png|jpe?g|webp|gif|svg|mp4|webm|mov)(?:\?|$)", r.url
                 ):
                     await route.abort()
                 else:
                     await route.continue_()
+
             await ctx.route("**/*", _block_media)
 
             page = await ctx.new_page()
@@ -375,8 +367,7 @@ class ProductEnricher:
 
             # Открываем первый товар лишь для захвата cookies/headers
             page.on("response", capture_entry)
-            await page.goto(self.base_url + rows[0]["link"],
-                            timeout=60_000, wait_until="domcontentloaded")
+            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
             await asyncio.sleep(random.uniform(1.0, 1.8))
 
             sem = asyncio.Semaphore(self.concurrency)
@@ -395,9 +386,9 @@ class ProductEnricher:
         return {
             "id": property.get("key", ""),
             "title": property.get("name", {}).lower(),
-            "values": [v.get("text", "").lower() for v in property.get("values", [])]
+            "values": [v.get("text", "").lower() for v in property.get("values", [])],
         }
-    
+
     def _process_description(self, description: dict[str, Any], *, sku: str) -> list[dict[str, str]]:
         """
         Превращает richAnnotationJson → flat-список блоков.
@@ -429,7 +420,7 @@ class ProductEnricher:
             if blocks is None:  # fallback-логика
                 looks_like_block = any(k in content for k in ("img", "text", "title"))
                 if looks_like_block:
-                    blocks = [content]          # делаем псевдо-блок
+                    blocks = [content]  # делаем псевдо-блок
                 else:
                     raise DataParsingError(
                         code="missing_blocks",
@@ -470,7 +461,7 @@ class ProductEnricher:
         descr_blocks = V.require_non_empty_list(descr_blocks)
 
         if len(descr_blocks) == 2:
-            if 'richAnnotationJson' in descr_blocks[0]:
+            if "richAnnotationJson" in descr_blocks[0]:
                 content_blocks, specs = descr_blocks
             else:
                 specs, content_blocks = descr_blocks
@@ -478,10 +469,10 @@ class ProductEnricher:
             content_blocks, specs = descr_blocks[0], None
         else:
             raise RuntimeError("Somethig wierd during richAnnotationJson collecting")
-        
+
         descr_json = {
             "content_blocks": self._process_description(content_blocks, sku=56),
             "specs": V.get_key(specs, "characteristics"),
-        }        
-        
+        }
+
         return {"characteristics": charcs_json, "description": descr_json}

@@ -1,7 +1,11 @@
 # indexer.py
 from __future__ import annotations
 
-import asyncio, json, logging, random, re
+import asyncio
+import json
+import logging
+import random
+import re
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import quote
@@ -15,11 +19,12 @@ logger = logging.getLogger(__name__)
 
 ENTRY_RE = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F")
 
+
 class ProductIndexer:
     def __init__(self) -> None:
-        self.base_url   = "https://www.ozon.ru"
+        self.base_url = "https://www.ozon.ru"
         self.search_url = f"{self.base_url}/search/"
-        self.api_url    = f"{self.base_url}/api/entrypoint-api.bx/page/json/v2"
+        self.api_url = f"{self.base_url}/api/entrypoint-api.bx/page/json/v2"
 
         ua = UserAgent().random
         self.context_settings = {
@@ -51,8 +56,7 @@ class ProductIndexer:
             return None
 
         link = it.get("action", {}).get("link", "").split("?")[0]
-        name = next((b["textAtom"]["text"]
-                    for b in it["mainState"] if b["type"] == "textAtom"), None)
+        name = next((b["textAtom"]["text"] for b in it["mainState"] if b["type"] == "textAtom"), None)
 
         price_curr = price_old = None
         price_block = next((b for b in it["mainState"] if b["type"] == "priceV2"), None)
@@ -74,8 +78,7 @@ class ProductIndexer:
                         reviews = int(digits_only(labels[1]["title"]) or 0) or None
                 break
 
-        img_urls = [i["image"]["link"]
-                    for i in it.get("tileImage", {}).get("items", [])[:10]]
+        img_urls = [i["image"]["link"] for i in it.get("tileImage", {}).get("items", [])[:10]]
         images = "|".join(img_urls)
 
         mb = it.get("multiButton", {}).get("ozonButton", {}).get("addToCart", {})
@@ -111,7 +114,7 @@ class ProductIndexer:
         search_url = f"{self.search_url}?text={query}&category={category}&page={start_page}"
 
         async with AsyncCamoufox(headless=headless) as browser:
-            ctx  = await browser.new_context(**self.context_settings)
+            ctx = await browser.new_context(**self.context_settings)
             page = await ctx.new_page()
 
             first_headers: Dict[str, str] = {}
@@ -154,8 +157,10 @@ class ProductIndexer:
                 if max_pages and page_no > start_page + max_pages - 1:
                     break
 
-                next_api = (f"{self.api_url}?url="
-                            f"{quote(f'/search/?text={query}&category={category}&page={page_no}', safe='')}")
+                next_api = (
+                    f"{self.api_url}?url="
+                    f"{quote(f'/search/?text={query}&category={category}&page={page_no}', safe='')}"
+                )
                 resp = await ctx.request.get(next_api, headers=first_headers)
                 if resp.status != 200:
                     logger.warning("⛔ HTTP %s on page %s", resp.status, page_no)
