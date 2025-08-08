@@ -1,13 +1,4 @@
-"""
-enricher.py
-
-Пример:
-    enr = ProductEnricher(
-        reviews=True, reviews_limit=40,
-        states=True, state_ids=["state-searchResultsV2", r"state-pdp.*"], state_regex=True
-    )
-    rows_plus, reviews = await enr.enrich(base_rows)
-"""
+# enricher.py
 
 from __future__ import annotations
 
@@ -33,13 +24,13 @@ logger = logging.getLogger(__name__)
 ENTRY_RE = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=")
 REVIEW_WIDGET_RE = re.compile(r"webListReviews-\d+-reviewshelfpaginator-\d+")
 
+# Pulls JSON from <div data-state id="...">, optionally filtering by ids (strings or regex patterns).
 _JS_PULL = """
 ({ids = [], useRegex = false} = {}) => {
   const ok = id =>
     !ids.length ||
     ids.some(p => useRegex ? new RegExp(p).test(id)
                            : (id === p || id.includes(p)));
-
   const out = {};
   document.querySelectorAll('div[data-state]').forEach(el => {
     if (!ok(el.id)) return;
@@ -53,114 +44,191 @@ _JS_PULL = """
 """
 
 
-def _parse(raw):
-    """Строку-JSON превращаем в dict, предварительно убрав двойные слэши."""
+# -------- helpers --------
+
+def _parse_json_maybe(raw: Any) -> Any:
     if isinstance(raw, str):
-        # \\u002F → / ,  а просто двойные backslash-escape → один
         cleaned = raw.replace("\\u002F", "/").replace("\\\\", "\\")
         try:
             return json.loads(cleaned)
         except Exception:
-            pass  # если всё ещё не JSON — вернём как есть
-    return cleaned or {}
+            return cleaned
+    return raw or {}
 
+
+def _regex_search_key(d: Dict[str, Any], pat: str) -> Optional[str]:
+    for k in d:
+        if re.search(rf"{pat}", k):
+            return k
+    return None
+
+
+# -------- main class --------
 
 class ProductEnricher:
-    """Асинхронный обогатитель SKU-карточек: описание, характеристики, отзывы, state-div-ы."""
-
     def __init__(
         self,
         *,
         concurrency: int = 6,
         headless: bool = True,
-        # reviews
         reviews: bool = False,
         reviews_limit: int = 0,
-        # state-div
         states: bool = False,
         state_ids: Optional[List[str]] = None,
         state_regex: bool = False,
         state_wait: int = 7_000,
     ) -> None:
-
         self.base_url = "https://www.ozon.ru"
-
         self.concurrency = max(1, concurrency)
         self.headless = headless
 
         self.want_reviews = reviews
-        self.reviews_limit = reviews_limit
+        self.reviews_limit = max(0, reviews_limit)
 
         self.want_states = states
         self.state_ids = state_ids or []
         self.state_regex = state_regex
-        self.state_wait = max(1_000, state_wait)  # ≥1 с
+        self.state_wait = max(1_000, state_wait)
 
-    def _filter_reviews(self, rev: Dict[str, Any]) -> Dict[str, Any]:
-        """Оставляем только нужные поля + нормализуем дату."""
-        return {
-            "author": rev.get("author"),  # dict
-            "content": rev.get("content"),  # dict
-            "comments": rev.get("comments"),  # dict
-            "usefulness": rev.get("usefulness"),  # dict
-            "created_at": rev.get("createdAt"),
-            "published_at": rev.get("publishedAt"),
-            "updated_at": rev.get("updatedAt"),
-            "is_purchased": rev.get("isItemPurchased"),
-            "uuid": rev.get("uuid"),
-            "version": rev.get("version"),
-        }
+    # ----- public -----
 
-    async def _collect_reviews_shelf(self, ctx, headers, path_part, sku) -> List[Dict[str, Any]]:
+    async def enrich(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if not rows:
+            return [], []
+
+        async with AsyncCamoufox(headless=self.headless) as browser:
+            ctx = await browser.new_context(locale="ru-RU")
+            await ctx.route("**/*", self._block_heavy_assets)
+
+            # Prime headers/cookies from the first product page.
+            first_headers: Dict[str, str] = {}
+            page = await ctx.new_page()
+            page.on("response", lambda resp: asyncio.create_task(self._capture_entry_headers(resp, first_headers)))
+
+            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(1.0, 1.8))
+
+            sem = asyncio.Semaphore(self.concurrency)
+            enriched: List[Dict[str, Any]] = []
+            collected_reviews: List[Dict[str, Any]] = []
+
+            async def worker(row: Dict[str, Any]) -> None:
+                async with sem:
+                    r, revs = await self._grab_pdp(ctx, first_headers, dict(row))
+                    enriched.append(r)
+                    collected_reviews.extend(revs)
+
+            await asyncio.gather(*(worker(r) for r in rows))
+            return enriched, collected_reviews
+        
+    # ----- network / page ops -----
+
+    async def _capture_entry_headers(self, resp, sink: Dict[str, str]) -> None:
+        if sink or resp.status != 200 or not ENTRY_RE.search(resp.url):
+            return
+        headers = await resp.request.all_headers()
+        sink.update({k: v for k, v in headers.items() if not k.startswith(":")})
+        sink.pop("accept-encoding", None)
+
+    async def _block_heavy_assets(self, route):
+        r = route.request
+        if r.resource_type in ("image", "media", "font") or re.search(
+            r"\.(?:png|jpe?g|webp|gif|svg|mp4|webm|mov)(?:\?|$)", r.url
+        ):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    async def _grab_pdp(
+        self, ctx: BrowserContext, headers: Dict[str, str], row: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        link = row["link"]
+        sku = row["sku"]
+
+        path_part = link.split("ozon.ru")[-1]
+        pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(
+            f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
+        )
+
+        resp = await ctx.request.get(pdp_api, headers=headers)
+        if resp.status != 200:
+            await asyncio.sleep(random.uniform(0.7, 1.4))
+            return row, []
+        
+        pdp_json = await resp.json()
+
+        # raw widgets
+        row.update(self._collect_widgets(pdp_json, sku=sku))
+
+        # reviews
         reviews: List[Dict[str, Any]] = []
+        if self.want_reviews:
+            reviews = await self._collect_reviews(ctx, headers, path_part, sku=sku)
+
+        # state divs
+        if self.want_states:
+            url_full = self.base_url + link
+            states = await self._collect_state_divs(
+                ctx=ctx,
+                url=url_full,
+                ids=self.state_ids,
+                use_regex=self.state_regex,
+                wait_ms=self.state_wait,
+                collect_nuxt=True,
+            )
+            clear_widget_meta(states)
+            row["states"] = self._normalize_states(states, sku=sku)
+
+        await asyncio.sleep(random.uniform(0.7, 1.4))
+        return row, reviews
+    
+    async def _collect_reviews(
+        self, ctx: BrowserContext, headers: Dict[str, str], path_part: str, *, sku: str
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         next_path: Optional[str] = (
             f"{path_part}?layout_container=reviewshelfpaginator&layout_page_index=1&reviewsVariantMode=1"
         )
 
-        total_reviews = -1
-        reviews_limit = self.reviews_limit
+        total = None
+        hard_limit = self.reviews_limit or float("inf")
 
-        while next_path and (reviews_limit == 0 or len(reviews) < reviews_limit):
+        while next_path and len(out) < hard_limit:
             shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(next_path, safe="")
             resp = await ctx.request.get(shelf_api, headers=headers)
             if resp.status != 200:
                 break
-            data = await resp.json()
 
+            data = await resp.json()
             raw_widget = next((v for k, v in data.get("widgetStates", {}).items() if REVIEW_WIDGET_RE.match(k)), None)
             if not raw_widget:
                 break
+            
             try:
-                widget_obj = json.loads(raw_widget)
+                widget = json.loads(raw_widget)
             except Exception:
-                widget_obj = {}
+                widget = {}
 
-            if total_reviews == -1:
-                total_reviews = widget_obj.get("paging", {}).get("total", 0)
-                if total_reviews < 1:
+            if total is None:
+                total = max(0, widget.get("paging", {}).get("total", 0))
+                if total == 0:
                     return []
-                reviews_limit = min(total_reviews, reviews_limit)
+                hard_limit = min(hard_limit, total)
 
-            for rev in widget_obj.get("reviews", []):
-                review_parsed = {**self._filter_reviews(rev), "sku": sku}
-                if review_parsed.get("content", {}).get("comment", "") == "":
+            for rev in widget.get("reviews", []):
+                item = {**self._filter_review(rev), "sku": sku}
+                if item.get("content", {}).get("comment", "") == "":
                     break
-                reviews.append(review_parsed)
-                if len(reviews) >= self.reviews_limit:
+                out.append(item)
+                if len(out) >= hard_limit:
                     break
 
             next_path = data.get("nextPage") or data.get("pageInfo", {}).get("url")
             await asyncio.sleep(random.uniform(0.9, 1.5))
 
-        return reviews[:reviews_limit]
-
-    async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = 0.8):
-        h = await page.evaluate("()=>document.body.scrollHeight")
-        for _ in range(steps):
-            await page.mouse.wheel(0, h // steps)
-            await asyncio.sleep(pause)
-
-    async def _collect_states_divs(
+        return out[: int(hard_limit) if hard_limit != float("inf") else None]
+    
+    async def _collect_state_divs(
         self,
         ctx: BrowserContext,
         url: str,
@@ -179,7 +247,6 @@ class ProductEnricher:
             await page.wait_for_selector("div[data-state]", state="attached", timeout=wait_ms)
             await page.wait_for_function("document.querySelectorAll('div[data-state]').length > 0", timeout=0)
         except Exception:
-            # ничего страшного — просто не нашли state-div
             return {}
 
         payload = {"ids": ids, "useRegex": use_regex}
@@ -187,292 +254,230 @@ class ProductEnricher:
 
         nuxt_state = {}
         if collect_nuxt:
-            nuxt_state = await self._collect_nuxt_state(page)
+            nuxt_state = await self._read_nuxt_state(page)
 
         return {"__NUXT__": nuxt_state, **div_states}
-
-    def _extract_states_divs(self, states: Dict[str, Any], name: str):
-        key = next((k for k in states if re.search(rf"{name}", k)), None)
-        attr = states.pop(key) if key else None
-        return attr
-
-    def _process_charcs(self, property: Dict[str, Any]) -> dict[str, Any]:
-        return {
-            "id": property.get("id", "").split("_")[0],
-            "title": property.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
-            "values": [v.get("text", "").split(",")[0].lower() for v in property.get("values", [])],
-        }
-
-    def _process_aspects(self, aspect: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "aspectKey": aspect.get("aspectKey", None),
-            "aspectName": aspect.get("aspectName", None),
-            "variants": [
-                {
-                    "sku": v["sku"],
-                    "title": v.get("data", {}).get("title", ""),
-                    "coverImage": v.get("data", {}).get("coverImage", None),
-                }
-                for v in aspect.get("variants", [])
-            ],
-        }
-
-    def _clear_states_divs(self, states: Dict[str, Any]) -> Dict[str, Any]:
-        gallery = self._extract_states_divs(states, "webGallery")
-        if gallery is not None:
-            states["gallery"] = {key: gallery.get(key) for key in ("coverImage", "images", "videos")}
-
-        _ = self._extract_states_divs(states, "webPriceDecreasedCompact")
-        price = self._extract_states_divs(states, "webPrice")
-        if price is not None:
-            states["price"] = {
-                "cardPrice": digits_only(price.get("cardPrice", None)),
-                "originalPrice": digits_only(price.get("originalPrice", None)),
-                "price": digits_only(price.get("price", None)),
-                "pricePerUnit": digits_only(price.get("pricePerUnit")),
-                "measurePerUnit": price.get("measurePerUnit", None),
-            }
-
-        short_charcs = self._extract_states_divs(states, "webShortCharacteristics")
-        if short_charcs is not None:
-            short_charcs = short_charcs.get("characteristics", [])
-            states["shortCharacteristics"] = [self._process_charcs(property) for property in short_charcs]
-
-        aspects = self._extract_states_divs(states, "webAspects")
-        if aspects is not None:
-            states["aspects"] = [self._process_aspects(aspect) for aspect in aspects.get("aspects", [])]
-
-        nuxt = self._extract_states_divs(states, "__NUXT__")
-        if nuxt is not None:
-            seo = nuxt.get("seo", {}).get("script", [])
-            if not seo:
-                raise RuntimeError("seo must have at least one element")
-            seo = json.loads(seo[0].get("innerHTML", ""))
-            states["seo"] = seo
-
-        return states
-
-    async def _collect_nuxt_state(self, page, *, debug: bool = False, hydrate_timeout: int = 1_500) -> dict:
-        """
-        Быстро возвращает window.__NUXT__.state.
-        • сперва direct-read;
-        • затем парсим inline-скрипт (самый частый fallback);
-        • только если не нашли — ждём hydrate (≤ hydrate_timeout мс, по умолчанию 1.5 с).
-        debug=True → подробный лог.
-        """
+    
+    async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = 0.8) -> None:
+        h = await page.evaluate("()=>document.body.scrollHeight")
+        for _ in range(steps):
+            await page.mouse.wheel(0, h // steps)
+            await asyncio.sleep(pause)
+    
+    async def _read_nuxt_state(self, page: Page, *, debug: bool = False, hydrate_timeout: int = 1_500) -> dict:
         t0 = time.perf_counter()
 
-        def log(msg):  # лёгкий shim-логгер
+        def dbg(msg: str) -> None:
             if debug:
                 logger.debug(msg)
 
-        # ─ 1. прямое чтение ─────────────
+        # 1) direct
         raw = await page.evaluate("() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)")
         if raw is not None:
-            log(f"step1 direct — {(time.perf_counter()-t0)*1000:.1f} ms")
-            return _parse(raw)
+            dbg(f"nuxt direct {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse_json_maybe(raw)
 
-        # ─ 2. inline-скрипт (почти мгновенно) ─
+        # 2) inline script
         raw = await page.evaluate(
             """() => {
                 const m = [...document.scripts]
-                .map(s => s.textContent.match(
-                        /window\\.__NUXT__\\.state\\s*=\\s*(['"`]?)(.*?)\\1[;\\n]/s))
-                .find(Boolean);
+                  .map(s => s.textContent.match(
+                    /window\\.__NUXT__\\.state\\s*=\\s*(['"`]?)(.*?)\\1[;\\n]/s))
+                  .find(Boolean);
                 return m ? m[2] : null;
             }"""
         )
         if raw is not None:
-            log(f"step2 inline — {(time.perf_counter()-t0)*1000:.1f} ms")
-            return _parse(raw)
+            dbg(f"nuxt inline {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse_json_maybe(raw)
 
-        # ─ 3. ждём hydrate (редко нужно) ───
+        # 3) hydrate wait
         try:
             await page.wait_for_function(
                 "() => window.__NUXT__ && (window.__NUXT__.state ?? window.__NUXT__._state)",
                 timeout=hydrate_timeout,
             )
             raw = await page.evaluate("() => window.__NUXT__.state ?? window.__NUXT__._state")
-            log(f"step3 hydrate — {(time.perf_counter()-t0)*1000:.1f} ms")
-            return _parse(raw)
+            dbg(f"nuxt hydrate {(time.perf_counter()-t0)*1000:.1f} ms")
+            return _parse_json_maybe(raw)
         except PWTimeout:
-            log(f"step3 timeout ({hydrate_timeout} ms)")
+            dbg(f"nuxt timeout ({hydrate_timeout} ms)")
             return {}
+        
+    # ----- data shaping -----
 
-    async def _grab_pdp(
-        self, ctx, headers: Dict[str, str], row: Dict[str, Any]
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Скачать PDP‑данные + (опц.) отзывы."""
-        path_part = row["link"].split("ozon.ru")[-1]
-        pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(
-            f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
-        )
-
-        resp = await ctx.request.get(pdp_api, headers=headers)
-        if resp.status != 200:
-            return row, []
-        pdp_json = await resp.json()
-
-        # raw widgets
-        row.update(self._collect_raw_widgets(pdp_json))
-
-        # reviews
-        reviews: List[Dict[str, Any]] = []
-        if self.want_reviews:
-            reviews = await self._collect_reviews_shelf(ctx, headers, path_part, row["sku"])
-
-        # state-div
-        if self.want_states:
-            url_full = self.base_url + row["link"]
-            states = await self._collect_states_divs(ctx, url_full, self.state_ids, self.state_regex, self.state_wait)
-            clear_widget_meta(states)
-            states = self._clear_states_divs(states)
-            row["states"] = states
-
-        await asyncio.sleep(random.uniform(0.7, 1.4))
-        return row, reviews
-
-    async def enrich(
-        self,
-        rows: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Обогатить список товаров. Возвращает (rows_plus, reviews)."""
-        if not rows:
-            return [], []
-
-        async with AsyncCamoufox(headless=self.headless) as browser:
-            ctx = await browser.new_context(locale="ru-RU")
-
-            async def _block_media(route):
-                r = route.request
-                if r.resource_type in ("image", "media", "font") or re.search(
-                    r"\.(?:png|jpe?g|webp|gif|svg|mp4|webm|mov)(?:\?|$)", r.url
-                ):
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await ctx.route("**/*", _block_media)
-
-            page = await ctx.new_page()
-
-            first_headers: Dict[str, str] = {}
-
-            async def capture_entry(resp):
-                nonlocal first_headers
-                if ENTRY_RE.search(resp.url) and resp.status == 200 and not first_headers:
-                    raw_h = await resp.request.all_headers()
-                    first_headers = {k: v for k, v in raw_h.items() if not k.startswith(":")}
-                    first_headers.pop("accept-encoding", None)
-
-            # Открываем первый товар лишь для захвата cookies/headers
-            page.on("response", capture_entry)
-            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(1.0, 1.8))
-
-            sem = asyncio.Semaphore(self.concurrency)
-            enriched, all_reviews = [], []
-
-            async def worker(row):
-                async with sem:
-                    r, revs = await self._grab_pdp(ctx, first_headers, row)
-                    enriched.append(r)
-                    all_reviews.extend(revs)
-
-            await asyncio.gather(*(worker(dict(r)) for r in rows))
-            return enriched, all_reviews
-
-    def _process_charcs_widget(self, property: Dict[str, Any]) -> dict[str, Any]:
+    def _filter_review(self, rev: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "id": property.get("key", ""),
-            "title": property.get("name", {}).lower(),
-            "values": [v.get("text", "").lower() for v in property.get("values", [])],
+            "author": rev.get("author"),
+            "content": rev.get("content"),
+            "comments": rev.get("comments"),
+            "usefulness": rev.get("usefulness"),
+            "created_at": rev.get("createdAt"),
+            "published_at": rev.get("publishedAt"),
+            "updated_at": rev.get("updatedAt"),
+            "is_purchased": rev.get("isItemPurchased"),
+            "uuid": rev.get("uuid"),
+            "version": rev.get("version"),
         }
+    
+    def _normalize_states(self, states: Dict[str, Any], *, sku) -> Dict[str, Any]:
+        def pop_match(pat: str) -> Optional[Any]:
+            key = _regex_search_key(states, pat)
+            return states.pop(key) if key else None
+        
+        gallery = pop_match("webGallery")
+        if gallery is not None:
+            states["gallery"] = {k: gallery.get(k) for k in ("coverImage", "images", "videos")}
 
-    def _process_description(self, description: dict[str, Any], *, sku: str) -> list[dict[str, str]]:
-        """
-        Превращает richAnnotationJson → flat-список блоков.
+        _ = pop_match("webPriceDecreasedCompact")
+        price = pop_match("webPrice")
+        if price is not None:
+            states["price"] = {
+                "cardPrice": digits_only(price.get("cardPrice")),
+                "originalPrice": digits_only(price.get("originalPrice")),
+                "price": digits_only(price.get("price")),
+                "pricePerUnit": digits_only(price.get("pricePerUnit")),
+                "measurePerUnit": price.get("measurePerUnit"),
+            }
 
-        • Если в content-элементе нет `blocks`, но он сам «похож на блок»
-        (есть img / text / title) — используем его как одиночный блок.
-        • Если нет ни `blocks`, ни признаков блока — бросаем DataParsingError.
-        """
-        content_list = V.get_key(  # description.richAnnotationJson.content
-            V.get_key(description, "richAnnotationJson", entity_id=sku, field_path="description"),
-            "content",
-            entity_id=sku,
-            field_path="description.richAnnotationJson",
-        )
+        short = pop_match("webShortCharacteristics")
+        if short is not None:
+            items = short.get("characteristics", [])
+            states["shortCharacteristics"] = [self._shape_short_char(p) for p in items]
 
-        blocks_out: list[dict[str, str]] = []
+        aspects = pop_match("webAspects")
+        if aspects is not None:
+            states["aspects"] = [self._shape_aspect(a) for a in aspects.get("aspects", [])]
 
-        for idx, content in enumerate(
-            V.require_non_empty_list(  # → error, если content пуст
-                content_list,
-                entity_id=sku,
-                field_path="description.richAnnotationJson.content",
-            )
-        ):
-            # ──────────────────────────────────────────────────────────────
-            # 1. Определяем, с чем работаем: blocks[] или «одиночный» блок
-            # ──────────────────────────────────────────────────────────────
-            blocks = content.get("blocks")
-            if blocks is None:  # fallback-логика
-                looks_like_block = any(k in content for k in ("img", "text", "title"))
-                if looks_like_block:
-                    blocks = [content]  # делаем псевдо-блок
-                else:
-                    raise DataParsingError(
-                        code="missing_blocks",
-                        message="No `blocks` key and content is not a block",
-                        entity_id=sku,
-                        field_path=f"description.richAnnotationJson.content[{idx}]",
-                        actual=content,
-                    )
+        collections = pop_match("webCollections")
+        if collections is not None:
+            states["collections"] = [self._shape_collection(t) for t in V.get_key(collections, "tiles")]
 
-            # ──────────────────────────────────────────────────────────────
-            # 2. Обрабатываем сами блоки
-            # ──────────────────────────────────────────────────────────────
-            for block in V.require_non_empty_list(  # error, если blocks пуст
-                blocks,
-                entity_id=sku,
-                field_path=f"description.richAnnotationJson.content[{idx}].blocks",
-            ):
-                blocks_out.append(
-                    {
-                        "img": {
-                            "alt": block.get("img", {}).get("alt", ""),
-                            "src": block.get("img", {}).get("src", ""),
-                        },
-                        "text": block.get("text", {}).get("content", ""),
-                        "title": block.get("title", {}).get("content", ""),
-                    }
-                )
+        nutrition = pop_match("webNutritionInfo")
+        if nutrition is not None:
+            states["nutrition_info"] = V.get_key(nutrition, "values")
 
-        return blocks_out
+        nuxt = pop_match("__NUXT__")
+        if nuxt is not None:
+            seo = nuxt.get("seo", {}).get("script", [])
+            V.require_non_empty_list(seo, entity_id=sku)
+            seo_json = json.loads(seo[0].get("innerHTML", "") or "{}")
+            states["seo"] = seo_json
 
-    def _collect_raw_widgets(self, json_page: Dict[str, Any]):
+        return states
+    
+    def _shape_short_char(self, prop: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": prop.get("id", "").split("_")[0],
+            "title": prop.get("title", {}).get("textRs", [{}])[0].get("content", "").lower(),
+            "values": [v.get("text", "").split(",")[0].lower() for v in prop.get("values", [])],
+        }
+    
+    def _shape_aspect(self, aspect: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "aspectKey": aspect.get("aspectKey"),
+            "aspectName": aspect.get("aspectName"),
+            "variants": [
+                {
+                    "sku": v.get("sku"),
+                    "title": v.get("data", {}).get("title", ""),
+                    "coverImage": v.get("data", {}).get("coverImage"),
+                }
+                for v in aspect.get("variants", [])
+            ],
+        }
+    
+    def _shape_collection(self, tile: Dict[str, Any]) -> Dict[str, Any]:
+        return {"sku": V.get_key(tile, "sku"), "picture": V.get_key(tile, "picture")}
+
+    def _shape_specs_char(self, prop: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": prop.get("key", ""),
+            "title": (prop.get("name", "") or "").lower(),
+            "values": [v.get("text", "").lower() for v in prop.get("values", [])],
+        }
+    
+    def _collect_widgets(self, json_page: Dict[str, Any], *, sku: str) -> Dict[str, Any]:
+        # Characteristics
         charcs_json = collect_raw_widgets(json_page, "webCharacteristics-")
         charcs_json = V.require_non_empty_list(charcs_json)[0]
         charcs_json = V.require_non_empty_list(V.get_key(charcs_json, "characteristics"))
-        charcs_json = [self._process_charcs_widget(prop) for ch in charcs_json for prop in V.get_key(ch, "short")]
+        charcs_json = [self._shape_specs_char(prop) for ch in charcs_json for prop in V.get_key(ch, "short")]
 
-        descr_blocks = collect_raw_widgets(json_page, "webDescription-")
-        descr_blocks = V.require_non_empty_list(descr_blocks)
-
+        # Description blocks
+        descr_blocks = V.require_non_empty_list(collect_raw_widgets(json_page, "webDescription-"))
         if len(descr_blocks) == 2:
-            if "richAnnotationJson" in descr_blocks[0]:
+            if any(k in descr_blocks[0] for k in ("richAnnotation", "richAnnotationJson")):
                 content_blocks, specs = descr_blocks
             else:
                 specs, content_blocks = descr_blocks
         elif len(descr_blocks) == 1:
             content_blocks, specs = descr_blocks[0], None
         else:
-            raise RuntimeError("Somethig wierd during richAnnotationJson collecting")
+            raise RuntimeError("Unexpected description widgets layout")
 
         descr_json = {
-            "content_blocks": self._process_description(content_blocks, sku=56),
+            "content_blocks": self._shape_description(content_blocks, sku=sku),
             "specs": V.get_key(specs, "characteristics"),
         }
 
         return {"characteristics": charcs_json, "description": descr_json}
+
+    def _shape_description(self, description: Dict[str, Any], *, sku: str) -> List[Dict[str, Any]]:
+        # HTML fallback
+        if "richAnnotation" in description and description.get("richAnnotationType") == "HTML":
+            return [
+                {
+                    "img": {"alt": "", "src": ""},
+                    "video": [],
+                    "text": description["richAnnotation"],
+                    "text_items": [],
+                    "title": "",
+                    "title_items": [],
+                }
+            ]
+
+        content_list = V.get_key(
+            V.get_key(description, "richAnnotationJson", entity_id=sku, field_path="description"),
+            "content",
+            entity_id=sku,
+            field_path="description.richAnnotationJson",
+        )
+
+        out: List[Dict[str, Any]] = []
+        for idx, content in enumerate(
+            V.require_non_empty_list(content_list, entity_id=sku, field_path="description.richAnnotationJson.content")
+        ):
+            blocks = content.get("blocks")
+            if blocks is None:
+                looks_like_block = any(k in content for k in ("img", "text", "title")) or (
+                    content.get("widgetName") == "raVideo"
+                )
+                if looks_like_block:
+                    blocks = [content]
+                else:
+                    raise DataParsingError(
+                        code="missing_blocks",
+                        message="No `blocks` and content is not a block",
+                        entity_id=sku,
+                        field_path=f"description.richAnnotationJson.content[{idx}]",
+                        actual=content,
+                    )
+
+            for block in V.require_non_empty_list(
+                blocks, entity_id=sku, field_path=f"description.richAnnotationJson.content[{idx}].blocks"
+            ):
+                out.append(
+                    {
+                        "img": {
+                            "alt": block.get("img", {}).get("alt", ""),
+                            "src": block.get("img", {}).get("src", ""),
+                        },
+                        "video": block.get("sources", []) if block.get("widgetName") == "raVideo" else [],
+                        "text": block.get("text", {}).get("content", ""),
+                        "text_items": [it.get("content") for it in block.get("text", {}).get("items", [])],
+                        "title": block.get("title", {}).get("content", ""),
+                        "title_items": [it.get("content") for it in block.get("title", {}).get("items", [])],
+                    }
+                )
+        return out
