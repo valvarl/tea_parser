@@ -77,6 +77,7 @@ class ProductEnricher:
         state_ids: Optional[List[str]] = None,
         state_regex: bool = False,
         state_wait: int = 7_000,
+        similar_offers: bool = False,
     ) -> None:
         self.base_url = "https://www.ozon.ru"
         self.concurrency = max(1, concurrency)
@@ -89,6 +90,8 @@ class ProductEnricher:
         self.state_ids = state_ids or []
         self.state_regex = state_regex
         self.state_wait = max(1_000, state_wait)
+
+        self.want_similar_offers = similar_offers 
 
     # ----- public -----
 
@@ -178,6 +181,12 @@ class ProductEnricher:
             )
             clear_widget_meta(states)
             row["states"] = self._normalize_states(states, sku=sku)
+
+        # similar/other offers
+        if self.want_similar_offers:
+            offers = await self._collect_similar_offers(ctx, headers, sku=sku)
+            if offers is not None:
+                row["other_offers"] = offers
 
         await asyncio.sleep(random.uniform(0.7, 1.4))
         return row, reviews
@@ -303,6 +312,51 @@ class ProductEnricher:
         except PWTimeout:
             dbg(f"nuxt timeout ({hydrate_timeout} ms)")
             return {}
+        
+    async def _collect_similar_offers(
+        self,
+        ctx: BrowserContext,
+        headers: Dict[str, str],
+        sku: str,
+    ) -> Optional[Dict[str, Any]]:
+        path = f"/modal/otherOffersFromSellers?product_id={sku}&page_changed=true"
+        url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(path, safe="")
+
+        resp = await ctx.request.get(url, headers=headers)
+        if resp.status != 200:
+            return None
+
+        data = await resp.json()
+        ws = data.get("widgetStates", {}) or {}
+
+        # We only need the JSON under the first webSellerList-* key.
+        key = next((k for k in ws.keys() if k.startswith("webSellerList-")), None)
+        if not key:
+            return None
+
+        try:
+            parsed = json.loads(ws[key])
+        except Exception:
+            return None
+
+        def safe_price(seller: dict, *keys: str) -> Optional[int]:
+            val = seller.get("price") or {}
+            for k in keys:
+                val = val.get(k, {}) if isinstance(val, dict) else {}
+            return digits_only(val) if val else None
+
+        results = [
+            {
+                "sku": s.get("sku"),
+                "seller_id": s.get("id"),
+                "card_price": safe_price(s, "cardPrice", "price"),
+                "orig_price": safe_price(s, "originalPrice"),
+                "disc_price": safe_price(s, "price"),
+            }
+            for s in parsed.get("sellers", [])
+        ]
+
+        return results or None
         
     # ----- data shaping -----
 
