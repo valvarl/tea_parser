@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import quote
 
@@ -18,8 +19,21 @@ logger = logging.getLogger(__name__)
 ENTRY_RE = re.compile(r"/api/entrypoint-api\.bx/page/json/v2\?url=%2Fsearch%2F")
 
 
+class CircuitOpen(RuntimeError):
+    def __init__(self, message: str, next_retry_at: int) -> None:
+        super().__init__(message)
+        self.next_retry_at = next_retry_at
+
+
 class ProductIndexer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_retries: int = 3,
+        retry_base_delay: float = 1.0,  # seconds
+        circuit_threshold: int = 5,  # consecutive failures to open circuit
+        circuit_cooldown: int = 600,  # seconds
+    ) -> None:
         self.base_url = "https://www.ozon.ru"
         self.search_url = f"{self.base_url}/search/"
         self.api_url = f"{self.base_url}/api/entrypoint-api.bx/page/json/v2"
@@ -31,6 +45,11 @@ class ProductIndexer:
             "viewport": {"width": 1366, "height": 768},
             "extra_http_headers": {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
         }
+
+        self.max_retries = max(1, int(max_retries))
+        self.retry_base_delay = float(retry_base_delay)
+        self.circuit_threshold = max(1, int(circuit_threshold))
+        self.circuit_cooldown = max(30, int(circuit_cooldown))
 
     # ---------- parsing ----------
 
@@ -54,10 +73,12 @@ class ProductIndexer:
         if not sku:
             return None
 
-        name = next((b["textAtom"]["text"] for b in it["mainState"] if b.get("type") == "textAtom"), None)
+        name = next(
+            (b.get("textAtom", {}).get("text") for b in it.get("mainState", []) if b.get("type") == "textAtom"), None
+        )
 
         rating = reviews = None
-        for b in it["mainState"]:
+        for b in it.get("mainState", []):
             if b.get("type") == "labelList" and "rating" in json.dumps(b):
                 labels = b.get("labelList", {}).get("items", [])
                 if labels:
@@ -79,15 +100,105 @@ class ProductIndexer:
             "cover_image": cover_image,
         }
 
-    # ---------- network / iteration ----------
+    # ---------- network utils with retry/backoff ----------
 
-    @staticmethod
-    async def _capture_entry_headers_and_json(resp, headers_sink: Dict[str, str], json_sink: Dict[str, Any]) -> None:
-        if json_sink or resp.status != 200 or not ENTRY_RE.search(resp.url):
-            return
-        raw_h = await resp.request.all_headers()
-        headers_sink.update({k: v for k, v in raw_h.items() if not k.startswith(":")})
-        json_sink.update(await resp.json())
+    async def _req_json(
+        self,
+        ctx,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        allow_status: range = range(200, 300),
+    ) -> Dict[str, Any]:
+        attempt = 0
+        while True:
+            try:
+                resp = await ctx.request.get(url, headers=headers)
+                status = resp.status
+                if status not in allow_status:
+                    # retry on 429 and 5xx
+                    if status == 429 or 500 <= status <= 599:
+                        raise RuntimeError(f"http_status_{status}")
+                    raise RuntimeError(f"http_status_{status}_noretry")
+                try:
+                    return await resp.json()
+                except Exception as e:
+                    # retry on JSON decode
+                    raise json.JSONDecodeError("bad json", doc="", pos=0) from e
+
+            except json.JSONDecodeError as e:
+                attempt += 1
+                if attempt >= self.max_retries:
+                    logger.error("JSON decode failed after %s tries: %s", attempt, e)
+                    raise
+            except Exception as e:
+                attempt += 1
+                # retry only for network/429/5xx buckets (marked above)
+                if "http_status_" in str(e) and str(e).endswith("_noretry"):
+                    raise
+                if attempt >= self.max_retries:
+                    logger.error("request failed after %s tries: %s", attempt, e)
+                    raise
+            # backoff with jitter
+            delay = self.retry_base_delay * (2 ** (attempt - 1))
+            delay *= 1.0 + random.uniform(0, 0.25)
+            await asyncio.sleep(delay)
+
+    async def _prime_session(
+        self,
+        ctx,
+        query: str,
+        category: str,
+        start_page: int,
+    ) -> Dict[str, Any]:
+        # try up to two passes to capture entry headers + first JSON
+        headers: Dict[str, str] = {}
+        first_json: Dict[str, Any] = {}
+
+        async def capture(resp):
+            nonlocal headers, first_json
+            if first_json or resp.status != 200 or not ENTRY_RE.search(resp.url):
+                return
+            raw_h = await resp.request.all_headers()
+            headers = {k: v for k, v in raw_h.items() if not k.startswith(":")}
+            first_json = await resp.json()
+
+        page = await ctx.new_page()
+        page.on("response", lambda r: asyncio.create_task(capture(r)))
+
+        async def open_and_scroll(url: str) -> None:
+            await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(1.2, 2.2))
+            await page.mouse.wheel(0, 3000)
+            await asyncio.sleep(random.uniform(1.2, 2.2))
+
+        # attempt 1: original search url
+        url1 = f"{self.search_url}?text={query}&category={category}&page={start_page}"
+        await open_and_scroll(url1)
+
+        # attempt 2: same url with a cache-buster if not captured
+        if not first_json:
+            url2 = f"{url1}&t={int(time.time()*1000)}"
+            await open_and_scroll(url2)
+
+        if not first_json:
+            # give one direct API try with retries, to salvage headers-less flow
+            api_url = (
+                f"{self.api_url}?url={quote(f'/search/?text={query}&category={category}&page={start_page}', safe='')}"
+            )
+            try:
+                first_json = await self._req_json(ctx, api_url, headers=headers or None)
+            except Exception:
+                first_json = {}
+
+        if not first_json:
+            # open circuit: can't proceed now
+            next_retry_at = int(time.time()) + self.circuit_cooldown
+            raise CircuitOpen("entrypoint not captured", next_retry_at)
+
+        return {"headers": headers, "json": first_json}
+
+    # ---------- iteration with circuit breaker ----------
 
     async def iter_products(
         self,
@@ -97,33 +208,15 @@ class ProductIndexer:
         max_pages: int = 10,
         headless: bool = True,
     ) -> AsyncIterator[List[Dict[str, Any]]]:
-        search_url = f"{self.search_url}?text={query}&category={category}&page={start_page}"
+        failures = 0
+        seen: set[str] = set()
 
         async with AsyncCamoufox(headless=headless) as browser:
             ctx = await browser.new_context(**self.context_settings)
-            page = await ctx.new_page()
 
-            first_headers: Dict[str, str] = {}
-            first_json_box: Dict[str, Any] = {}
-
-            page.on(
-                "response",
-                lambda resp: asyncio.create_task(
-                    self._capture_entry_headers_and_json(resp, first_headers, first_json_box)
-                ),
-            )
-
-            await page.goto(search_url, timeout=60_000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(1.5, 3.5))
-            await page.mouse.wheel(0, 3000)
-            await asyncio.sleep(random.uniform(1.5, 3.5))
-
-            if not first_json_box:
-                logger.warning("Entrypoint JSON not captured; possible anti-bot or changed markup.")
-                return
-
-            seen: set[str] = set()
-            json_page = first_json_box
+            primed = await self._prime_session(ctx, query, category, start_page)
+            headers = primed["headers"]
+            json_page = primed["json"]
             page_no = start_page
 
             while True:
@@ -136,21 +229,25 @@ class ProductIndexer:
 
                 if batch:
                     yield batch
-                logger.info("page %s: %s unique items", page_no, len(seen))
 
                 page_no += 1
                 if max_pages and page_no > start_page + max_pages - 1:
                     break
 
-                next_api = (
-                    f"{self.api_url}?url={quote(f'/search/?text={query}&category={category}&page={page_no}', safe='')}"
-                )
-                resp = await ctx.request.get(next_api, headers=first_headers)
-                if resp.status != 200:
-                    logger.warning("HTTP %s on page %s", resp.status, page_no)
-                    break
-                json_page = await resp.json()
-                await asyncio.sleep(random.uniform(1.2, 2.5))
+                try:
+                    next_api = f"{self.api_url}?url={quote(f'/search/?text={query}&category={category}&page={page_no}', safe='')}"
+                    json_page = await self._req_json(ctx, next_api, headers=headers)
+                    failures = 0
+                except Exception as e:
+                    failures += 1
+                    logger.warning(
+                        "page fetch failed (page=%s, fail=%s/%s): %s", page_no, failures, self.circuit_threshold, e
+                    )
+                    if failures >= self.circuit_threshold:
+                        next_retry_at = int(time.time()) + self.circuit_cooldown
+                        raise CircuitOpen("circuit opened due to consecutive failures", next_retry_at)
+                    # soft backoff between page attempts
+                    await asyncio.sleep(self.retry_base_delay * (2 ** (failures - 1)) * (1.0 + random.uniform(0, 0.25)))
 
     async def search_products(
         self,

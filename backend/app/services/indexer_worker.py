@@ -8,9 +8,10 @@ import time
 from typing import List
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
 from app.core.logging import configure_logging
 from app.db.mongo import db
-from app.services.indexer import ProductIndexer
+from app.services.indexer import ProductIndexer, CircuitOpen
 
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
@@ -70,82 +71,86 @@ async def handle(
         scraped = failed = page_no = 0
         inserted = updated = 0
 
-        async for batch in indexer.iter_products(
-            query=query,
-            category=category,
-            start_page=1,
-            max_pages=max_pages,
-            headless=True,
-        ):
-            page_no += 1
-            now_ts = int(time.time())
-            batch_skus: List[str] = []
+        try:
+            async for batch in indexer.iter_products(
+                query=query,
+                category=category,
+                start_page=1,
+                max_pages=max_pages,
+                headless=True,
+            ):
+                page_no += 1
+                now_ts = int(time.time())
+                batch_skus: List[str] = []
 
-            for p in batch:
-                sku = p.get("sku")
-                if not sku:
-                    continue
+                for p in batch:
+                    sku = p.get("sku")
+                    if not sku:
+                        continue
 
-                doc_now = {
-                    "name": p.get("name"),
-                    "rating": p.get("rating"),
-                    "reviews": p.get("reviews"),
-                    "cover_image": p.get("cover_image"),
-                    "last_seen_at": now_ts,
-                    "is_active": True,
-                    "task_id": task_id,
-                }
+                    doc_now = {
+                        "name": p.get("name"),
+                        "rating": p.get("rating"),
+                        "reviews": p.get("reviews"),
+                        "cover_image": p.get("cover_image"),
+                        "last_seen_at": now_ts,
+                        "is_active": True,
+                        "task_id": task_id,
+                    }
 
-                start = time.perf_counter()
-                try:
-                    res = await db.index.update_one(
-                        {"sku": sku},
-                        {
-                            "$set": doc_now,
-                            "$setOnInsert": {
-                                "first_seen_at": now_ts,
-                                "candidate_id": None,
-                                "sku": sku,
+                    try:
+                        res = await db.index.update_one(
+                            {"sku": sku},
+                            {
+                                "$set": doc_now,
+                                "$setOnInsert": {"first_seen_at": now_ts, "candidate_id": None, "sku": sku},
                             },
-                        },
-                        upsert=True,
-                    )
-                    if res.upserted_id is not None:
-                        inserted += 1
-                    else:
-                        updated += 1
-                    scraped += 1
-                    batch_skus.append(sku)
-                    logger.debug("Mongo upsert sku=%s OK (%.3fs)", sku, time.perf_counter() - start)
-                except Exception as exc:
-                    failed += 1
-                    logger.error(
-                        "Mongo upsert sku=%s failed after %.3fs: %s",
-                        sku,
-                        time.perf_counter() - start,
-                        exc,
-                        exc_info=True,
-                    )
+                            upsert=True,
+                        )
+                        if res.upserted_id is not None:
+                            inserted += 1
+                        else:
+                            updated += 1
+                        scraped += 1
+                        batch_skus.append(sku)
+                    except Exception as exc:
+                        failed += 1
+                        logger.error("Mongo upsert sku=%s failed: %s", sku, exc, exc_info=True)
 
+                await prod.send_and_wait(
+                    TOPIC_INDEXER_STATUS,
+                    {
+                        "task_id": task_id,
+                        "status": "batch_ready",
+                        "batch_data": {"batch_id": page_no, "skus": batch_skus},
+                        "scraped_products": scraped,
+                        "failed_products": failed,
+                        "inserted_products": inserted,
+                        "updated_products": updated,
+                    },
+                )
+                logger.info(
+                    "Batch %s done: saved=%s failed=%s (total saved=%s)", page_no, len(batch_skus), failed, scraped
+                )
+
+        except CircuitOpen as co:
+            # defer the task; background can re-queue later based on this timestamp
+            next_retry_at = getattr(co, "next_retry_at", int(time.time()) + 600)
             await prod.send_and_wait(
                 TOPIC_INDEXER_STATUS,
                 {
                     "task_id": task_id,
-                    "status": "batch_ready",
-                    "batch_data": {"batch_id": page_no, "skus": batch_skus},
+                    "status": "deferred",
+                    "reason": str(co),
+                    "next_retry_at": next_retry_at,
                     "scraped_products": scraped,
                     "failed_products": failed,
                     "inserted_products": inserted,
                     "updated_products": updated,
                 },
             )
-            logger.info(
-                "Batch %s done: saved=%s failed=%s (total saved=%s)",
-                page_no,
-                len(batch_skus),
-                failed,
-                scraped,
-            )
+            logger.warning("Task %s deferred until %s (%s)", task_id, next_retry_at, co)
+            return  # stop handle() here
 
         total = scraped + failed
         await prod.send_and_wait(
@@ -161,6 +166,7 @@ async def handle(
             },
         )
         logger.info("Task %s completed: total=%s scraped=%s failed=%s", task_id, total, scraped, failed)
+
     except Exception as e:
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
