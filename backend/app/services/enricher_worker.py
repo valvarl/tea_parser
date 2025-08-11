@@ -1,61 +1,25 @@
 from __future__ import annotations
 
-"""Kafka worker: enriches products and writes structured docs to MongoDB.
-
-Collections used
-----------------
-- index       : minimal SKU registry (already created by indexer)
-- candidates  : detailed product cards (this worker populates)
-- prices      : one snapshot per capture (price history)
-- tea_reviews : full‑text reviews (optional)
-
-Schema hints (see README for full spec):
-
-candidates
-~~~~~~~~~~
-{
-    _id: ObjectId,
-    sku: str,
-    created_at: datetime,
-    updated_at: datetime,
-    basic: {
-        title: str, price_current: int | None, price_old: int | None,
-        rating_avg: float | None, reviews_count: int | None,
-    },
-    stock: {
-        qty: int | None, max_qty: int | None,
-        delivery_date: datetime | None, delivery_label_raw: str | None,
-    },
-    media: { images: [str], video: [str] },
-    attributes: { … },
-    raw: { charcs_json: str | None, description: str | None },
-    reviews_agg: { last_count: int | None, last_rating: float | None },
-}
-
-prices
-~~~~~~
-{ _id, candidate_id, captured_at, price_current, price_old, currency }
-"""
-
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from app.core.logging import configure_logging
 from app.db.mongo import db
-from app.services.enricher import ProductEnricher  # scraping / parsing class
+from app.services.enricher import ProductEnricher
 
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_ENRICHER_CMD = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
 TOPIC_ENRICHER_STATUS = os.getenv("TOPIC_ENRICHER_STATUS", "enricher_status")
+
 CONCURRENCY_DEF = int(os.getenv("ENRICH_CONCURRENCY", 6))
 REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "false").lower() == "true"
 REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
-CURRENCY = "RUB"
+CURRENCY = os.getenv("CURRENCY", "RUB")
 
 configure_logging()
 logger = logging.getLogger("enricher-worker")
@@ -67,212 +31,225 @@ enricher = ProductEnricher(
     reviews_limit=REVIEWS_LIMIT_DEF,
 )
 
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
 
-IMMUTABLE_ON_INSERT = ("created_at",)
-
-def _split_update(doc: dict) -> tuple[dict, dict]:
-    """
-    Возвращает (set_on_insert, set_always).
-    Всё, что нельзя трогать при апдейте (created_at …), уходит
-    **только** в $setOnInsert.
-    """
-    soi, sa = {}, {}
-    for k, v in doc.items():
-        if k in IMMUTABLE_ON_INSERT:
-            soi[k] = v
-        else:
-            sa[k] = v
-    # обновляем «дата последнего парсинга»
-    sa["updated_at"] = datetime.utcnow()
-    return soi, sa
-
-def _now() -> datetime:
-    return datetime.utcnow()
+# ---------- helpers ----------
 
 
-def _mk_candidate_doc(row: Dict[str, Any], first_seen_at: Optional[datetime]) -> Dict[str, Any]:
-    """Convert raw row from ProductEnricher → structured candidate document."""
-    img_array = row.get("images", "").split("|") if row.get("images") else []
+def _now_ts() -> int:
+    return int(time.time())
 
+
+def _digits_only(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    s = str(val)
+    num = "".join(ch for ch in s if ch.isdigit())
+    return int(num) if num else None
+
+
+def _dumps(x: Any) -> bytes:
+    return json.dumps(x, ensure_ascii=False).encode("utf-8")
+
+
+def _loads(x: bytes) -> Any:
+    return json.loads(x.decode("utf-8"))
+
+
+def _pick_cover(row: Dict[str, Any]) -> Optional[str]:
+    return (
+        row.get("cover_image")
+        or row.get("states", {}).get("gallery", {}).get("coverImage")
+        or row.get("states", {}).get("gallery", {}).get("images", [{}])[0].get("src")
+    )
+
+
+def _pick_title(row: Dict[str, Any]) -> Optional[str]:
+    return row.get("name") or row.get("states", {}).get("seo", {}).get("name")
+
+
+def _extract_prices(row: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    pr = row.get("price") or {}
+    card = _digits_only(pr.get("cardPrice"))
+    orig = _digits_only(pr.get("originalPrice"))
+    disc = _digits_only(pr.get("price"))
+    return card, orig, disc
+
+
+def _mk_candidate(row: Dict[str, Any], first_seen_at: Optional[int]) -> Dict[str, Any]:
     doc: Dict[str, Any] = {
         "sku": row["sku"],
-        "created_at": first_seen_at or _now(),
-        "updated_at": _now(),
-        "basic": {
-            "title": row.get("name"),
-            "price_current": row.get("price_curr"),
-            "price_old": row.get("price_old"),
-            "rating_avg": row.get("rating"),
-            "reviews_count": row.get("reviews"),
+        "created_at": first_seen_at or _now_ts(),
+        "updated_at": _now_ts(),
+        "title": _pick_title(row),
+        "cover_image": _pick_cover(row),
+        "description": row.get("description"),
+        "characteristics": {
+            "full": row.get("characteristics"),
+            "short": row.get("states", {}).get("shortCharacteristics"),
         },
-        "stock": {
-            "qty": row.get("qty"),  # placeholder; can be filled elsewhere
-            "max_qty": row.get("max_qty"),
-            "delivery_date": row.get("delivery_date"),
-            "delivery_label_raw": row.get("delivery_day_raw"),
-        },
-        "media": {
-            "images": img_array,
-            "video": [],
-        },
-        "attributes": {},  # to be parsed later from charcs_json
-        "raw": {
-            "charcs_json": row.get("charcs_json"),
-            "description": row.get("description"),
-        },
-        "reviews_agg": {
-            "last_count": row.get("reviews"),
-            "last_rating": row.get("rating"),
-        },
+        "gallery": row.get("states").get("gallery", {}),
+        "aspects": row.get("states").get("aspects", {}),
+        "collections": row.get("states").get("collections", {}),
+        "nutrition": row.get("states").get("nutrition", {}),
+        "seo": row.get("states").get("seo", {}),
+        "other_offers": row.get("other_offers"),
     }
     return doc
 
 
-async def _save_price_snapshot(candidate_id, price_curr, price_old):
-    try:
-        await db.prices.insert_one({
+async def _save_price_snapshot(candidate_id, disc_price, orig_price) -> None:
+    await db.prices.insert_one(
+        {
             "candidate_id": candidate_id,
-            "captured_at": _now(),
-            "price_current": price_curr,
-            "price_old": price_old,
+            "captured_at": _now_ts(),
+            "price_current": disc_price,
+            "price_old": orig_price,
             "currency": CURRENCY,
-        })
-    except Exception as exc:
-        logger.warning("price snapshot failed for %s: %s", candidate_id, exc)
+        }
+    )
 
 
-# --------------------------------------------------------------------------
-# Kafka worker
-# --------------------------------------------------------------------------
+async def _upsert_candidate(doc: Dict[str, Any]) -> Any:
+    soi = {"created_at": doc["created_at"], "sku": doc["sku"]}
+    sa = {k: v for k, v in doc.items() if k not in ("created_at", "sku")}
+    sa["updated_at"] = _now_ts()
+
+    res = await db.candidates.update_one(
+        {"sku": doc["sku"]},
+        {"$set": sa, "$setOnInsert": soi},
+        upsert=True,
+    )
+    if res.upserted_id is not None:
+        candidate_id = res.upserted_id
+    else:
+        got = await db.candidates.find_one({"sku": doc["sku"]}, {"_id": 1})
+        candidate_id = got["_id"]
+
+    await db.index.update_one({"sku": doc["sku"]}, {"$set": {"candidate_id": candidate_id}})
+    return candidate_id
+
+
+async def _bulk_upsert_reviews(reviews: List[Dict[str, Any]]) -> int:
+    saved = 0
+    for rv in reviews:
+        # normalize timestamps if they arrived as ISO strings
+        for tkey in ("created_at", "published_at", "updated_at"):
+            if isinstance(rv.get(tkey), str):
+                rv[tkey] = _digits_only(rv[tkey])
+        try:
+            await db.reviews.update_one(
+                {"uuid": rv.get("uuid") or f"{rv.get('sku')}::{rv.get('published_at')}"},
+                {"$set": rv},
+                upsert=True,
+            )
+            saved += 1
+        except Exception as exc:
+            logger.warning("review upsert failed for sku=%s uuid=%s: %s", rv.get("sku"), rv.get("uuid"), exc)
+    return saved
+
+
+# ---------- kafka worker ----------
+
 
 async def main() -> None:
     cons = AIOKafkaConsumer(
         TOPIC_ENRICHER_CMD,
         bootstrap_servers=BOOT,
         group_id="enricher-worker",
-        value_deserializer=lambda x: json.loads(x.decode()),
+        value_deserializer=_loads,
         auto_offset_reset="earliest",
         enable_auto_commit=False,
     )
     prod = AIOKafkaProducer(
         bootstrap_servers=BOOT,
-        value_serializer=lambda x: json.dumps(x).encode(),
+        value_serializer=_dumps,
         enable_idempotence=True,
     )
-    await cons.start(); await prod.start()
+    await cons.start()
+    await prod.start()
     try:
         async for msg in cons:
             try:
                 await _handle_message(msg.value, prod)
                 await cons.commit()
             except Exception as exc:
-                logger.exception("message failed → no commit: %s", exc)
+                logger.exception("message processing failed, not committing: %s", exc)
     finally:
-        await cons.stop(); await prod.stop()
+        await cons.stop()
+        await prod.stop()
 
 
-async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer):
+async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     task_id: str = cmd["task_id"]
-    skus: List[str] | None = cmd.get("skus")
-    want_reviews: bool = bool(cmd.get("reviews", REVIEWS_DEF))
-    reviews_limit: int = int(cmd.get("reviews_limit", REVIEWS_LIMIT_DEF))
-    concurrency: int = int(cmd.get("concurrency", CONCURRENCY_DEF))
+    skus: Optional[List[str]] = cmd.get("skus")
+    want_reviews = bool(cmd.get("reviews", REVIEWS_DEF))
+    reviews_limit = int(cmd.get("reviews_limit", REVIEWS_LIMIT_DEF))
+    concurrency = int(cmd.get("concurrency", CONCURRENCY_DEF))
 
     enricher.concurrency = concurrency
     enricher.want_reviews = want_reviews
     enricher.reviews_limit = reviews_limit
 
-    # ------------------------------------------------------------------
-    # 1. Fetch rows to enrich
-    # ------------------------------------------------------------------
     if skus:
         index_rows = await db.index.find({"sku": {"$in": skus}}).to_list(None)
     else:
-        # все SKU у которых ещё нет candidate_id → никогда не обогащались
         index_rows = await db.index.find({"candidate_id": None}).to_list(None)
 
     if not index_rows:
-        logger.info("task %s: nothing to enrich", task_id)
-        await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
-            "task_id": task_id, "status": "completed",
-            "scraped_products": 0, "failed_products": 0, "total_products": 0,
-        })
+        await prod.send_and_wait(
+            TOPIC_ENRICHER_STATUS,
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "scraped_products": 0,
+                "failed_products": 0,
+                "total_products": 0,
+            },
+        )
         return
 
-    base_rows: List[Dict[str, Any]] = [
-        {"sku": d["sku"], "first_seen_at": d.get("first_seen_at")} for d in index_rows
-    ]
-
-    total = len(base_rows)
-    await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
-        "task_id": task_id, "status": "running", "total_products": total,
-    })
-    logger.info("⚙️  task %s: enriching %s SKUs (reviews=%s)", task_id, total, want_reviews)
-
-    # ------------------------------------------------------------------
-    # 2. Grab PDP pages
-    # ------------------------------------------------------------------
-    # Re‑attach minimal data needed by ProductEnricher: at least sku & link
+    base_rows: List[Dict[str, Any]] = [{"sku": d["sku"], "first_seen_at": d.get("first_seen_at")} for d in index_rows]
     for r in base_rows:
-        r["link"] = f"/product/{r['sku']}/"  # slug‑less path works fine (302)
+        r["link"] = f"/product/{r['sku']}/"
+
+    await prod.send_and_wait(
+        TOPIC_ENRICHER_STATUS, {"task_id": task_id, "status": "running", "total_products": len(base_rows)}
+    )
 
     enriched_rows, reviews_rows = await enricher.enrich(base_rows)
 
-    # ------------------------------------------------------------------
-    # 3. Persist to MongoDB
-    # ------------------------------------------------------------------
-    scraped = failed = 0
+    scraped = failed = saved_reviews = 0
     for row in enriched_rows:
-        sku = row["sku"]
-        first_seen_at = next((it.get("first_seen_at") for it in base_rows if it["sku"] == sku), None)
-        candidate_doc = _mk_candidate_doc(row, first_seen_at)
-        soi, sa = _split_update(candidate_doc)
         try:
-            res = await db.candidates.update_one(
-                {"sku": candidate_doc["sku"]},
-                {"$set": sa, "$setOnInsert": soi},
-                upsert=True,
-            )
-            candidate_id = res.upserted_id or (await db.candidates.find_one({"sku": sku}, {"_id": 1}))['_id']
-            # link back from index → candidates
-            await db.index.update_one(
-                {"sku": candidate_doc["sku"]},
-                {"$set": {"candidate_id": candidate_id}},
-            )
-            # price history
-            await _save_price_snapshot(candidate_id, candidate_doc["basic"]["price_current"], candidate_doc["basic"]["price_old"])
+            sku = row["sku"]
+            fs_at = next((it.get("first_seen_at") for it in base_rows if it["sku"] == sku), None)
+            candidate_doc = _mk_candidate(row, fs_at)
+            candidate_id = await _upsert_candidate(candidate_doc)
+
+            card_price, orig_price, disc_price = _extract_prices(row)
+            await _save_price_snapshot(candidate_id, disc_price or card_price, orig_price)
+
             scraped += 1
         except Exception as exc:
-            logger.error("failed to save candidate for %s: %s", sku, exc)
             failed += 1
+            logger.error("candidate persist failed for sku=%s: %s", row.get("sku"), exc, exc_info=True)
 
-    # reviews
-    saved_reviews = 0
     if want_reviews and reviews_rows:
-        for rv in reviews_rows:
-            try:
-                await db.tea_reviews.update_one(
-                    {"sku": rv["sku"], "author": rv["author"], "date": rv["date"]},
-                    {"$set": rv},
-                    upsert=True,
-                )
-                saved_reviews += 1
-            except Exception:
-                logger.warning("review upsert failed for %s", rv.get("sku"))
+        saved_reviews = await _bulk_upsert_reviews(reviews_rows)
 
-    # ------------------------------------------------------------------
-    await prod.send_and_wait(TOPIC_ENRICHER_STATUS, {
-        "task_id": task_id,
-        "status": "batch_ready",
-        "scraped_products": scraped,
-        "failed_products": failed,
-        "total_products": total,
-        "saved_reviews": saved_reviews,
-    })
-    logger.info("✅ task %s done: saved=%s failed=%s reviews=%s", task_id, scraped, failed, saved_reviews)
+    await prod.send_and_wait(
+        TOPIC_ENRICHER_STATUS,
+        {
+            "task_id": task_id,
+            "status": "batch_ready",
+            "scraped_products": scraped,
+            "failed_products": failed,
+            "total_products": len(base_rows),
+            "saved_reviews": saved_reviews,
+        },
+    )
+
+    logger.info("task %s done: saved=%s failed=%s reviews=%s", task_id, scraped, failed, saved_reviews)
 
 
 if __name__ == "__main__":
