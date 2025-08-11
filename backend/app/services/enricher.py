@@ -44,6 +44,26 @@ _JS_PULL = """
 """
 
 
+class RetryableError(RuntimeError):
+    def __init__(
+        self, message: str, *, url: str | None = None, status: int | None = None, cause: Exception | None = None
+    ):
+        super().__init__(message)
+        self.url = url
+        self.status = status
+        self.cause = cause
+
+
+class NonRetryableError(RuntimeError):
+    def __init__(
+        self, message: str, *, url: str | None = None, status: int | None = None, cause: Exception | None = None
+    ):
+        super().__init__(message)
+        self.url = url
+        self.status = status
+        self.cause = cause
+
+
 # -------- helpers --------
 
 
@@ -97,9 +117,15 @@ class ProductEnricher:
 
     # ----- public -----
 
-    async def enrich(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    async def enrich(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        batch_retries: int = 3,
+        base_backoff: float = 1.0,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         if not rows:
-            return [], []
+            return [], [], []
 
         async with AsyncCamoufox(headless=self.headless) as browser:
             ctx = await browser.new_context(locale="ru-RU")
@@ -113,18 +139,44 @@ class ProductEnricher:
             await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
             await asyncio.sleep(random.uniform(1.0, 1.8))
 
-            sem = asyncio.Semaphore(self.concurrency)
-            enriched: List[Dict[str, Any]] = []
-            collected_reviews: List[Dict[str, Any]] = []
+            successes: List[Dict[str, Any]] = []
+            reviews_all: List[Dict[str, Any]] = []
+            failed: List[Dict[str, Any]] = list(rows)
 
-            async def worker(row: Dict[str, Any]) -> None:
-                async with sem:
-                    r, revs = await self._grab_pdp(ctx, first_headers, dict(row))
-                    enriched.append(r)
-                    collected_reviews.extend(revs)
+            attempt = 0
+            while failed and attempt < batch_retries:
+                attempt += 1
+                sem = asyncio.Semaphore(self.concurrency)
+                round_success: List[Dict[str, Any]] = []
+                round_reviews: List[Dict[str, Any]] = []
+                round_failed: List[Dict[str, Any]] = []
 
-            await asyncio.gather(*(worker(r) for r in rows))
-            return enriched, collected_reviews
+                async def worker(row: Dict[str, Any]) -> None:
+                    async with sem:
+                        try:
+                            r, revs = await self._grab_pdp(ctx, first_headers, dict(row))
+                            round_success.append(r)
+                            round_reviews.extend(revs)
+                        except RetryableError:
+                            round_failed.append(row)
+                        except NonRetryableError:
+                            # do not retry this SKU
+                            pass
+                        except Exception:
+                            # default to retryable
+                            round_failed.append(row)
+
+                await asyncio.gather(*(worker(r) for r in failed))
+
+                successes.extend(round_success)
+                reviews_all.extend(round_reviews)
+                failed = round_failed
+
+                if failed and attempt < batch_retries:
+                    delay = base_backoff * (2 ** (attempt - 1)) * (1.0 + random.uniform(0, 0.25))
+                    await asyncio.sleep(delay)
+
+            return successes, reviews_all, failed
 
     # ----- network / page ops -----
 
@@ -144,6 +196,31 @@ class ProductEnricher:
         else:
             await route.continue_()
 
+    async def _request_json(
+        self,
+        ctx: BrowserContext,
+        url: str,
+        headers: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        try:
+            resp = await ctx.request.get(url, headers=headers)
+        except Exception as e:
+            raise RetryableError("network_error", url=url, cause=e)
+
+        st = getattr(resp, "status", None)
+        if st is None:
+            raise RetryableError("no_status", url=url)
+
+        if st == 429 or 500 <= st <= 599:
+            raise RetryableError(f"http_{st}", url=url, status=st)
+        if not (200 <= st < 300):
+            raise NonRetryableError(f"http_{st}", url=url, status=st)
+
+        try:
+            return await resp.json()
+        except Exception as e:
+            raise RetryableError("json_decode_error", url=url, cause=e)
+
     async def _grab_pdp(
         self, ctx: BrowserContext, headers: Dict[str, str], row: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -155,80 +232,91 @@ class ProductEnricher:
             f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
         )
 
-        resp = await ctx.request.get(pdp_api, headers=headers)
-        if resp.status != 200:
-            await asyncio.sleep(random.uniform(0.7, 1.4))
-            return row, []
+        # PDP JSON (hard requirement for SKU success)
+        try:
+            pdp_json = await self._request_json(ctx, pdp_api, headers)
+        except NonRetryableError:
+            raise
+        except Exception as e:
+            raise RetryableError(str(e)) from e
 
-        pdp_json = await resp.json()
-
-        # raw widgets
+        # widgets (must not make SKU fail if a subsection is missing)
         row.update(self._collect_widgets(pdp_json, sku=sku))
 
-        # reviews
         reviews: List[Dict[str, Any]] = []
         if self.want_reviews:
-            reviews = await self._collect_reviews(ctx, headers, path_part, sku=sku)
+            try:
+                reviews = await self._collect_reviews(ctx, headers, path_part, sku=sku)
+            except Exception:
+                # swallow — SKU stays successful even if reviews page errors
+                reviews = []
 
-        # state divs
         if self.want_states:
-            url_full = self.base_url + link
-            states = await self._collect_state_divs(
-                ctx=ctx,
-                url=url_full,
-                ids=self.state_ids,
-                use_regex=self.state_regex,
-                wait_ms=self.state_wait,
-                collect_nuxt=True,
-            )
-            clear_widget_meta(states)
-            row["states"] = self._normalize_states(states, sku=sku)
+            try:
+                url_full = self.base_url + link
+                states = await self._collect_state_divs(
+                    ctx=ctx,
+                    url=url_full,
+                    ids=self.state_ids,
+                    use_regex=self.state_regex,
+                    wait_ms=self.state_wait,
+                    collect_nuxt=True,
+                )
+                clear_widget_meta(states)
+                row["states"] = self._normalize_states(states)
+            except Exception:
+                pass
 
-        # similar/other offers
-        if self.want_similar_offers:
-            offers = await self._collect_similar_offers(ctx, headers, sku=sku)
-            if offers is not None:
-                row["other_offers"] = offers
+        if getattr(self, "want_similar_offers", False):
+            try:
+                offers = await self._collect_similar_offers(ctx, headers, row)
+                if offers is not None:
+                    row["other_offers"] = offers
+            except Exception:
+                pass
 
         await asyncio.sleep(random.uniform(0.7, 1.4))
         return row, reviews
 
     async def _collect_reviews(
-        self, ctx: BrowserContext, headers: Dict[str, str], path_part: str, *, sku: str
+        self,
+        ctx: BrowserContext,
+        headers: Dict[str, str],
+        path_part: str,
+        *,
+        sku: str,
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         next_path: Optional[str] = (
             f"{path_part}?layout_container=reviewshelfpaginator&layout_page_index=1&reviewsVariantMode=1"
         )
 
-        total = None
+        total: Optional[int] = None
         hard_limit = self.reviews_limit or float("inf")
 
         while next_path and len(out) < hard_limit:
             shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(next_path, safe="")
-            resp = await ctx.request.get(shelf_api, headers=headers)
-            if resp.status != 200:
-                break
+            data = await self._request_json(ctx, shelf_api, headers)
 
-            data = await resp.json()
-            raw_widget = next((v for k, v in data.get("widgetStates", {}).items() if REVIEW_WIDGET_RE.match(k)), None)
+            ws = data.get("widgetStates", {}) or {}
+            raw_widget = next((v for k, v in ws.items() if REVIEW_WIDGET_RE.match(k)), None)
             if not raw_widget:
                 break
 
             try:
                 widget = json.loads(raw_widget)
-            except Exception:
-                widget = {}
+            except Exception as e:
+                raise RetryableError("reviews_widget_decode", url=shelf_api, cause=e)
 
             if total is None:
-                total = max(0, widget.get("paging", {}).get("total", 0))
+                total = max(0, int(widget.get("paging", {}).get("total", 0) or 0))
                 if total == 0:
                     return []
                 hard_limit = min(hard_limit, total)
 
             for rev in widget.get("reviews", []):
-                item = {**self._filter_review(rev), "sku": sku}
-                if item.get("content", {}).get("comment", "") == "":
+                item = {**self._filter_reviews(rev), "sku": sku}
+                if (item.get("content") or {}).get("comment", "") == "":
                     break
                 out.append(item)
                 if len(out) >= hard_limit:
@@ -319,16 +407,16 @@ class ProductEnricher:
         self,
         ctx: BrowserContext,
         headers: Dict[str, str],
-        sku: str,
-    ) -> Optional[Dict[str, Any]]:
-        path = f"/modal/otherOffersFromSellers?product_id={sku}&page_changed=true"
-        url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(path, safe="")
-
-        resp = await ctx.request.get(url, headers=headers)
-        if resp.status != 200:
+        sku: str | Dict[str, Any],
+    ) -> Optional[List[Dict[str, Any]]]:
+        product_id = sku if isinstance(sku, str) else (sku.get("sku") if isinstance(sku, dict) else None)
+        if not product_id:
             return None
 
-        data = await resp.json()
+        path = f"/modal/otherOffersFromSellers?product_id={product_id}&page_changed=true"
+        url = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(path, safe="")
+
+        data = await self._request_json(ctx, url, headers)
         ws = data.get("widgetStates", {}) or {}
 
         # We only need the JSON under the first webSellerList-* key.
@@ -338,8 +426,8 @@ class ProductEnricher:
 
         try:
             parsed = json.loads(ws[key])
-        except Exception:
-            return None
+        except Exception as e:
+            raise RetryableError("sellerlist_decode", url=url, cause=e)
 
         def safe_price(seller: dict, *keys: str) -> Optional[int]:
             val = seller.get("price") or {}

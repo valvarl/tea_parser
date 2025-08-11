@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from pymongo import ReturnDocument
 from app.core.logging import configure_logging
 from app.db.mongo import db
 from app.services.enricher import ProductEnricher
@@ -20,6 +22,8 @@ CONCURRENCY_DEF = int(os.getenv("ENRICH_CONCURRENCY", 6))
 REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "false").lower() == "true"
 REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
 CURRENCY = os.getenv("CURRENCY", "RUB")
+
+ENRICH_RETRY_MAX = int(os.getenv("ENRICH_RETRY_MAX", "3"))
 
 configure_logging()
 logger = logging.getLogger("enricher-worker")
@@ -45,6 +49,11 @@ def _digits_only(val: Any) -> Optional[int]:
     s = str(val)
     num = "".join(ch for ch in s if ch.isdigit())
     return int(num) if num else None
+
+
+def _batch_hash(task_id: str, skus: List[str]) -> str:
+    payload = f"{task_id}::" + "|".join(sorted(skus))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 def _dumps(x: Any) -> bytes:
@@ -190,12 +199,11 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     enricher.want_reviews = want_reviews
     enricher.reviews_limit = reviews_limit
 
-    if skus:
-        index_rows = await db.index.find({"sku": {"$in": skus}}).to_list(None)
-    else:
+    if not skus:
         index_rows = await db.index.find({"candidate_id": None}).to_list(None)
+        skus = [d["sku"] for d in index_rows]
 
-    if not index_rows:
+    if not skus:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
             {
@@ -208,6 +216,36 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         )
         return
 
+    bh = _batch_hash(task_id, skus)
+    # dedupe batches
+    exists = await db.enrich_batches.find_one_and_update(
+        {"task_id": task_id, "hash": bh},
+        {
+            "$setOnInsert": {
+                "task_id": task_id,
+                "hash": bh,
+                "skus": skus,
+                "created_at": _now_ts(),
+                "status": "in_progress",
+            }
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    if exists.get("status") == "processed":
+        await prod.send_and_wait(
+            TOPIC_ENRICHER_STATUS,
+            {
+                "task_id": task_id,
+                "status": "completed",
+                "scraped_products": 0,
+                "failed_products": 0,
+                "total_products": 0,
+            },
+        )
+        return
+
+    index_rows = await db.index.find({"sku": {"$in": skus}}).to_list(None)
     base_rows: List[Dict[str, Any]] = [{"sku": d["sku"], "first_seen_at": d.get("first_seen_at")} for d in index_rows]
     for r in base_rows:
         r["link"] = f"/product/{r['sku']}/"
@@ -216,7 +254,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         TOPIC_ENRICHER_STATUS, {"task_id": task_id, "status": "running", "total_products": len(base_rows)}
     )
 
-    enriched_rows, reviews_rows = await enricher.enrich(base_rows)
+    enriched_rows, reviews_rows, failed_rows = await enricher.enrich(base_rows)
 
     scraped = failed = saved_reviews = 0
     for row in enriched_rows:
@@ -225,10 +263,8 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             fs_at = next((it.get("first_seen_at") for it in base_rows if it["sku"] == sku), None)
             candidate_doc = _mk_candidate(row, fs_at)
             candidate_id = await _upsert_candidate(candidate_doc)
-
             card_price, orig_price, disc_price = _extract_prices(row)
             await _save_price_snapshot(candidate_id, disc_price or card_price, orig_price)
-
             scraped += 1
         except Exception as exc:
             failed += 1
@@ -237,19 +273,55 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     if want_reviews and reviews_rows:
         saved_reviews = await _bulk_upsert_reviews(reviews_rows)
 
+    # DLQ for persistent failures
+    dlq_saved = 0
+    if failed_rows:
+        docs = [
+            {
+                "task_id": task_id,
+                "sku": r.get("sku"),
+                "reason": "retry_exhausted",
+                "attempts": ENRICH_RETRY_MAX,
+                "created_at": _now_ts(),
+                "updated_at": _now_ts(),
+            }
+            for r in failed_rows
+        ]
+        try:
+            if docs:
+                await db.enrich_dlq.insert_many(docs, ordered=False)
+                dlq_saved = len(docs)
+        except Exception as exc:
+            logger.warning("DLQ insert failed: %s", exc)
+
+    await db.enrich_batches.update_one(
+        {"task_id": task_id, "hash": bh},
+        {
+            "$set": {
+                "status": "processed",
+                "processed_at": _now_ts(),
+                "scraped": scraped,
+                "failed": failed + len(failed_rows),
+            }
+        },
+    )
+
     await prod.send_and_wait(
         TOPIC_ENRICHER_STATUS,
         {
             "task_id": task_id,
             "status": "batch_ready",
             "scraped_products": scraped,
-            "failed_products": failed,
+            "failed_products": failed + len(failed_rows),
             "total_products": len(base_rows),
             "saved_reviews": saved_reviews,
+            "dlq": dlq_saved,
         },
     )
 
-    logger.info("task %s done: saved=%s failed=%s reviews=%s", task_id, scraped, failed, saved_reviews)
+    logger.info(
+        "task %s done: saved=%s failed=%s reviews=%s", task_id, scraped, failed + len(failed_rows), saved_reviews
+    )
 
 
 if __name__ == "__main__":
