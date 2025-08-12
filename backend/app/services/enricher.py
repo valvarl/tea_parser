@@ -15,7 +15,7 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PWTimeout
 
-from .utils import clear_widget_meta, collect_raw_widgets, digits_only
+from .utils import collect_raw_widgets, digits_only
 from .validation import DataParsingError
 from .validation import Validator as V
 
@@ -100,6 +100,7 @@ class ProductEnricher:
         state_regex: bool = False,
         state_wait: int = 7_000,
         similar_offers: bool = False,
+        parallel_mode: bool = True,
     ) -> None:
         self.base_url = "https://www.ozon.ru"
         self.concurrency = max(1, concurrency)
@@ -115,8 +116,8 @@ class ProductEnricher:
 
         self.want_similar_offers = similar_offers
 
-        page_nav_concurrency = 1
-        self.page_nav_sem = asyncio.Semaphore(page_nav_concurrency)
+        self.parallel_mode = parallel_mode
+        self.page_nav_sem = asyncio.Semaphore(1)
 
     # ----- public -----
 
@@ -233,7 +234,7 @@ class ProductEnricher:
         headers: Dict[str, str],
         row: Dict[str, Any],
         *,
-        parallel: Optional[bool] = True,   # флаг параллельного режима
+        parallel: Optional[bool] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         link = row["link"]
         sku  = row["sku"]
@@ -272,16 +273,14 @@ class ProductEnricher:
                 return None
             try:
                 url_full = self.base_url + link
-                async with self.page_nav_sem:
-                    states = await self._collect_state_divs(
-                        ctx=ctx,
-                        url=url_full,
-                        ids=self.state_ids,
-                        use_regex=self.state_regex,
-                        wait_ms=self.state_wait,
-                        collect_nuxt=True,
-                    )
-                clear_widget_meta(states)
+                states = await self._collect_state_divs(
+                    ctx=ctx,
+                    url=url_full,
+                    ids=self.state_ids,
+                    use_regex=self.state_regex,
+                    wait_ms=self.state_wait,
+                    collect_nuxt=True,
+                )
                 return self._normalize_states(states, sku=sku)
             except Exception as e:
                 print(str(e), flush=True)
@@ -402,7 +401,13 @@ class ProductEnricher:
         wait_ms: int,
         collect_nuxt: bool = True,
     ) -> Dict[str, Any]:
+        await self.page_nav_sem.acquire()
         async with await ctx.new_page() as page:
+            
+            # https://github.com/daijro/camoufox/issues/314
+            await asyncio.sleep(1.0)
+            self.page_nav_sem.release()
+
             print("before load", flush=True)
             await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
             print("after load", flush=True)
