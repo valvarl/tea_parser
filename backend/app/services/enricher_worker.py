@@ -19,7 +19,7 @@ TOPIC_ENRICHER_CMD = os.getenv("TOPIC_ENRICHER_CMD", "enricher_cmd")
 TOPIC_ENRICHER_STATUS = os.getenv("TOPIC_ENRICHER_STATUS", "enricher_status")
 
 CONCURRENCY_DEF = int(os.getenv("ENRICH_CONCURRENCY", 6))
-REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "false").lower() == "true"
+REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "true").lower() == "true"
 REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
 CURRENCY = os.getenv("CURRENCY", "RUB")
 
@@ -33,6 +33,17 @@ enricher = ProductEnricher(
     headless=True,
     reviews=REVIEWS_DEF,
     reviews_limit=REVIEWS_LIMIT_DEF,
+    states=True,
+    state_ids=[
+        "webGallery",
+        "webPrice",
+        "webAspects",
+        "webCollections",
+        "webNutritionInfo",
+        "webShortCharacteristics"
+    ],
+    state_regex=False, 
+    similar_offers=True,
 )
 
 
