@@ -263,7 +263,7 @@ class ProductEnricher:
                     collect_nuxt=True,
                 )
                 clear_widget_meta(states)
-                row["states"] = self._normalize_states(states)
+                row["states"] = self._normalize_states(states, sku=sku)
             except Exception:
                 pass
 
@@ -315,7 +315,7 @@ class ProductEnricher:
                 hard_limit = min(hard_limit, total)
 
             for rev in widget.get("reviews", []):
-                item = {**self._filter_reviews(rev), "sku": sku}
+                item = {**self._filter_review(rev), "sku": sku}
                 if (item.get("content") or {}).get("comment", "") == "":
                     break
                 out.append(item)
