@@ -115,6 +115,9 @@ class ProductEnricher:
 
         self.want_similar_offers = similar_offers
 
+        page_nav_concurrency = 1
+        self.page_nav_sem = asyncio.Semaphore(page_nav_concurrency)
+
     # ----- public -----
 
     async def enrich(
@@ -166,7 +169,10 @@ class ProductEnricher:
                             # default to retryable
                             round_failed.append(row)
 
-                await asyncio.gather(*(worker(r) for r in failed))
+                results = await asyncio.gather(*(worker(r) for r in failed), return_exceptions=True)
+                for res in results:
+                    if isinstance(res, Exception):
+                        logger.debug("worker error: %r", res)
 
                 successes.extend(round_success)
                 reviews_all.extend(round_reviews)
@@ -222,17 +228,22 @@ class ProductEnricher:
             raise RetryableError("json_decode_error", url=url, cause=e)
 
     async def _grab_pdp(
-        self, ctx: BrowserContext, headers: Dict[str, str], row: Dict[str, Any]
+        self,
+        ctx: BrowserContext,
+        headers: Dict[str, str],
+        row: Dict[str, Any],
+        *,
+        parallel: Optional[bool] = True,   # флаг параллельного режима
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         link = row["link"]
-        sku = row["sku"]
+        sku  = row["sku"]
 
         path_part = link.split("ozon.ru")[-1]
         pdp_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(
             f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
         )
 
-        # PDP JSON (hard requirement for SKU success)
+        # PDP JSON (обязателен для успеха SKU)
         try:
             pdp_json = await self._request_json(ctx, pdp_api, headers)
         except NonRetryableError:
@@ -240,40 +251,82 @@ class ProductEnricher:
         except Exception as e:
             raise RetryableError(str(e)) from e
 
-        # widgets (must not make SKU fail if a subsection is missing)
+        # widgets — синхронная обработка JSON (быстро, нет смысла выносить в отдельный таск)
         row.update(self._collect_widgets(pdp_json, sku=sku))
 
-        reviews: List[Dict[str, Any]] = []
-        if self.want_reviews:
-            try:
-                reviews = await self._collect_reviews(ctx, headers, path_part, sku=sku)
-            except Exception:
-                # swallow — SKU stays successful even if reviews page errors
-                reviews = []
+        # Решаем, включать ли параллельный режим
+        use_parallel = self.parallel_mode if parallel is None else parallel
 
-        if self.want_states:
+        # Готовим корутины для остальных подсекций
+        async def _task_reviews():
+            if not self.want_reviews:
+                return []
+            try:
+                return await self._collect_reviews(ctx, headers, path_part, sku=sku)
+            except Exception:
+                # SKU не падает из‑за ошибок отзывов
+                return []
+
+        async def _task_states():
+            if not self.want_states:
+                return None
             try:
                 url_full = self.base_url + link
-                states = await self._collect_state_divs(
-                    ctx=ctx,
-                    url=url_full,
-                    ids=self.state_ids,
-                    use_regex=self.state_regex,
-                    wait_ms=self.state_wait,
-                    collect_nuxt=True,
-                )
+                async with self.page_nav_sem:
+                    states = await self._collect_state_divs(
+                        ctx=ctx,
+                        url=url_full,
+                        ids=self.state_ids,
+                        use_regex=self.state_regex,
+                        wait_ms=self.state_wait,
+                        collect_nuxt=True,
+                    )
                 clear_widget_meta(states)
-                row["states"] = self._normalize_states(states, sku=sku)
-            except Exception:
-                pass
+                return self._normalize_states(states, sku=sku)
+            except Exception as e:
+                print(str(e), flush=True)
+                return None
 
-        if getattr(self, "want_similar_offers", False):
+        async def _task_offers():
+            if not getattr(self, "want_similar_offers", False):
+                return None
             try:
-                offers = await self._collect_similar_offers(ctx, headers, row)
-                if offers is not None:
-                    row["other_offers"] = offers
+                return await self._collect_similar_offers(ctx, headers, row)
             except Exception:
-                pass
+                return None
+
+        if use_parallel:
+            # Параллельный запуск
+            tasks: Dict[str, asyncio.Task] = {}
+            if self.want_reviews:
+                tasks["reviews"] = asyncio.create_task(_task_reviews())
+            if self.want_states:
+                tasks["states"] = asyncio.create_task(_task_states())
+            if getattr(self, "want_similar_offers", False):
+                tasks["offers"] = asyncio.create_task(_task_offers())
+
+            # Дожидаемся всех; если какой-то таск упадёт — его внутренняя обёртка вернёт безопасное значение
+            results = await asyncio.gather(*tasks.values(), return_exceptions=False)
+
+            # Маппим результаты по ключам
+            for key, val in zip(tasks.keys(), results):
+                if key == "reviews":
+                    reviews = val or []
+                elif key == "states" and val is not None:
+                    row["states"] = val
+                elif key == "offers" and val is not None:
+                    row["other_offers"] = val
+            if "reviews" not in locals():
+                reviews = []
+        else:
+            # Последовательный режим (поведение максимально близко к твоему исходному коду)
+            reviews: List[Dict[str, Any]] = await _task_reviews()
+            states = await _task_states()
+            if states is not None:
+                row["states"] = states
+            offers = await _task_offers()
+            if offers is not None:
+                row["other_offers"] = offers
 
         await asyncio.sleep(random.uniform(0.7, 1.4))
         return row, reviews
@@ -293,10 +346,15 @@ class ProductEnricher:
 
         total: Optional[int] = None
         hard_limit = self.reviews_limit or float("inf")
+        seen_paths: set[str] = set()
 
         while next_path and len(out) < hard_limit:
             shelf_api = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + u.quote(next_path, safe="")
             data = await self._request_json(ctx, shelf_api, headers)
+
+            if next_path in seen_paths:
+                break
+            seen_paths.add(next_path)
 
             ws = data.get("widgetStates", {}) or {}
             raw_widget = next((v for k, v in ws.items() if REVIEW_WIDGET_RE.match(k)), None)
@@ -314,13 +372,21 @@ class ProductEnricher:
                     return []
                 hard_limit = min(hard_limit, total)
 
+            added_this_page = 0
+            stop_all = False
+
             for rev in widget.get("reviews", []):
                 item = {**self._filter_review(rev), "sku": sku}
                 if (item.get("content") or {}).get("comment", "") == "":
+                    stop_all = True
                     break
                 out.append(item)
+                added_this_page += 1
                 if len(out) >= hard_limit:
                     break
+
+            if stop_all or added_this_page == 0:
+                break
 
             next_path = data.get("nextPage") or data.get("pageInfo", {}).get("url")
             await asyncio.sleep(random.uniform(0.9, 1.5))
@@ -336,26 +402,32 @@ class ProductEnricher:
         wait_ms: int,
         collect_nuxt: bool = True,
     ) -> Dict[str, Any]:
-        page = await ctx.new_page()
-        await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
-        await asyncio.sleep(1.5)
-        await self._gentle_scroll(page)
-        await asyncio.sleep(1.0)
+        async with await ctx.new_page() as page:
+            print("before load", flush=True)
+            await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+            print("after load", flush=True)
 
-        try:
-            await page.wait_for_selector("div[data-state]", state="attached", timeout=wait_ms)
-            await page.wait_for_function("document.querySelectorAll('div[data-state]').length > 0", timeout=0)
-        except Exception:
-            return {}
+            await asyncio.sleep(1.5)
+            await self._gentle_scroll(page)
+            await asyncio.sleep(1.0)
 
-        payload = {"ids": ids, "useRegex": use_regex}
-        div_states = await page.evaluate(_JS_PULL, payload)
+            try:
+                await page.wait_for_selector("div[data-state]", state="attached", timeout=wait_ms)
+                await page.wait_for_function(
+                    "document.querySelectorAll('div[data-state]').length > 0",
+                    timeout=0
+                )
+            except Exception:
+                return {}
 
-        nuxt_state = {}
-        if collect_nuxt:
-            nuxt_state = await self._read_nuxt_state(page)
+            payload = {"ids": ids, "useRegex": use_regex}
+            div_states = await page.evaluate(_JS_PULL, payload)
 
-        return {"__NUXT__": nuxt_state, **div_states}
+            nuxt_state = {}
+            if collect_nuxt:
+                nuxt_state = await self._read_nuxt_state(page)
+
+            return {"__NUXT__": nuxt_state, **div_states}
 
     async def _gentle_scroll(self, page: Page, steps: int = 6, pause: float = 0.8) -> None:
         h = await page.evaluate("()=>document.body.scrollHeight")
