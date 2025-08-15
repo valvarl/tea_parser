@@ -15,7 +15,7 @@ from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PWTimeout
 
-from .utils import collect_raw_widgets, digits_only
+from .utils import collect_raw_widgets, clean_price
 from .validation import DataParsingError
 from .validation import Validator as V
 
@@ -510,7 +510,7 @@ class ProductEnricher:
             val = seller.get("price") or {}
             for k in keys:
                 val = val.get(k, {}) if isinstance(val, dict) else {}
-            return digits_only(val) if val else None
+            return clean_price(val) if val else None
 
         results = [
             {
@@ -554,10 +554,10 @@ class ProductEnricher:
         price = pop_match("webPrice")
         if price is not None:
             states["price"] = {
-                "cardPrice": digits_only(price.get("cardPrice")),
-                "originalPrice": digits_only(price.get("originalPrice")),
-                "price": digits_only(price.get("price")),
-                "pricePerUnit": digits_only(price.get("pricePerUnit")),
+                "cardPrice": clean_price(price.get("cardPrice")),
+                "originalPrice": clean_price(price.get("originalPrice")),
+                "price": clean_price(price.get("price")),
+                "pricePerUnit": clean_price(price.get("pricePerUnit")),
                 "measurePerUnit": price.get("measurePerUnit"),
             }
 
