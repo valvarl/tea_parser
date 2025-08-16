@@ -129,61 +129,182 @@ class ProductEnricher:
         base_backoff: float = 1.0,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         if not rows:
+            logger.info("enrich: empty input, nothing to do")
             return [], [], []
 
-        async with AsyncCamoufox(headless=self.headless) as browser:
-            ctx = await browser.new_context(locale="ru-RU")
-            await ctx.route("**/*", self._block_heavy_assets)
+        import random, time
+        from collections import deque
 
-            # Prime headers/cookies from the first product page.
-            first_headers: Dict[str, str] = {}
-            page = await ctx.new_page()
-            page.on("response", lambda resp: asyncio.create_task(self._capture_entry_headers(resp, first_headers)))
+        class _CtxCtl:
+            def __init__(self, svc: "ProductEnricher") -> None:
+                self.svc = svc
+                self.browser_cm = None
+                self.browser = None
+                self.ctx = None
+                self.headers: Dict[str, str] = {}
+                self._gen = 0
 
-            await page.goto(self.base_url + rows[0]["link"], timeout=60_000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(1.0, 1.8))
+            async def close(self) -> None:
+                try:
+                    if self.ctx:
+                        await self.ctx.close()
+                except Exception as e:
+                    logger.debug("ctx close error: %r", e)
+                self.ctx = None
+                try:
+                    if self.browser_cm:
+                        await self.browser_cm.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.debug("browser close error: %r", e)
+                self.browser_cm, self.browser = None, None
 
-            successes: List[Dict[str, Any]] = []
-            reviews_all: List[Dict[str, Any]] = []
-            failed: List[Dict[str, Any]] = list(rows)
+            async def build(self, prime_link: Optional[str]) -> None:
+                t0 = time.perf_counter()
+                await self.close()
+                self._gen += 1
+                gen = self._gen
 
-            attempt = 0
-            while failed and attempt < batch_retries:
-                attempt += 1
-                sem = asyncio.Semaphore(self.concurrency)
-                round_success: List[Dict[str, Any]] = []
-                round_reviews: List[Dict[str, Any]] = []
-                round_failed: List[Dict[str, Any]] = []
+                self.browser_cm = AsyncCamoufox(headless=self.svc.headless)
+                self.browser = await self.browser_cm.__aenter__()
+                self.ctx = await self.browser.new_context(locale="ru-RU")
+                await self.ctx.route("**/*", self.svc._block_heavy_assets)
 
-                async def worker(row: Dict[str, Any]) -> None:
-                    async with sem:
-                        try:
-                            r, revs = await self._grab_pdp(ctx, first_headers, dict(row))
-                            round_success.append(r)
-                            round_reviews.extend(revs)
-                        except RetryableError:
-                            round_failed.append(row)
-                        except NonRetryableError:
-                            # do not retry this SKU
-                            pass
-                        except Exception:
-                            # default to retryable
-                            round_failed.append(row)
+                self.headers = {}
+                page = await self.ctx.new_page()
+                page.on(
+                    "response",
+                    lambda resp: asyncio.create_task(self.svc._capture_entry_headers(resp, self.headers)),
+                )
+                if prime_link:
+                    try:
+                        await page.goto(prime_link, timeout=60_000, wait_until="domcontentloaded")
+                        await asyncio.sleep(random.uniform(1.0, 1.8))
+                        logger.info("ctx gen=%s primed url=%s", gen, prime_link)
+                    except Exception as e:
+                        logger.warning("ctx gen=%s priming failed url=%s err=%r", gen, prime_link, e)
+                logger.info("ctx gen=%s ready in %.3fs", gen, time.perf_counter() - t0)
 
-                results = await asyncio.gather(*(worker(r) for r in failed), return_exceptions=True)
-                for res in results:
-                    if isinstance(res, Exception):
-                        logger.debug("worker error: %r", res)
+            @property
+            def gen(self) -> int:
+                return self._gen
 
-                successes.extend(round_success)
-                reviews_all.extend(round_reviews)
-                failed = round_failed
+        ctxctl = _CtxCtl(self)
+        await ctxctl.build(self.base_url + rows[0]["link"])
 
-                if failed and attempt < batch_retries:
-                    delay = base_backoff * (2 ** (attempt - 1)) * (1.0 + random.uniform(0, 0.25))
+        # очередь pending: элементы вида {"row": <row>, "attempt": <int>}
+        pending = deque({"row": r, "attempt": 0} for r in rows)
+        successes: List[Dict[str, Any]] = []
+        reviews_all: List[Dict[str, Any]] = []
+        final_failed: List[Dict[str, Any]] = []
+
+        total = len(rows)
+        logger.info("enrich start: total=%s concurrency=%s max_attempts=%s", total, self.concurrency, batch_retries)
+
+        round_no = 0
+        while pending:
+            round_no += 1
+            logger.info("round %s: pending=%s ctx_gen=%s", round_no, len(pending), ctxctl.gen)
+
+            # обрабатываем волнами по concurrency
+            wave_no = 0
+            while pending:
+                wave_no += 1
+                wave: List[Dict[str, Any]] = []
+                for _ in range(min(self.concurrency, len(pending))):
+                    wave.append(pending.popleft())
+
+                # параллельный запуск волны
+                t0 = time.perf_counter()
+                tasks = []
+                for idx, item in enumerate(wave, start=1):
+                    row = item["row"]
+                    sku = row.get("sku")
+                    tasks.append(asyncio.create_task(self._grab_pdp(ctxctl.ctx, ctxctl.headers, dict(row))))
+                    logger.debug("round %s wave %s worker=%s sku=%s start", round_no, wave_no, idx, sku)
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                wave_retryable = 0
+                wave_ok = 0
+                wave_nonretryable = 0
+
+                # разбор результатов: успехи, ретраибл (+инкремент попытки), нон-ретраибл (drop)
+                for idx, (item, res) in enumerate(zip(wave, results), start=1):
+                    row = item["row"]
+                    sku = row.get("sku")
+                    attempt = item["attempt"]
+
+                    if isinstance(res, tuple):
+                        r, revs = res
+                        successes.append(r)
+                        if revs:
+                            reviews_all.extend(revs)
+                        wave_ok += 1
+                        logger.debug("round %s wave %s worker=%s sku=%s ok", round_no, wave_no, idx, sku)
+                        continue
+
+                    if isinstance(res, RetryableError) or isinstance(res, Exception):
+                        wave_retryable += 1
+                        new_attempt = attempt + 1
+                        if new_attempt >= batch_retries:
+                            final_failed.append(row)
+                            logger.warning(
+                                "round %s wave %s worker=%s sku=%s retryable exhausted (attempt=%s/%s)",
+                                round_no, wave_no, idx, sku, new_attempt, batch_retries
+                            )
+                        else:
+                            pending.appendleft({"row": row, "attempt": new_attempt})
+                            logger.warning(
+                                "round %s wave %s worker=%s sku=%s retryable attempt=%s/%s -> requeue",
+                                round_no, wave_no, idx, sku, new_attempt, batch_retries
+                            )
+                        continue
+
+                    if isinstance(res, NonRetryableError):
+                        wave_nonretryable += 1
+                        logger.info("round %s wave %s worker=%s sku=%s non-retryable drop", round_no, wave_no, idx, sku)
+                        continue
+
+                dt = time.perf_counter() - t0
+                max_attempt_in_wave = max(item["attempt"] for item in wave) if wave else 0
+                logger.info(
+                    "round %s wave %s done in %.3fs: ok=%s retryable=%s nonretryable=%s left=%s max_attempt=%s/%s",
+                    round_no, wave_no, dt, wave_ok, wave_retryable, wave_nonretryable, len(pending),
+                    max_attempt_in_wave, batch_retries
+                )
+
+                # если вся волна оказалась retryable — немедленно rebuild (новый браузер + контекст)
+                if (wave_ok + wave_nonretryable) == 0 and wave_retryable == len(wave):
+                    prime = self.base_url + (pending[0]["row"]["link"] if pending else wave[0]["row"]["link"])
+                    logger.warning(
+                        "round %s wave %s: all %s workers retryable -> rebuild ctx (gen=%s), prime=%s",
+                        round_no, wave_no, wave_retryable, ctxctl.gen, prime
+                    )
+                    await ctxctl.build(prime)
+                    # лёгкий джиттер-паузу чтобы дать странице «остыть»
+                    delay = base_backoff * (1.0 + random.uniform(0, 0.25))
+                    logger.info("rebuild backoff sleep %.2fs", delay)
                     await asyncio.sleep(delay)
 
-            return successes, reviews_all, failed
+                # если очередь опустела — выходим из внутреннего цикла
+                if not pending:
+                    break
+
+            # если после раунда ничего не осталось — завершаем
+            if not pending:
+                break
+
+        logger.info(
+            "enrich finished: ok=%s reviews=%s failed=%s",
+            len(successes), len(reviews_all), len(final_failed)
+        )
+
+        try:
+            await ctxctl.close()
+        except Exception as e:
+            logger.debug("ctx final close error: %r", e)
+
+        return successes, reviews_all, final_failed
 
     # ----- network / page ops -----
 
@@ -244,7 +365,6 @@ class ProductEnricher:
             f"{path_part}?layout_container=pdpPage2column&layout_page_index=2", safe=""
         )
 
-        # PDP JSON (обязателен для успеха SKU)
         try:
             pdp_json = await self._request_json(ctx, pdp_api, headers)
         except NonRetryableError:
@@ -252,20 +372,16 @@ class ProductEnricher:
         except Exception as e:
             raise RetryableError(str(e)) from e
 
-        # widgets — синхронная обработка JSON (быстро, нет смысла выносить в отдельный таск)
         row.update(self._collect_widgets(pdp_json, sku=sku))
 
-        # Решаем, включать ли параллельный режим
         use_parallel = self.parallel_mode if parallel is None else parallel
 
-        # Готовим корутины для остальных подсекций
         async def _task_reviews():
             if not self.want_reviews:
                 return []
             try:
                 return await self._collect_reviews(ctx, headers, path_part, sku=sku)
             except Exception:
-                # SKU не падает из‑за ошибок отзывов
                 return []
 
         async def _task_states():
@@ -282,9 +398,10 @@ class ProductEnricher:
                     collect_nuxt=True,
                 )
                 return self._normalize_states(states, sku=sku)
+            except PWTimeout as e:
+                raise RetryableError(f"states timeout for sku={sku}: {e}", url=link) from e
             except Exception as e:
-                print(str(e), flush=True)
-                return None
+                raise NonRetryableError(f"states error for sku={sku}: {e}", url=link) from e
 
         async def _task_offers():
             if not getattr(self, "want_similar_offers", False):
@@ -295,7 +412,6 @@ class ProductEnricher:
                 return None
 
         if use_parallel:
-            # Параллельный запуск
             tasks: Dict[str, asyncio.Task] = {}
             if self.want_reviews:
                 tasks["reviews"] = asyncio.create_task(_task_reviews())
@@ -304,10 +420,9 @@ class ProductEnricher:
             if getattr(self, "want_similar_offers", False):
                 tasks["offers"] = asyncio.create_task(_task_offers())
 
-            # Дожидаемся всех; если какой-то таск упадёт — его внутренняя обёртка вернёт безопасное значение
+            # exceptions bubble up; RetryableError/NonRetryableError will be raised
             results = await asyncio.gather(*tasks.values(), return_exceptions=False)
 
-            # Маппим результаты по ключам
             for key, val in zip(tasks.keys(), results):
                 if key == "reviews":
                     reviews = val or []
@@ -318,9 +433,8 @@ class ProductEnricher:
             if "reviews" not in locals():
                 reviews = []
         else:
-            # Последовательный режим (поведение максимально близко к твоему исходному коду)
             reviews: List[Dict[str, Any]] = await _task_reviews()
-            states = await _task_states()
+            states = await _task_states()  # may raise RetryableError / NonRetryableError
             if states is not None:
                 row["states"] = states
             offers = await _task_offers()
@@ -409,7 +523,7 @@ class ProductEnricher:
             self.page_nav_sem.release()
 
             print("before load", flush=True)
-            await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+            await page.goto(url, timeout=15_000, wait_until="domcontentloaded")
             print("after load", flush=True)
 
             await asyncio.sleep(1.5)
@@ -626,6 +740,7 @@ class ProductEnricher:
         charcs_json = [self._shape_specs_char(prop) for ch in charcs_json for prop in V.get_key(ch, "short")]
 
         # Description blocks
+        # TODO: empty description
         descr_blocks = V.require_non_empty_list(collect_raw_widgets(json_page, "webDescription-"))
         if len(descr_blocks) == 2:
             if any(k in descr_blocks[0] for k in ("richAnnotation", "richAnnotationJson")):
