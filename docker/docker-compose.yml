@@ -38,7 +38,7 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
       MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE}
     volumes:
-      - ../mongo:/data/db
+      - mongo_data:/data/db
 
   # ────────────────────────── Back-end ──────────────────────────
   backend:
@@ -112,3 +112,4 @@ services:
 
 volumes:
   kafka_data: {}
+  mongo_data: {}
