@@ -1,18 +1,19 @@
-from pydantic import BaseModel, Field
-from typing import Optional
+import time
 import uuid
-from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
 
 
 class BaseTask(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     task_type: str = "indexing"  # indexing, enriching, scraping
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"  # pending, running, finished, failed
     error_message: Optional[str] = None
-    started_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    finished_at: Optional[int] = None
+    created_at: int = Field(default_factory=lambda: int(time.time()))
 
 
 class IndexingTask(BaseTask):
@@ -35,7 +36,7 @@ class ScrapingTask(IndexingTask, EnrichingTask):
 class ScrapingStats(BaseModel):
     total_tasks: int = 0
     running_tasks: int = 0
-    completed_tasks: int = 0
+    finished_tasks: int = 0
     failed_tasks: int = 0
     total_products: int = 0
     captcha_solves: int = 0

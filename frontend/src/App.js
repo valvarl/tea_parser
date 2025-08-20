@@ -50,7 +50,7 @@ function formatDate(input) {
 
 function StatusBadge({ status }) {
   const cls =
-    status === "completed"
+    status === "finished"
       ? "bg-green-100 text-green-800"
       : status === "running"
         ? "bg-blue-100 text-blue-800"
@@ -421,8 +421,8 @@ export default function App() {
                 subtitle="In progress"
               />
               <StatCard
-                title="Completed tasks"
-                value={stats.completed_tasks || 0}
+                title="Finished tasks"
+                value={stats.finished_tasks || 0}
                 subtitle="Succeeded"
               />
               <StatCard
@@ -564,7 +564,7 @@ export default function App() {
                   <div className="text-2xl font-bold text-purple-900">
                     {stats.total_tasks > 0
                       ? (
-                          (Number(stats.completed_tasks || 0) /
+                          (Number(stats.finished_tasks || 0) /
                             Number(stats.total_tasks || 1)) *
                           100
                         ).toFixed(1)
@@ -672,7 +672,7 @@ export default function App() {
                         Created
                       </th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Completed
+                        Finished
                       </th>
                     </tr>
                   </thead>
@@ -706,7 +706,7 @@ export default function App() {
                           {formatDate(t.created_at)}
                         </td>
                         <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {formatDate(t.completed_at)}
+                          {formatDate(t.finished_at)}
                         </td>
                       </tr>
                     ))}

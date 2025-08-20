@@ -6,7 +6,6 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -444,8 +443,8 @@ async def scrape_tea_products_task(
     finally:
         await asyncio.gather(c_idx.stop(), c_enr.stop(), prod_enr.stop())
 
-    final_status = "completed" if idx_done and enr_done else "failed"
-    await patch_task(task_id, {"status": final_status, "completed_at": _now_ts()})
+    final_status = "finished" if idx_done and enr_done else "failed"
+    await patch_task(task_id, {"status": final_status, "finished_at": _now_ts()})
     logger.info("scraping task %s finished %s", task_id, final_status)
 
     # kick off collections follow-up as a separate task
