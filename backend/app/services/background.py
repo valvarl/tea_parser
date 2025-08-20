@@ -29,9 +29,6 @@ INDEXER_MAX_DEFERS = max(0, int(os.getenv("INDEXER_MAX_DEFERS", "3")))
 
 # ========== time/json/hash utils ==========
 
-def _now_dt() -> datetime:
-    return datetime.utcnow()
-
 def _now_ts() -> int:
     return int(time.time())
 
@@ -150,14 +147,14 @@ def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         "aspect_name": item.get("aspect_name"),
         "collection_hash": build_collection_hash(item),
         "skus": [{"sku": s, "status": "queued"} for s in item["skus"]],
-        "created_at": _now_dt(),
-        "updated_at": _now_dt(),
+        "created_at": _now_ts(),
+        "updated_at": _now_ts(),
     }
 
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[int]]:
     created_count = 0
     all_skus: set[int] = set()
-    now = _now_dt()
+    now = _now_ts()
 
     for bucket in ("collections", "aspects", "other_offers"):
         for item in grouped.get(bucket, []):
@@ -493,8 +490,8 @@ async def create_and_run_collections_task(parent_task_id: str) -> str:
             "parent_task_id": parent_task_id,
             "task_type": "collections",
             "status": "started",
-            "created_at": _now_dt(),
-            "updated_at": _now_dt(),
+            "created_at": _now_ts(),
+            "updated_at": _now_ts(),
             "trigger": "auto",
         }
     )
@@ -510,7 +507,7 @@ async def create_and_run_collections_task(parent_task_id: str) -> str:
             {
                 "$set": {
                     "meta": {"created_collections": created_cnt, "skus_to_process": len(all_skus)},
-                    "updated_at": _now_dt(),
+                    "updated_at": _now_ts(),
                 }
             },
         )
@@ -520,17 +517,17 @@ async def create_and_run_collections_task(parent_task_id: str) -> str:
 
         await db.collections.update_many(
             {"task_id": new_task_id, "status": "queued"},
-            {"$set": {"status": "processed", "updated_at": _now_dt()}},
+            {"$set": {"status": "processed", "updated_at": _now_ts()}},
         )
         await db.scraping_tasks.update_one(
             {"id": new_task_id},
-            {"$set": {"status": "finished", "finished_at": _now_dt(), "updated_at": _now_dt()}},
+            {"$set": {"status": "finished", "finished_at": _now_ts(), "updated_at": _now_ts()}},
         )
     except Exception as e:
         logger.exception("collections follow-up failed: %s", e)
         await db.scraping_tasks.update_one(
             {"id": new_task_id},
-            {"$set": {"status": "failed", "error": str(e), "updated_at": _now_dt()}},
+            {"$set": {"status": "failed", "error": str(e), "updated_at": _now_ts()}},
         )
 
     return new_task_id
