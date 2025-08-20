@@ -16,7 +16,7 @@ from app.services.indexer import ProductIndexer, CircuitOpen
 BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
 TOPIC_INDEXER_STATUS = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
-MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 3))
+MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 1))
 CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
 
 configure_logging()
@@ -85,7 +85,7 @@ async def _dispatch(payload: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         await _handle_add_collection_members(
             task_id=payload["task_id"],
             batch_id=payload.get("batch_id"),
-            skus=[int(s) for s in payload.get("skus", [])],
+            skus=payload.get("skus", []),
             prod=prod,
         )
         return
@@ -127,7 +127,7 @@ async def _handle_search(
                 batch_skus: List[int] = []
 
                 for p in batch:
-                    sku = int(p.get("sku") or 0)
+                    sku = str(p.get("sku") or "")
                     if not sku:
                         continue
                     try:
@@ -135,10 +135,10 @@ async def _handle_search(
                             {"sku": sku},
                             {
                                 "$set": {
-                                    "name": p.get("name"),
-                                    "rating": p.get("rating"),
-                                    "reviews": p.get("reviews"),
-                                    "cover_image": p.get("cover_image"),
+                                    # "name": p.get("name"),
+                                    # "rating": p.get("rating"),
+                                    # "reviews": p.get("reviews"),
+                                    # "cover_image": p.get("cover_image"),
                                     "last_seen_at": now_ts,
                                     "is_active": True,
                                     "task_id": task_id,
@@ -147,6 +147,7 @@ async def _handle_search(
                                     "first_seen_at": now_ts,
                                     "candidate_id": None,
                                     "sku": sku,
+                                    "status": "indexed_auto",
                                 },
                             },
                             upsert=True,
@@ -218,7 +219,7 @@ async def _handle_search(
 async def _handle_add_collection_members(
     task_id: str,
     batch_id: Optional[int],
-    skus: List[int],
+    skus: List[str],
     prod: AIOKafkaProducer,
 ) -> None:
     try:
@@ -244,17 +245,22 @@ async def _handle_add_collection_members(
         coll_map = await _map_sku_to_collection_hashes(task_id=task_id, skus=skus)
 
         for sku in skus:
-            hashes = sorted(coll_map.get(int(sku), set()))
+            hashes = sorted(coll_map.get(sku, set()))
             try:
                 res = await db.index.update_one(
-                    {"sku": int(sku)},
+                    {"sku": sku},
                     {
                         "$set": {
                             "last_seen_at": now_ts,
                             "is_active": True,
                             "task_id": task_id,
                         },
-                        "$setOnInsert": {"first_seen_at": now_ts, "candidate_id": None, "sku": int(sku)},
+                        "$setOnInsert": {
+                            "first_seen_at": now_ts, 
+                            "candidate_id": None, 
+                            "sku": sku,
+                            "status": "pending_review"
+                        },
                         "$addToSet": {"collections": {"$each": hashes}},
                     },
                     upsert=True,
@@ -286,17 +292,17 @@ async def _handle_add_collection_members(
         logger.exception("collections batch failed task=%s batch=%s: %s", task_id, batch_id, e)
 
 
-async def _map_sku_to_collection_hashes(task_id: str, skus: List[int]) -> Dict[int, Set[str]]:
-    mapping: Dict[int, Set[str]] = {int(s): set() for s in skus}
+async def _map_sku_to_collection_hashes(task_id: str, skus: List[str]) -> Dict[str, Set[str]]:
+    mapping: Dict[int, Set[str]] = {s: set() for s in skus}
     cur = db.collections.find(
-        {"task_id": task_id, "skus.sku": {"$in": [int(s) for s in skus]}},
+        {"task_id": task_id, "skus.sku": {"$in": skus}},
         {"collection_hash": 1, "skus": 1},
     )
     async for col in cur:
         ch = col.get("collection_hash")
         for sdoc in col.get("skus", []):
-            s = int(sdoc.get("sku") or 0)
-            if s in mapping:
+            s = sdoc.get("sku") or ""
+            if s and s in mapping:
                 mapping[s].add(ch)
     return mapping
 

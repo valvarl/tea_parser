@@ -99,14 +99,16 @@ async def aggregate_collections_for_task(task_id: str) -> Dict[str, List[Dict[st
             continue
 
         for group in prepared.get("collections", []):
-            skus = sorted({int(s) for s in (group if isinstance(group, list) else [])})
+            # TODO: sorted key for str skus
+            skus = sorted(set(group if isinstance(group, list) else []), key=int)
             if skus:
                 out["collections"].append(
-                    {"type": "collection", "skus": skus, "come_from": int(parent)}
+                    {"type": "collection", "skus": skus, "come_from": parent}
                 )
 
         for asp in prepared.get("aspects", []):
-            skus = sorted({int(s) for s in (asp.get("variants", []) or [])})
+            # TODO: sorted key for str skus
+            skus = sorted(set(asp.get("variants", []) or []), key=int)
             if skus:
                 out["aspects"].append(
                     {
@@ -114,15 +116,16 @@ async def aggregate_collections_for_task(task_id: str) -> Dict[str, List[Dict[st
                         "aspect_key": asp.get("aspectKey"),
                         "aspect_name": asp.get("aspectName"),
                         "skus": skus,
-                        "come_from": int(parent),
+                        "come_from": parent,
                     }
                 )
 
         for off in prepared.get("other_offers", []):
-            skus = sorted({int(s) for s in (off if isinstance(off, list) else [off])})
+            # TODO: sorted key for str skus
+            skus = sorted(set(off if isinstance(off, list) else [off]), key=int)
             if skus:
                 out["other_offers"].append(
-                    {"type": "other_offer", "skus": skus, "come_from": int(parent)}
+                    {"type": "other_offer", "skus": skus, "come_from": parent}
                 )
 
     return out
@@ -151,9 +154,9 @@ def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         "updated_at": _now_ts(),
     }
 
-async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[int]]:
+async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
     created_count = 0
-    all_skus: set[int] = set()
+    all_skus: set[str] = set()
     now = _now_ts()
 
     for bucket in ("collections", "aspects", "other_offers"):
@@ -204,7 +207,7 @@ def new_consumer(topic: str, group: str, *, offset: str = "latest") -> AIOKafkaC
 
 # ========== indexer/enricher roundtrips for collections follow-up ==========
 
-async def send_to_indexer_and_wait(task_id: str, skus: List[int], *, batch_size: int = 200, timeout_sec: int = 600) -> None:
+async def send_to_indexer_and_wait(task_id: str, skus: List[str], *, batch_size: int = 200, timeout_sec: int = 600) -> None:
     if not skus:
         return
 
@@ -245,7 +248,7 @@ async def send_to_indexer_and_wait(task_id: str, skus: List[int], *, batch_size:
         await cons.stop()
         await prod.stop()
 
-async def send_to_enricher_and_wait(task_id: str, skus: List[int], *, batch_size: int = 100, timeout_sec: int = 900) -> None:
+async def send_to_enricher_and_wait(task_id: str, skus: List[str], *, batch_size: int = 100, timeout_sec: int = 900) -> None:
     if not skus:
         return
 

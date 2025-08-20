@@ -23,7 +23,7 @@ CONCURRENCY_DEF = int(os.getenv("ENRICH_CONCURRENCY", 6))
 REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "true").lower() == "true"
 REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
 CURRENCY = os.getenv("CURRENCY", "RUB")
-ENRICH_RETRY_MAX = int(os.getenv("ENRICH_RETRY_MAX", "3"))
+ENRICH_RETRY_MAX = int(os.getenv("ENRICH_RETRY_MAX", 3))
 
 configure_logging()
 logger = logging.getLogger("enricher-worker")
@@ -160,7 +160,7 @@ async def _bulk_upsert_reviews(reviews: List[Dict[str, Any]]) -> int:
 async def _acquire_or_create_batch(
     task_id: str,
     batch_id: Optional[int],
-    skus: Optional[List[int]],
+    skus: Optional[List[str]],
     trigger: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[List[int]]]:
     batch_doc = None
@@ -172,7 +172,7 @@ async def _acquire_or_create_batch(
             return_document=ReturnDocument.AFTER,
         )
         if batch_doc and not skus:
-            skus = [int(x) for x in batch_doc.get("skus", [])]
+            skus = batch_doc.get("skus", [])
 
     if skus and batch_doc is None:
         bh = _batch_hash(task_id, [str(s) for s in skus])
@@ -206,8 +206,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     batch_id: Optional[int] = cmd.get("batch_id")
     trigger: str = cmd.get("trigger") or cmd.get("source") or "ad-hoc"
 
-    skus_in = cmd.get("skus")
-    skus: Optional[List[int]] = [int(s) for s in skus_in] if skus_in else None
+    skus: Optional[List[str]] = cmd.get("skus")
 
     enricher.concurrency = int(cmd.get("concurrency", CONCURRENCY_DEF))
     enricher.want_reviews = bool(cmd.get("reviews", REVIEWS_DEF))
@@ -226,7 +225,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     # Legacy mode: enrich all items without candidate_id if no skus provided
     if not skus:
         index_rows = await db.index.find({"candidate_id": None}).to_list(None)
-        skus = [int(d["sku"]) for d in index_rows]
+        skus = [d["sku"] for d in index_rows]
 
     if not skus:
         await prod.send_and_wait(
