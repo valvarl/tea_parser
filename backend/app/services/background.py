@@ -137,7 +137,7 @@ async def aggregate_collections_for_task(task_id: str) -> Dict[str, List[Dict[st
     async for c in cursor:
         parent_skus |= {str(s) for s in c.get("skus", [])}
 
-    for parent in parent_skus:
+    for parent in sorted(parent_skus, key=_sku_sort_key):
         prepared = await prepare_collection(parent)
         if not prepared:
             continue
@@ -193,31 +193,47 @@ def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         "updated_at": _now_ts(),
     }
 
+def build_processing_order(grouped: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    """
+    Возвращает линейную очередь SKU так, чтобы:
+      1) коллекции (группы) шли последовательно: все SKU из 1-й группы aspects,
+         затем все SKU из 2-й группы aspects, ... затем группы из collections,
+         затем группы из other_offers;
+      2) SKU не повторялись в итоговой последовательности (dedup по первому вхождению);
+      3) порядок внутри группы берётся как в grouped['...'][i]['skus'].
+    """
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    for bucket in ("aspects", "collections", "other_offers"):
+        for item in grouped.get(bucket, []) or []:
+            for s in item.get("skus", []):
+                if s not in seen:
+                    seen.add(s)
+                    ordered.append(s)
+
+    return ordered
+
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
     created_count = 0
-    all_skus: set[str] = set()
     now = _now_ts()
 
     for bucket in ("collections", "aspects", "other_offers"):
         for item in grouped.get(bucket, []):
             doc = to_collection_doc(item, task_id)
-            all_skus.update(x["sku"] for x in doc["skus"])
 
-            # avoid conflict: do not include 'updated_at' in $setOnInsert
             on_insert = {k: v for k, v in doc.items() if k != "updated_at"}
-
             res = await db.collections.update_one(
                 {"collection_hash": doc["collection_hash"]},
-                {
-                    "$setOnInsert": on_insert,
-                    "$set": {"updated_at": now},
-                },
+                {"$setOnInsert": on_insert, "$set": {"updated_at": now}},
                 upsert=True,
             )
             if res.upserted_id is not None:
                 created_count += 1
 
-    return created_count, sorted(all_skus, key=_sku_sort_key)
+    # ключевая строка: формируем порядок обработки SKU
+    processing_order = build_processing_order(grouped)
+    return created_count, processing_order
 
 # ========== mongo helpers (tasks) ==========
 
