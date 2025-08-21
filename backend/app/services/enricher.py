@@ -178,7 +178,7 @@ class ProductEnricher:
                 if prime_link:
                     try:
                         await page.goto(prime_link, timeout=60_000, wait_until="domcontentloaded")
-                        await asyncio.sleep(random.uniform(1.0, 1.8))
+                        await asyncio.sleep(random.uniform(2.0, 3.5))
                         logger.info("ctx gen=%s primed url=%s", gen, prime_link)
                     except Exception as e:
                         logger.warning("ctx gen=%s priming failed url=%s err=%r", gen, prime_link, e)
@@ -280,6 +280,7 @@ class ProductEnricher:
                         "round %s wave %s: all %s workers retryable -> rebuild ctx (gen=%s), prime=%s",
                         round_no, wave_no, wave_retryable, ctxctl.gen, prime
                     )
+                    await asyncio.sleep(random.uniform(5.0, 15.0))
                     await ctxctl.build(prime)
                     # лёгкий джиттер-паузу чтобы дать странице «остыть»
                     delay = base_backoff * (1.0 + random.uniform(0, 0.25))
@@ -519,7 +520,7 @@ class ProductEnricher:
         async with await ctx.new_page() as page:
             
             # https://github.com/daijro/camoufox/issues/314
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(5.0)
             self.page_nav_sem.release()
 
             print("before load", flush=True)
@@ -655,7 +656,7 @@ class ProductEnricher:
             "version": rev.get("version"),
         }
 
-    def _normalize_states(self, states: Dict[str, Any], *, sku) -> Dict[str, Any]:
+    def _normalize_states(self, states: Dict[str, Any], *, sku: str) -> Dict[str, Any]:
         def pop_match(pat: str) -> Optional[Any]:
             key = _regex_search_key(states, pat)
             return states.pop(key) if key else None

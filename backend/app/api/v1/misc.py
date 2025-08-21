@@ -32,7 +32,7 @@ async def get_search_queries(limit: int = 50):
 async def get_scraping_stats():
     total = await db.scraping_tasks.count_documents({})
     running = await db.scraping_tasks.count_documents({"status": "running"})
-    completed = await db.scraping_tasks.count_documents({"status": "completed"})
+    finished = await db.scraping_tasks.count_documents({"status": "finished"})
     failed = await db.scraping_tasks.count_documents({"status": "failed"})
 
     products_total = await db.candidates.count_documents({})
@@ -41,7 +41,7 @@ async def get_scraping_stats():
     return ScrapingStats(
         total_tasks=total,
         running_tasks=running,
-        completed_tasks=completed,
+        finished_tasks=finished,
         failed_tasks=failed,
         total_products=products_total,
         captcha_solves=captcha_solver.solve_count,
