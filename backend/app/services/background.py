@@ -80,38 +80,70 @@ async def prepare_collection(parent_sku: str) -> Optional[Dict[str, Any]]:
     doc = await db.candidates.find_one(
         {"sku": parent_sku},
         {
-            "collections": {"sku": 1},
-            "aspects": {"aspectKey": 1, "aspectName": 1, "variants": {"sku": 1}},
-            "other_offers": {"sku": 1},
+            "_id": 0,
+            "collections.sku": 1,
+            "aspects.aspectKey": 1,
+            "aspects.aspectName": 1,
+            "aspects.variants.sku": 1,
+            "other_offers.sku": 1,
         },
     )
     if doc is None:
         return None
     return squash_sku(doc)
 
+def _as_str_sku(x: Any) -> str:
+    # поддерживает '123', 123, {'sku': '123', ...}
+    if isinstance(x, dict) and "sku" in x:
+        return str(x["sku"])
+    return str(x)
+
+def _sku_sort_key(s: str) -> tuple[int, int | str]:
+    ss = s.strip()
+    return (0, int(ss)) if ss.isdigit() else (1, ss)
+
+def _normalize_skus(seq: Iterable[Any]) -> list[str]:
+    # вытянули sku, убрали пустые, дедуп, отсортировали
+    uniq = { _as_str_sku(v).strip() for v in (seq or []) }
+    uniq.discard("")
+    return sorted(uniq, key=_sku_sort_key)
+
+def _normalize_collection_groups(value: Any) -> list[list[str]]:
+    """
+    Превращает вход в список групп, где каждая группа — список sku.
+    Поддерживает:
+      - список словарей/строк/чисел -> одна группа
+      - список списков (внутри — dict/str/int) -> несколько групп
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        # если внутри есть подсписки — трактуем как группы
+        if any(isinstance(x, (list, tuple, set)) for x in value):
+            groups: list[list[str]] = []
+            for grp in value:
+                groups.append(_normalize_skus(grp))
+            return [g for g in groups if g]
+        # иначе это "плоский" список элементов -> одна группа
+        return [_normalize_skus(value)]
+    # на всякий случай: одиночное значение -> одна группа
+    return [_normalize_skus([value])]
+
 async def aggregate_collections_for_task(task_id: str) -> Dict[str, List[Dict[str, Any]]]:
     out = {"collections": [], "aspects": [], "other_offers": []}
+
     cursor = db.enrich_batches.find({"task_id": task_id}, {"skus": 1})
     parent_skus: set[str] = set()
     async for c in cursor:
-        parent_skus |= set(c.get("skus", []))
+        parent_skus |= {str(s) for s in c.get("skus", [])}
 
     for parent in parent_skus:
         prepared = await prepare_collection(parent)
         if not prepared:
             continue
-
-        for group in prepared.get("collections", []):
-            # TODO: sorted key for str skus
-            skus = sorted(set(group if isinstance(group, list) else []), key=int)
-            if skus:
-                out["collections"].append(
-                    {"type": "collection", "skus": skus, "come_from": parent}
-                )
-
-        for asp in prepared.get("aspects", []):
-            # TODO: sorted key for str skus
-            skus = sorted(set(asp.get("variants", []) or []), key=int)
+        
+        for asp in prepared.get("aspects", []) or []:
+            skus = _normalize_skus((asp or {}).get("variants", []))
             if skus:
                 out["aspects"].append(
                     {
@@ -123,13 +155,17 @@ async def aggregate_collections_for_task(task_id: str) -> Dict[str, List[Dict[st
                     }
                 )
 
-        for off in prepared.get("other_offers", []):
-            # TODO: sorted key for str skus
-            skus = sorted(set(off if isinstance(off, list) else [off]), key=int)
+        for skus in _normalize_collection_groups(prepared.get("collections")):
             if skus:
-                out["other_offers"].append(
-                    {"type": "other_offer", "skus": skus, "come_from": parent}
+                out["collections"].append(
+                    {"type": "collection", "skus": skus, "come_from": parent}
                 )
+
+        other_skus = _normalize_skus(prepared.get("other_offers", []))
+        if other_skus:
+            out["other_offers"].append(
+                {"type": "other_offer", "skus": other_skus, "come_from": parent}
+            )
 
     return out
 
@@ -181,7 +217,7 @@ async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str,
             if res.upserted_id is not None:
                 created_count += 1
 
-    return created_count, sorted(all_skus)
+    return created_count, sorted(all_skus, key=_sku_sort_key)
 
 # ========== mongo helpers (tasks) ==========
 
