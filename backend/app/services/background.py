@@ -6,11 +6,12 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from app.db.mongo import db
-from app.models.task import ScrapingTask
+from app.models.task import BaseTask, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,9 @@ INDEXER_MAX_DEFERS = max(0, int(os.getenv("INDEXER_MAX_DEFERS", "3")))
 
 
 # ========== time/json/hash utils ==========
+
+def _now_dt() -> datetime:
+    return datetime.utcnow()
 
 def _now_ts() -> int:
     return int(time.time())
@@ -182,9 +186,32 @@ async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str,
 # ========== mongo helpers (tasks) ==========
 
 async def patch_task(task_id: str, patch: Dict[str, Any]) -> None:
-    patch["updated_at"] = _now_ts()
-    await db.scraping_tasks.update_one({"id": task_id}, {"$set": patch})
+    await db.scraping_tasks.update_one(
+        {"id": task_id},
+        {
+            "$set": patch,
+            "$currentDate": {"updated_at": True},
+        },
+    )
 
+async def push_status(task_id: str, to_status: TaskStatus, *, reason: Optional[str] = None) -> None:
+    doc = await db.scraping_tasks.find_one({"id": task_id}, {"status": 1})
+    from_status = (doc or {}).get("status")
+    await db.scraping_tasks.update_one(
+        {"id": task_id},
+        {
+            "$set": {"status": to_status},
+            "$push": {
+                "status_history": {
+                    "from_status": from_status,
+                    "to_status": to_status,
+                    "at": _now_dt(),
+                    "reason": reason,
+                }
+            },
+            "$currentDate": {"updated_at": True},
+        },
+    )
 
 # ========== kafka helpers ==========
 
@@ -310,14 +337,15 @@ async def scrape_tea_products_task(
     category_id: str = "9373",
     max_pages: int = 3,
 ) -> None:
+    # pending -> queued
+    await push_status(task_id, TaskStatus.queued)
     await patch_task(
         task_id,
         {
-            "status": "queued",
-            "search_term": search_term,
-            "category_id": category_id,
-            "max_pages": max_pages,
-            "retry_attempt": 0,
+            "params.search_term": search_term,
+            "params.category_id": category_id,
+            "params.max_pages": max_pages,
+            "attempt.current": 0,
         },
     )
 
@@ -352,7 +380,21 @@ async def scrape_tea_products_task(
             if st.get("task_id") != task_id:
                 continue
 
-            await patch_task(task_id, {"indexer": st})
+            # сохраняем «как есть» во временное поле workers.indexer.raw + быстрые счетчики в stats
+            norm_stats = {}
+            if st.get("status") == "task_done":
+                norm_stats = {
+                    "scraped_products": int(st.get("scraped_products", 0)),
+                    "failed_products": int(st.get("failed_products", 0)),
+                    "inserted_products": int(st.get("inserted_products", 0)),
+                    "updated_products": int(st.get("updated_products", 0)),
+                    "total_products": int(st.get("total_products", 0)),
+                }
+
+            await patch_task(task_id, {
+                "workers.indexer.status": st.get("status"),
+                "workers.indexer.stats": norm_stats,
+            })
 
             if st.get("status") == "ok":
                 skus = list(st.get("batch_data", {}).get("skus", []) or [])
@@ -368,6 +410,17 @@ async def scrape_tea_products_task(
                             i,
                             len(chunk),
                         )
+                
+                # аккумулируем агрегаты
+                inc_stats = {
+                    "stats.products_indexed": int(st.get("batch_data", {}).get("inserted", 0)) + int(st.get("batch_data", {}).get("updated", 0)),
+                    "stats.new_products": int(st.get("batch_data", {}).get("inserted", 0)),
+                    "stats.pages_indexed": int(st.get("batch_data", {}).get("pages", 0)),
+                }
+                await db.scraping_tasks.update_one(
+                    {"id": task_id},
+                    {"$inc": inc_stats, "$currentDate": {"updated_at": True}},
+                )
 
             if st.get("status") == "deferred":
                 doc = await db.scraping_tasks.find_one({"id": task_id}, {"retry_attempt": 1})
@@ -376,12 +429,13 @@ async def scrape_tea_products_task(
                 await patch_task(
                     task_id,
                     {
-                        "status": "deferred",
-                        "next_retry_at": next_retry_at,
-                        "retry_attempt": attempt,
+                        "status": TaskStatus.deferred,
+                        "attempt.current": attempt,
                         "deferred_reason": st.get("reason"),
+                        "next_retry_at": next_retry_at,
                     },
                 )
+                await push_status(task_id, TaskStatus.deferred, reason=st.get("reason"))
                 logger.warning(
                     "indexer deferred task=%s attempt=%s next_retry_at=%s reason=%s",
                     task_id,
@@ -412,6 +466,7 @@ async def scrape_tea_products_task(
                 break
 
             if st.get("status") == "failed":
+                await patch_task(task_id, {"error_message": st.get("error")})
                 idx_done = True
                 break
 
@@ -428,13 +483,24 @@ async def scrape_tea_products_task(
             if st.get("task_id") != task_id:
                 continue
 
-            await patch_task(task_id, {"enricher": st})
+            norm_stats = {}
+            if st.get("status") == "task_done":
+                norm_stats = {
+                    "skus_enriched": int(st.get("enriched_products", st.get("enriched", 0))),
+                    "failed": int(st.get("failed_products", st.get("failed", 0))),
+                }
+
+            await patch_task(task_id, {
+                "workers.enricher.status": st.get("status"),
+                "workers.enricher.stats": norm_stats,
+            })
 
             if st.get("status") == "task_done" and st.get("done") is True:
                 enr_done = True
                 break
 
             if st.get("status") == "failed":
+                await patch_task(task_id, {"error_message": st.get("error")})
                 enr_done = True
                 break
 
@@ -443,8 +509,9 @@ async def scrape_tea_products_task(
     finally:
         await asyncio.gather(c_idx.stop(), c_enr.stop(), prod_enr.stop())
 
-    final_status = "finished" if idx_done and enr_done else "failed"
-    await patch_task(task_id, {"status": final_status, "finished_at": _now_ts()})
+    final_status = TaskStatus.finished if idx_done and enr_done else TaskStatus.failed
+    await patch_task(task_id, {"finished_at": _now_dt()})
+    await push_status(task_id, final_status)
     logger.info("scraping task %s finished %s", task_id, final_status)
 
     # kick off collections follow-up as a separate task
@@ -486,50 +553,84 @@ async def schedule_indexer_retry(
 # ========== collections follow-up orchestration ==========
 
 async def create_and_run_collections_task(parent_task_id: str) -> str:
-    collections_task = ScrapingTask(search_term=f"collections-from:{parent_task_id}").dict()
-    collections_task.update(
-        {
-            "parent_task_id": parent_task_id,
-            "task_type": "collections",
-            "status": "started",
-            "created_at": _now_ts(),
-            "updated_at": _now_ts(),
+    # подтянуть pipeline_id из родителя
+    parent = await db.scraping_tasks.find_one({"id": parent_task_id}, {"pipeline_id": 1})
+    pipeline_id = (parent or {}).get("pipeline_id") or parent_task_id
+
+    collections = BaseTask(
+        task_type="collections",
+        status=TaskStatus.queued,  # совместимость
+        params={
+            "source_task_id": parent_task_id,
+            "max_pages": 3,
             "trigger": "auto",
-        }
+        },
+        parent_task_id=parent_task_id,
+        pipeline_id=pipeline_id,
+    ).model_dump(exclude_none=True)
+    collections["_id"] = collections["id"]
+
+    # нормализуем стартовый статус
+    collections["status_history"] = [
+        {"from_status": None, "to_status": TaskStatus.queued, "at": _now_dt(), "reason": "auto-followup"}
+    ]
+    await db.scraping_tasks.insert_one(collections)
+    new_task_id = collections["id"]
+
+    # привяжем follow-up к outputs родителя
+    await db.scraping_tasks.update_one(
+        {"id": parent_task_id},
+        {"$push": {"outputs.next_tasks": {"task_type": "collections", "task_id": new_task_id}},
+         "$currentDate": {"updated_at": True}}
     )
-    await db.scraping_tasks.insert_one(collections_task)
-    new_task_id = collections_task["id"]
 
     try:
+        # queued -> running
+        await push_status(new_task_id, TaskStatus.running)
+
         grouped = await aggregate_collections_for_task(parent_task_id)
         created_cnt, all_skus = await insert_new_collections(new_task_id, grouped)
+
+        await patch_task(new_task_id, {
+            "workers.collector.status": "task_done",
+            "workers.collector.stats": {
+                "created_collections": created_cnt,
+                "skus_discovered": len(all_skus),
+            },
+            "stats.created_collections": created_cnt,
+            "stats.skus_to_process": len(all_skus),
+        })
 
         await db.scraping_tasks.update_one(
             {"id": new_task_id},
             {
-                "$set": {
-                    "meta": {"created_collections": created_cnt, "skus_to_process": len(all_skus)},
-                    "updated_at": _now_ts(),
-                }
+                "$set": {"stats.created_collections": created_cnt, "stats.skus_to_process": len(all_skus)},
+                "$currentDate": {"updated_at": True},
             },
         )
 
         await send_to_indexer_and_wait(new_task_id, all_skus)
+        await patch_task(new_task_id, {
+            "workers.indexer.status": "task_done",
+            "workers.indexer.stats.skus_sent": len(all_skus)
+        })
+        
         await send_to_enricher_and_wait(new_task_id, all_skus)
+        await patch_task(new_task_id, {
+            "workers.enricher.status": "task_done",
+            "workers.enricher.stats.skus_enriched": len(all_skus)  # или фактическое число из ответа
+        })
 
         await db.collections.update_many(
             {"task_id": new_task_id, "status": "queued"},
-            {"$set": {"status": "processed", "updated_at": _now_ts()}},
+            {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
         )
-        await db.scraping_tasks.update_one(
-            {"id": new_task_id},
-            {"$set": {"status": "finished", "finished_at": _now_ts(), "updated_at": _now_ts()}},
-        )
+
+        await patch_task(new_task_id, {"finished_at": _now_dt()})
+        await push_status(new_task_id, TaskStatus.finished)
     except Exception as e:
         logger.exception("collections follow-up failed: %s", e)
-        await db.scraping_tasks.update_one(
-            {"id": new_task_id},
-            {"$set": {"status": "failed", "error": str(e), "updated_at": _now_ts()}},
-        )
+        await patch_task(new_task_id, {"error_message": str(e)})
+        await push_status(new_task_id, TaskStatus.failed)
 
     return new_task_id

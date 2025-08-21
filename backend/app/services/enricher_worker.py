@@ -24,6 +24,7 @@ REVIEWS_DEF = os.getenv("ENRICH_REVIEWS", "true").lower() == "true"
 REVIEWS_LIMIT_DEF = int(os.getenv("ENRICH_REVIEWS_LIMIT", 20))
 CURRENCY = os.getenv("CURRENCY", "RUB")
 ENRICH_RETRY_MAX = int(os.getenv("ENRICH_RETRY_MAX", 3))
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
 configure_logging()
 logger = logging.getLogger("enricher-worker")
@@ -162,7 +163,7 @@ async def _acquire_or_create_batch(
     batch_id: Optional[int],
     skus: Optional[List[str]],
     trigger: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[List[int]]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[List[str]]]:
     batch_doc = None
 
     if batch_id is not None:
@@ -218,7 +219,13 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     if not skus and batch_id is None:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
-            {"source": "enricher", "task_id": task_id, "status": "task_done", "done": True},
+            {
+                "source": "enricher",
+                "version": SERVICE_VERSION,
+                "task_id": task_id,
+                "status": "task_done",
+                "done": True
+            },
         )
         return
 
@@ -232,6 +239,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             TOPIC_ENRICHER_STATUS,
             {
                 "source": "enricher",
+                "version": SERVICE_VERSION,
                 "task_id": task_id,
                 "batch_id": batch_id,
                 "status": "ok",
@@ -243,14 +251,21 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         return
 
     index_rows = await db.index.find({"sku": {"$in": skus}}).to_list(None)
-    base_rows: List[Dict[str, Any]] = [{"sku": d["sku"], "first_seen_at": d.get("first_seen_at")} for d in index_rows]
+    base_rows: List[Dict[str, Any]] = [{"sku": str(d["sku"]), "first_seen_at": d.get("first_seen_at")} for d in index_rows]
     for r in base_rows:
         # r["link"] = f"/product/{r['sku']}/?oos_search=false"
         r["link"] = f"/product/{r['sku']}/"
 
     await prod.send_and_wait(
         TOPIC_ENRICHER_STATUS,
-        {"source": "enricher", "task_id": task_id, "batch_id": batch_id, "status": "running", "total_products": len(base_rows)},
+        {
+            "source": "enricher",
+            "version": SERVICE_VERSION,
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "status": "running",
+            "total_products": len(base_rows)
+        },
     )
 
     try:
@@ -260,7 +275,14 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         await db.enrich_batches.update_one(where, {"$set": {"status": "failed", "error": str(exc), "updated_at": _now_ts()}})
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
-            {"source": "enricher", "task_id": task_id, "batch_id": batch_id, "status": "failed", "error": str(exc)},
+            {
+                "source": "enricher",
+                "version": SERVICE_VERSION,
+                "task_id": task_id,
+                "batch_id": batch_id,
+                "status": "failed",
+                "error": str(exc)
+            },
         )
         raise
 
@@ -322,6 +344,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         TOPIC_ENRICHER_STATUS,
         {
             "source": "enricher",
+            "version": SERVICE_VERSION,
             "task_id": task_id,
             "batch_id": batch_id,
             "status": "ok",

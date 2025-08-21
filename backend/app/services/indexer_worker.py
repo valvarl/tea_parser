@@ -18,6 +18,7 @@ TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
 TOPIC_INDEXER_STATUS = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
 MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 1))
 CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
 configure_logging()
 logger = logging.getLogger("indexer-worker")
@@ -124,7 +125,8 @@ async def _handle_search(
                 headless=True,
             ):
                 page_no += 1
-                batch_skus: List[int] = []
+                batch_skus: List[str] = []
+                batch_ins = batch_upd = batch_fail = 0
 
                 for p in batch:
                     sku = str(p.get("sku") or "")
@@ -135,10 +137,6 @@ async def _handle_search(
                             {"sku": sku},
                             {
                                 "$set": {
-                                    # "name": p.get("name"),
-                                    # "rating": p.get("rating"),
-                                    # "reviews": p.get("reviews"),
-                                    # "cover_image": p.get("cover_image"),
                                     "last_seen_at": now_ts,
                                     "is_active": True,
                                     "task_id": task_id,
@@ -152,21 +150,33 @@ async def _handle_search(
                             },
                             upsert=True,
                         )
-                        inserted += int(res.upserted_id is not None)
-                        updated += int(res.upserted_id is None)
+                        is_insert = res.upserted_id is not None
+                        inserted += int(is_insert)
+                        updated  += int(not is_insert)
                         scraped += 1
                         batch_skus.append(sku)
+                        batch_ins += int(is_insert)
+                        batch_upd += int(not is_insert)
                     except Exception as exc:
                         failed += 1
+                        batch_fail += 1
                         logger.error("index upsert failed sku=%s: %s", sku, exc, exc_info=True)
 
                 await prod.send_and_wait(
                     TOPIC_INDEXER_STATUS,
                     {
+                        "source": "indexer",
+                        "version": SERVICE_VERSION,
                         "task_id": task_id,
                         "status": "ok",
                         "batch_id": page_no,
-                        "batch_data": {"batch_id": page_no, "skus": batch_skus},
+                        "batch_data": {
+                            "batch_id": page_no,
+                            "pages": 1, 
+                            "skus": batch_skus,
+                            "inserted": batch_ins,
+                            "updated": batch_upd
+                            },
                         "scraped_products": scraped,
                         "failed_products": failed,
                         "inserted_products": inserted,
@@ -180,6 +190,8 @@ async def _handle_search(
             await prod.send_and_wait(
                 TOPIC_INDEXER_STATUS,
                 {
+                    "source": "indexer",
+                    "version": SERVICE_VERSION,
                     "task_id": task_id,
                     "status": "deferred",
                     "reason": str(co),
@@ -197,6 +209,8 @@ async def _handle_search(
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
             {
+                "source": "indexer",
+                "version": SERVICE_VERSION,
                 "task_id": task_id,
                 "status": "task_done",
                 "done": True,
@@ -265,8 +279,9 @@ async def _handle_add_collection_members(
                     },
                     upsert=True,
                 )
-                inserted += int(res.upserted_id is not None)
-                updated += int(res.upserted_id is None)
+                is_insert = res.upserted_id is not None
+                inserted += int(is_insert)
+                updated  += int(not is_insert)
             except Exception as exc:
                 failed += 1
                 logger.error("index upsert (collections) failed sku=%s: %s", sku, exc, exc_info=True)
@@ -274,10 +289,18 @@ async def _handle_add_collection_members(
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
             {
+                "source": "indexer",
+                "version": SERVICE_VERSION,
                 "task_id": task_id,
                 "status": "ok",
                 "batch_id": batch_id,
-                "batch_data": {"batch_id": batch_id, "skus": skus},
+                "batch_data": {
+                    "batch_id": batch_id, 
+                    "pages": 0,
+                    "skus": skus,
+                    "inserted": inserted,
+                    "updated": updated,
+                },
                 "scraped_products": inserted + updated,
                 "failed_products": failed,
                 "inserted_products": inserted,
@@ -293,16 +316,18 @@ async def _handle_add_collection_members(
 
 
 async def _map_sku_to_collection_hashes(task_id: str, skus: List[str]) -> Dict[str, Set[str]]:
-    mapping: Dict[int, Set[str]] = {s: set() for s in skus}
+    mapping: Dict[str, Set[str]] = {s: set() for s in skus}
     cur = db.collections.find(
         {"task_id": task_id, "skus.sku": {"$in": skus}},
         {"collection_hash": 1, "skus": 1},
     )
     async for col in cur:
         ch = col.get("collection_hash")
+        if not ch:
+            continue
         for sdoc in col.get("skus", []):
-            s = sdoc.get("sku") or ""
-            if s and s in mapping:
+            s = str(sdoc.get("sku") or "")
+            if s in mapping:
                 mapping[s].add(ch)
     return mapping
 
