@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import PropTypes from "prop-types";
 import "./App.css";
+import ProductModal from "./components/ProductModal";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
@@ -129,25 +130,34 @@ function extractSpecs(product) {
   ].filter((x) => x.val);
 }
 
-function TeaCard({ product, onDelete }) {
+function TeaCard({ product, onDelete, onOpen }) {
   const img = pickCover(product);
   const title = product.title || product.name || product.sku || "Untitled";
   const specs = extractSpecs(product);
   const ts = product.updated_at || product.created_at || product.scraped_at;
 
   return (
-    <div className="bg-white rounded-lg shadow-md p-4 hover:shadow-lg transition-shadow">
-      <div className="flex justify-between items-start mb-3">
+    <div
+      className="bg-white rounded-lg shadow-md p-4 hover:shadow-lg transition-shadow cursor-pointer relative" // cursor + relative
+      onClick={onOpen} // Открытие модалки при клике на карточку
+    >
+      {/* Крестик удаления: закрепляем сверху, выше клика по карточке */}
+      <button
+        onClick={(e) => {
+          e.stopPropagation(); // НЕ открывать модалку
+          onDelete(product.id);
+        }}
+        className="absolute top-2 right-2 z-10 text-red-500 hover:text-red-700 text-sm bg-white/90 rounded-full px-2 py-1 shadow"
+        title="Delete"
+        aria-label="Delete"
+      >
+        ❌
+      </button>
+
+      <div className="flex justify-between items-start mb-3 pr-8">
         <h3 className="text-base font-semibold text-gray-900 line-clamp-2">
           {title}
         </h3>
-        <button
-          onClick={() => onDelete(product.id)}
-          className="text-red-500 hover:text-red-700 text-sm"
-          title="Delete"
-        >
-          ❌
-        </button>
       </div>
 
       {img ? (
@@ -182,6 +192,7 @@ function TeaCard({ product, onDelete }) {
 TeaCard.propTypes = {
   product: ProductPropType.isRequired,
   onDelete: PropTypes.func.isRequired,
+  onOpen: PropTypes.func.isRequired, // добавили
 };
 
 function Pagination({
@@ -250,6 +261,43 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("puer");
   const [categories, setCategories] = useState([]);
+  const [isProductModalOpen, setIsProductModalOpen] = useState(false);
+  const [modalProduct, setModalProduct] = useState(null);
+
+  const openProductModal = useCallback(
+    (prodOrSku) => {
+      if (!prodOrSku) return;
+      // Если пришёл объект — открываем сразу
+      if (typeof prodOrSku === "object") {
+        setModalProduct(prodOrSku);
+        setIsProductModalOpen(true);
+        return;
+      }
+      // Если пришёл sku — попробуем найти в текущей странице
+      const found = products.find((p) => String(p.sku) === String(prodOrSku));
+      if (found) {
+        setModalProduct(found);
+        setIsProductModalOpen(true);
+        return;
+      }
+      // Фоллбек: получить по SKU с бэка (если эндпоинт есть)
+      api
+        .get(`/products/sku/${encodeURIComponent(String(prodOrSku))}`)
+        .then((res) => {
+          if (res?.data) {
+            setModalProduct(res.data);
+            setIsProductModalOpen(true);
+          }
+        })
+        .catch(() => {});
+    },
+    [products]
+  );
+
+  const closeProductModal = useCallback(() => {
+    setIsProductModalOpen(false);
+    setModalProduct(null);
+  }, []);
 
   const totalPages = useMemo(
     () => Math.max(1, Math.ceil(totalProducts / pageSize)),
@@ -614,7 +662,12 @@ export default function App() {
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {products.map((p) => (
-                  <TeaCard key={p.id} product={p} onDelete={deleteProduct} />
+                  <TeaCard
+                    key={p.id}
+                    product={p}
+                    onDelete={deleteProduct}
+                    onOpen={() => openProductModal(p)}
+                  />
                 ))}
               </div>
 
@@ -723,6 +776,12 @@ export default function App() {
             </div>
           </div>
         )}
+      <ProductModal
+        isOpen={isProductModalOpen}
+        product={modalProduct || {}}
+        onClose={closeProductModal}
+        onSelectSku={(sku) => openProductModal(sku)}
+      />
       </main>
     </div>
   );
