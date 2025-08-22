@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from pymongo import ReturnDocument
 
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 from app.db.mongo import db
 from app.services.enricher import ProductEnricher
 
@@ -26,8 +26,8 @@ CURRENCY = os.getenv("CURRENCY", "RUB")
 ENRICH_RETRY_MAX = int(os.getenv("ENRICH_RETRY_MAX", 3))
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
-configure_logging()
-logger = logging.getLogger("enricher-worker")
+configure_logging(service="enricher", worker="enricher-worker")
+logger = get_logger("enricher-worker")
 
 enricher = ProductEnricher(
     concurrency=CONCURRENCY_DEF,
@@ -48,7 +48,7 @@ enricher = ProductEnricher(
 )
 
 
-# ===== time/json helpers =====
+# ===== time/json =====
 
 def _now_ts() -> int:
     return int(time.time())
@@ -152,8 +152,9 @@ async def _bulk_upsert_reviews(reviews: List[Dict[str, Any]]) -> int:
             )
             saved += 1
         except Exception as exc:
-            logger.warning("review upsert failed sku=%s uuid=%s: %s", rv.get("sku"), rv.get("uuid"), exc)
+            logger.warning("review upsert failed", extra={"event": "review_upsert_failed", "task_id": rv.get("task_id"), "sku": rv.get("sku")})
     return saved
+
 
 # ===== counters =====
 
@@ -166,6 +167,7 @@ async def _next_enrich_batch_id(task_id: str) -> int:
     )
     return int(doc.get("seq", 1))
 
+
 # ===== batch lifecycle =====
 
 async def _acquire_or_create_batch(
@@ -173,7 +175,7 @@ async def _acquire_or_create_batch(
     batch_id: Optional[int],
     skus: Optional[List[str]],
     trigger: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str | int], Optional[List[str]]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[List[str]]]:
     batch_doc = None
 
     if batch_id is not None:
@@ -206,7 +208,7 @@ async def _acquire_or_create_batch(
             new_id = await _next_enrich_batch_id(task_id)
             await db.enrich_batches.update_one({"_id": batch_doc["_id"]}, {"$set": {"batch_id": new_id}})
             batch_doc = await db.enrich_batches.find_one({"_id": batch_doc["_id"]})
-            batch_id = batch_doc.get("batch_id")
+            batch_id = int(batch_doc.get("batch_id"))
 
     return batch_doc, batch_id, skus
 
@@ -217,7 +219,6 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     task_id: str = cmd["task_id"]
     batch_id: Optional[int] = cmd.get("batch_id")
     trigger: str = cmd.get("trigger") or cmd.get("source") or "ad-hoc"
-
     skus: Optional[List[str]] = cmd.get("skus")
 
     enricher.concurrency = int(cmd.get("concurrency", CONCURRENCY_DEF))
@@ -226,17 +227,11 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
 
     batch_doc, batch_id, skus = await _acquire_or_create_batch(task_id, batch_id, skus, trigger)
 
+    # Unified status: source, version, task_id, status, ts, batch_id?, trigger?
     if not skus and batch_id is None:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
-            {
-                "source": "enricher",
-                "version": SERVICE_VERSION,
-                "task_id": task_id,
-                "status": "task_done",
-                "done": True,
-                "ts": _now_ts(),
-            },
+            {"source": "enricher", "version": SERVICE_VERSION, "task_id": task_id, "status": "task_done", "done": True, "ts": _now_ts(), "trigger": trigger},
         )
         return
 
@@ -248,15 +243,10 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
             {
-                "source": "enricher",
-                "version": SERVICE_VERSION,
-                "task_id": task_id,
-                "batch_id": batch_id,
-                "status": "ok",
-                "scraped_products": 0,
-                "failed_products": 0,
-                "total_products": 0,
-                "ts": _now_ts(),
+                "source": "enricher", "version": SERVICE_VERSION, "task_id": task_id,
+                "batch_id": batch_id, "status": "ok", "ts": _now_ts(), "trigger": trigger,
+                "batch_data": {"processed": 0, "failed": 0, "saved_reviews": 0, "dlq": 0, "skus": []},
+                "scraped_products": 0, "failed_products": 0, "total_products": 0, "batch_failed": 0,
             },
         )
         return
@@ -269,13 +259,9 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     await prod.send_and_wait(
         TOPIC_ENRICHER_STATUS,
         {
-            "source": "enricher",
-            "version": SERVICE_VERSION,
-            "task_id": task_id,
-            "batch_id": batch_id,
-            "status": "running",
+            "source": "enricher", "version": SERVICE_VERSION, "task_id": task_id,
+            "batch_id": batch_id, "status": "running", "ts": _now_ts(), "trigger": trigger,
             "total_products": len(base_rows),
-            "ts": _now_ts(),
         },
     )
 
@@ -287,14 +273,9 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
             {
-                "source": "enricher",
-                "version": SERVICE_VERSION,
-                "task_id": task_id,
-                "batch_id": batch_id,
-                "status": "failed",
-                "error": str(exc),
-                "error_message": str(exc),
-                "ts": _now_ts(),
+                "source": "enricher", "version": SERVICE_VERSION, "task_id": task_id, "batch_id": batch_id,
+                "status": "failed", "ts": _now_ts(), "trigger": trigger,
+                "reason_code": "db_write_error", "error": str(exc), "error_message": str(exc),
             },
         )
         raise
@@ -312,7 +293,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             scraped += 1
         except Exception as exc:
             failed += 1
-            logger.error("candidate persist failed sku=%s: %s", row.get("sku"), exc, exc_info=True)
+            logger.error("candidate persist failed", extra={"event": "candidate_persist_failed", "task_id": task_id, "sku": row.get("sku")})
 
     if enricher.want_reviews and reviews_rows:
         saved_reviews = await _bulk_upsert_reviews(reviews_rows)
@@ -336,8 +317,8 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             if docs:
                 await db.enrich_dlq.insert_many(docs, ordered=False)
                 dlq_saved = len(docs)
-        except Exception as exc:
-            logger.warning("DLQ insert failed: %s", exc)
+        except Exception:
+            logger.warning("DLQ insert failed", extra={"event": "dlq_insert_failed", "task_id": task_id})
 
     where = {"task_id": task_id, "batch_id": batch_id} if batch_id is not None else {"_id": batch_doc["_id"]}
     await db.enrich_batches.update_one(
@@ -356,21 +337,15 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     await prod.send_and_wait(
         TOPIC_ENRICHER_STATUS,
         {
-            "source": "enricher",
-            "version": SERVICE_VERSION,
-            "task_id": task_id,
-            "batch_id": batch_id,
-            "status": "ok",
-            "scraped_products": scraped,
-            "failed_products": failed + len(failed_rows),
-            "total_products": len(base_rows),
-            "saved_reviews": saved_reviews,
-            "dlq": dlq_saved,
-            "ts": _now_ts(),
+            "source": "enricher", "version": SERVICE_VERSION, "task_id": task_id,
+            "batch_id": batch_id, "status": "ok", "ts": _now_ts(), "trigger": trigger,
+            "batch_data": {"processed": scraped, "failed": failed + len(failed_rows), "saved_reviews": saved_reviews, "dlq": dlq_saved, "skus": [r["sku"] for r in enriched_rows]},
+            "scraped_products": scraped, "failed_products": failed + len(failed_rows), "total_products": len(base_rows),
+            "saved_reviews": saved_reviews, "dlq": dlq_saved, "batch_failed": failed + len(failed_rows),
         },
     )
 
-    logger.info("task %s batch %s done: saved=%s failed=%s reviews=%s", task_id, batch_id, scraped, failed + len(failed_rows), saved_reviews)
+    logger.info("batch done", extra={"event": "batch_ok", "task_id": task_id, "batch_id": batch_id, "counts": {"processed": scraped, "failed": failed + len(failed_rows)}})
 
 
 async def main() -> None:
@@ -391,8 +366,8 @@ async def main() -> None:
             try:
                 await _handle_message(msg.value, prod)
                 await cons.commit()
-            except Exception as exc:
-                logger.exception("message processing failed, not committing: %s", exc)
+            except Exception:
+                logger.exception("message processing failed", extra={"event": "msg_failed"})
     finally:
         await cons.stop()
         await prod.stop()

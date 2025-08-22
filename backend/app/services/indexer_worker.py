@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 from app.db.mongo import db
 from app.services.indexer import ProductIndexer, CircuitOpen
 
@@ -20,8 +20,8 @@ MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 1))
 CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
-configure_logging()
-logger = logging.getLogger("indexer-worker")
+configure_logging(service="indexer", worker="indexer-worker")
+logger = get_logger("indexer-worker")
 indexer = ProductIndexer()
 
 
@@ -71,8 +71,8 @@ async def main() -> None:
             try:
                 await _dispatch(payload, prod)
                 await cons.commit()
-            except Exception as exc:
-                logger.exception("Task failed: %s", exc)
+            except Exception:
+                logger.exception("task failed", extra={"event": "task_failed"})
     finally:
         await cons.stop()
         await prod.stop()
@@ -87,6 +87,7 @@ async def _dispatch(payload: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             task_id=payload["task_id"],
             batch_id=payload.get("batch_id"),
             skus=payload.get("skus", []),
+            trigger=payload.get("trigger") or "collections_followup",
             prod=prod,
         )
         return
@@ -96,6 +97,7 @@ async def _dispatch(payload: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         query=payload.get("search_term", ""),
         category=payload.get("category_id", CATEGORY_DEF),
         max_pages=int(payload.get("max_pages", MAX_PAGES_DEF)),
+        trigger=payload.get("trigger") or "search",
         prod=prod,
     )
 
@@ -107,11 +109,12 @@ async def _handle_search(
     query: str,
     category: str,
     max_pages: int,
+    trigger: str,
     prod: AIOKafkaProducer,
 ) -> None:
     try:
-        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running", "ts": _now_ts()})
-        logger.info("index: query=%r category=%s pages=%s", query, category, max_pages)
+        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"source": "indexer", "version": SERVICE_VERSION, "task_id": task_id, "status": "running", "ts": _now_ts(), "trigger": trigger})
+        logger.info("running", extra={"event": "running", "task_id": task_id, "trigger": trigger, "counts": {"max_pages": max_pages}})
 
         now_ts = _now_ts()
         scraped = failed = page_no = inserted = updated = 0
@@ -157,10 +160,10 @@ async def _handle_search(
                         batch_skus.append(sku)
                         batch_ins += int(is_insert)
                         batch_upd += int(not is_insert)
-                    except Exception as exc:
+                    except Exception:
                         failed += 1
                         batch_fail += 1
-                        logger.error("index upsert failed sku=%s: %s", sku, exc, exc_info=True)
+                        logger.error("index upsert failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
 
                 await prod.send_and_wait(
                     TOPIC_INDEXER_STATUS,
@@ -170,21 +173,23 @@ async def _handle_search(
                         "task_id": task_id,
                         "status": "ok",
                         "batch_id": page_no,
+                        "ts": _now_ts(),
+                        "trigger": trigger,
                         "batch_data": {
                             "batch_id": page_no,
                             "pages": 1,
                             "skus": batch_skus,
                             "inserted": batch_ins,
-                            "updated": batch_upd
-                            },
+                            "updated": batch_upd,
+                            "failed": batch_fail,
+                        },
                         "scraped_products": scraped,
                         "failed_products": failed,
                         "inserted_products": inserted,
                         "updated_products": updated,
-                        "ts": _now_ts(),
                     },
                 )
-                logger.info("page %s done: saved=%s failed=%s total_saved=%s", page_no, len(batch_skus), failed, scraped)
+                logger.info("page done", extra={"event": "batch_ok", "task_id": task_id, "batch_id": page_no, "counts": {"inserted": batch_ins, "updated": batch_upd, "failed": batch_fail}})
 
         except CircuitOpen as co:
             next_retry_at = getattr(co, "next_retry_at", _now_ts() + 600)
@@ -196,15 +201,17 @@ async def _handle_search(
                     "task_id": task_id,
                     "status": "deferred",
                     "reason": str(co),
+                    "reason_code": "circuit_open",
                     "next_retry_at": next_retry_at,
                     "scraped_products": scraped,
                     "failed_products": failed,
                     "inserted_products": inserted,
                     "updated_products": updated,
                     "ts": _now_ts(),
+                    "trigger": trigger,
                 },
             )
-            logger.warning("task %s deferred until %s (%s)", task_id, next_retry_at, co)
+            logger.warning("deferred", extra={"event": "deferred", "task_id": task_id, "reason_code": "circuit_open", "next_retry_at": next_retry_at})
             return
 
         total = scraped + failed
@@ -222,16 +229,17 @@ async def _handle_search(
                 "updated_products": updated,
                 "total_products": total,
                 "ts": _now_ts(),
+                "trigger": trigger,
             },
         )
-        logger.info("task %s done: total=%s scraped=%s failed=%s", task_id, total, scraped, failed)
+        logger.info("task done", extra={"event": "task_done", "task_id": task_id, "counts": {"total": total, "failed": failed}})
 
     except Exception as e:
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
-            {"task_id": task_id, "status": "failed", "error": str(e), "error_message": str(e), "ts": _now_ts()},
+            {"source": "indexer", "version": SERVICE_VERSION, "task_id": task_id, "status": "failed", "error": str(e), "error_message": str(e), "reason_code": "unexpected_error", "ts": _now_ts(), "trigger": trigger},
         )
-        logger.exception("task %s failed: %s", task_id, e)
+        logger.exception("task failed", extra={"event": "failed", "task_id": task_id, "reason_code": "unexpected_error"})
 
 
 # ===== collections flow =====
@@ -240,6 +248,7 @@ async def _handle_add_collection_members(
     task_id: str,
     batch_id: Optional[int],
     skus: List[str],
+    trigger: str,
     prod: AIOKafkaProducer,
 ) -> None:
     try:
@@ -247,15 +256,18 @@ async def _handle_add_collection_members(
             await prod.send_and_wait(
                 TOPIC_INDEXER_STATUS,
                 {
+                    "source": "indexer",
+                    "version": SERVICE_VERSION,
                     "task_id": task_id,
                     "status": "ok",
                     "batch_id": batch_id,
-                    "batch_data": {"batch_id": batch_id, "skus": []},
+                    "ts": _now_ts(),
+                    "trigger": trigger,
+                    "batch_data": {"batch_id": batch_id, "pages": 0, "skus": [], "inserted": 0, "updated": 0, "failed": 0},
                     "scraped_products": 0,
                     "failed_products": 0,
                     "inserted_products": 0,
                     "updated_products": 0,
-                    "ts": _now_ts(),
                 },
             )
             return
@@ -289,9 +301,9 @@ async def _handle_add_collection_members(
                 is_insert = res.upserted_id is not None
                 inserted += int(is_insert)
                 updated  += int(not is_insert)
-            except Exception as exc:
+            except Exception:
                 failed += 1
-                logger.error("index upsert (collections) failed sku=%s: %s", sku, exc, exc_info=True)
+                logger.error("index upsert (collections) failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
 
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
@@ -301,26 +313,28 @@ async def _handle_add_collection_members(
                 "task_id": task_id,
                 "status": "ok",
                 "batch_id": batch_id,
+                "ts": _now_ts(),
+                "trigger": trigger,
                 "batch_data": {
                     "batch_id": batch_id,
                     "pages": 0,
                     "skus": skus,
                     "inserted": inserted,
                     "updated": updated,
+                    "failed": failed,
                 },
                 "scraped_products": inserted + updated,
                 "failed_products": failed,
                 "inserted_products": inserted,
                 "updated_products": updated,
-                "ts": _now_ts(),
             },
         )
     except Exception as e:
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
-            {"task_id": task_id, "status": "failed", "batch_id": batch_id, "error": str(e), "error_message": str(e), "ts": _now_ts()},
+            {"source": "indexer", "version": SERVICE_VERSION, "task_id": task_id, "status": "failed", "batch_id": batch_id, "error": str(e), "error_message": str(e), "reason_code": "unexpected_error", "ts": _now_ts(), "trigger": trigger},
         )
-        logger.exception("collections batch failed task=%s batch=%s: %s", task_id, batch_id, e)
+        logger.exception("collections batch failed", extra={"event": "failed", "task_id": task_id, "batch_id": batch_id})
 
 
 async def _map_sku_to_collection_hashes(task_id: str, skus: List[str]) -> Dict[str, Set[str]]:
