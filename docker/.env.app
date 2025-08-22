@@ -1,13 +1,10 @@
-# ───── Mongo (app) ─────
-MONGO_URL=mongodb://teauser:secret@mongo:27017/
+PYTHONPATH=/app
+
+# Mongo (runtime for apps). If you use the root user, include authSource=admin
+MONGO_URL=mongodb://teauser:secret@mongo:27017/?authSource=admin
 DB_NAME=teadb
 
-# ───── Mongo (container init) ─────
-MONGO_INITDB_ROOT_USERNAME=teauser
-MONGO_INITDB_ROOT_PASSWORD=secret
-MONGO_INITDB_DATABASE=teadb
-
-# ───── Kafka ─────
+# Kafka
 KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 TOPIC_COORDINATOR_CMD=coordinator_cmd
 TOPIC_INDEXER_CMD=indexer_cmd
@@ -15,7 +12,7 @@ TOPIC_INDEXER_STATUS=indexer_status
 TOPIC_ENRICHER_CMD=enricher_cmd
 TOPIC_ENRICHER_STATUS=enricher_status
 
-# ───── Coordinator runtime ─────
+# Coordinator runtime
 ENRICHER_BATCH_SIZE=50
 STATUS_TIMEOUT_SEC=300
 HEARTBEAT_DEADLINE_SEC=900
@@ -26,20 +23,22 @@ RETRY_BACKOFF_BASE=60
 RETRY_BACKOFF_MAX=3600
 FORWARD_THROTTLE_DELAY_MS=0
 MAX_RUNNING_TASKS=0
-COORDINATOR_HEALTH_PORT=8081
 
-# ───── Indexer defaults ─────
+# Indexer defaults
 INDEX_MAX_PAGES=3
 INDEX_CATEGORY_ID=9373
 
-# ───── Enricher defaults ─────
+# Enricher defaults
 ENRICH_CONCURRENCY=6
 ENRICH_REVIEWS=true
 ENRICH_REVIEWS_LIMIT=20
 ENRICH_RETRY_MAX=3
 CURRENCY=RUB
 
-# ───── Logging / versioning ─────
+# Logging / versioning
 LOG_LEVEL=INFO
 SERVICE_VERSION=dev
 GIT_SHA=dev
+
+# Front-end
+REACT_APP_BACKEND_URL=http://localhost:8000
