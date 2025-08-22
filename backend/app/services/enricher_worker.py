@@ -155,6 +155,16 @@ async def _bulk_upsert_reviews(reviews: List[Dict[str, Any]]) -> int:
             logger.warning("review upsert failed sku=%s uuid=%s: %s", rv.get("sku"), rv.get("uuid"), exc)
     return saved
 
+# ===== counters =====
+
+async def _next_enrich_batch_id(task_id: str) -> int:
+    doc = await db.counters.find_one_and_update(
+        {"_id": f"enrich_batch::{task_id}"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc.get("seq", 1))
 
 # ===== batch lifecycle =====
 
@@ -163,7 +173,7 @@ async def _acquire_or_create_batch(
     batch_id: Optional[int],
     skus: Optional[List[str]],
     trigger: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[List[str]]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str | int], Optional[List[str]]]:
     batch_doc = None
 
     if batch_id is not None:
@@ -193,9 +203,10 @@ async def _acquire_or_create_batch(
             return_document=ReturnDocument.AFTER,
         )
         if batch_doc and "batch_id" not in batch_doc:
-            await db.enrich_batches.update_one({"_id": batch_doc["_id"]}, {"$set": {"batch_id": int(time.time() % 1_000_000)}})
+            new_id = await _next_enrich_batch_id(task_id)
+            await db.enrich_batches.update_one({"_id": batch_doc["_id"]}, {"$set": {"batch_id": new_id}})
             batch_doc = await db.enrich_batches.find_one({"_id": batch_doc["_id"]})
-        batch_id = batch_doc.get("batch_id")
+            batch_id = batch_doc.get("batch_id")
 
     return batch_doc, batch_id, skus
 
