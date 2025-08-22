@@ -181,6 +181,7 @@ async def _handle_search(
                         "failed_products": failed,
                         "inserted_products": inserted,
                         "updated_products": updated,
+                        "ts": _now_ts(),
                     },
                 )
                 logger.info("page %s done: saved=%s failed=%s total_saved=%s", page_no, len(batch_skus), failed, scraped)
@@ -200,6 +201,7 @@ async def _handle_search(
                     "failed_products": failed,
                     "inserted_products": inserted,
                     "updated_products": updated,
+                    "ts": _now_ts(),
                 },
             )
             logger.warning("task %s deferred until %s (%s)", task_id, next_retry_at, co)
@@ -219,12 +221,16 @@ async def _handle_search(
                 "inserted_products": inserted,
                 "updated_products": updated,
                 "total_products": total,
+                "ts": _now_ts(),
             },
         )
         logger.info("task %s done: total=%s scraped=%s failed=%s", task_id, total, scraped, failed)
 
     except Exception as e:
-        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "failed", "error_message": str(e)})
+        await prod.send_and_wait(
+            TOPIC_INDEXER_STATUS,
+            {"task_id": task_id, "status": "failed", "error": str(e), "error_message": str(e), "ts": _now_ts()},
+        )
         logger.exception("task %s failed: %s", task_id, e)
 
 
@@ -249,6 +255,7 @@ async def _handle_add_collection_members(
                     "failed_products": 0,
                     "inserted_products": 0,
                     "updated_products": 0,
+                    "ts": _now_ts(),
                 },
             )
             return
@@ -305,12 +312,13 @@ async def _handle_add_collection_members(
                 "failed_products": failed,
                 "inserted_products": inserted,
                 "updated_products": updated,
+                "ts": _now_ts(),
             },
         )
     except Exception as e:
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
-            {"task_id": task_id, "status": "failed", "batch_id": batch_id, "error_message": str(e)},
+            {"task_id": task_id, "status": "failed", "batch_id": batch_id, "error": str(e), "error_message": str(e), "ts": _now_ts()},
         )
         logger.exception("collections batch failed task=%s batch=%s: %s", task_id, batch_id, e)
 

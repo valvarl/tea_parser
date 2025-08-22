@@ -224,7 +224,8 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
                 "version": SERVICE_VERSION,
                 "task_id": task_id,
                 "status": "task_done",
-                "done": True
+                "done": True,
+                "ts": _now_ts(),
             },
         )
         return
@@ -246,6 +247,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
                 "scraped_products": 0,
                 "failed_products": 0,
                 "total_products": 0,
+                "ts": _now_ts(),
             },
         )
         return
@@ -264,7 +266,8 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             "task_id": task_id,
             "batch_id": batch_id,
             "status": "running",
-            "total_products": len(base_rows)
+            "total_products": len(base_rows),
+            "ts": _now_ts(),
         },
     )
 
@@ -281,7 +284,9 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
                 "task_id": task_id,
                 "batch_id": batch_id,
                 "status": "failed",
-                "error": str(exc)
+                "error": str(exc),
+                "error_message": str(exc),
+                "ts": _now_ts(),
             },
         )
         raise
@@ -353,6 +358,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
             "total_products": len(base_rows),
             "saved_reviews": saved_reviews,
             "dlq": dlq_saved,
+            "ts": _now_ts(),
         },
     )
 
