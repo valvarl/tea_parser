@@ -110,7 +110,7 @@ async def _handle_search(
     prod: AIOKafkaProducer,
 ) -> None:
     try:
-        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running"})
+        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"task_id": task_id, "status": "running", "ts": _now_ts()})
         logger.info("index: query=%r category=%s pages=%s", query, category, max_pages)
 
         now_ts = _now_ts()
@@ -172,7 +172,7 @@ async def _handle_search(
                         "batch_id": page_no,
                         "batch_data": {
                             "batch_id": page_no,
-                            "pages": 1, 
+                            "pages": 1,
                             "skus": batch_skus,
                             "inserted": batch_ins,
                             "updated": batch_upd
@@ -277,8 +277,8 @@ async def _handle_add_collection_members(
                             "task_id": task_id,
                         },
                         "$setOnInsert": {
-                            "first_seen_at": now_ts, 
-                            "candidate_id": None, 
+                            "first_seen_at": now_ts,
+                            "candidate_id": None,
                             "sku": sku,
                             "status": "pending_review"
                         },
@@ -302,7 +302,7 @@ async def _handle_add_collection_members(
                 "status": "ok",
                 "batch_id": batch_id,
                 "batch_data": {
-                    "batch_id": batch_id, 
+                    "batch_id": batch_id,
                     "pages": 0,
                     "skus": skus,
                     "inserted": inserted,

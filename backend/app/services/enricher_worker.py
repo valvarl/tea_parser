@@ -226,7 +226,6 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
 
     batch_doc, batch_id, skus = await _acquire_or_create_batch(task_id, batch_id, skus, trigger)
 
-    # Finalize signal from background (no skus and no batch_id)
     if not skus and batch_id is None:
         await prod.send_and_wait(
             TOPIC_ENRICHER_STATUS,
@@ -241,7 +240,6 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
         )
         return
 
-    # Legacy mode: enrich all items without candidate_id if no skus provided
     if not skus:
         index_rows = await db.index.find({"candidate_id": None}).to_list(None)
         skus = [d["sku"] for d in index_rows]
@@ -266,7 +264,6 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     index_rows = await db.index.find({"sku": {"$in": skus}}).to_list(None)
     base_rows: List[Dict[str, Any]] = [{"sku": str(d["sku"]), "first_seen_at": d.get("first_seen_at")} for d in index_rows]
     for r in base_rows:
-        # r["link"] = f"/product/{r['sku']}/?oos_search=false"
         r["link"] = f"/product/{r['sku']}/"
 
     await prod.send_and_wait(
