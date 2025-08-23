@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Dict, List
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -65,3 +66,33 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     # ВАЖНО: не передавать os.environ внутрь
     return Settings()
+
+TEA_KEYWORDS: Dict[str, List[str]] = {
+    "base_terms": [
+        "пуэр", "пуер", "pu-erh", "pu erh", "puer",
+        "китайский чай", "chinese tea", "чай китай",
+        "чёрный чай", "черный чай", "black tea",
+        "зелёный чай", "зеленый чай", "green tea",
+        "улун", "оолонг", "oolong",
+        "белый чай", "white tea",
+        "дахунпао", "да хун пао", "da hong pao",
+        "лунцзин", "longjing", "dragon well",
+        "те гуань инь", "tie guan yin", "tieguanyin",
+    ],
+    "forms": [
+        "блин", "блинчик", "плитка", "таблетка",
+        "прессованный", "рассыпной", "листовой",
+        "cake", "brick", "тuo", "то ча",
+    ],
+    "regions": [
+        "юннань", "yunnan", "фуцзянь", "fujian",
+        "аньхой", "anhui", "чжэцзян", "zhejiang",
+        "гуанси", "guangxi", "гуандун", "guangdong",
+    ],
+    "grades": [
+        "шэн", "шен", "sheng", "сырой",
+        "шу", "shu", "shou", "готовый",
+        "молодой", "выдержанный", "aged",
+    ],
+    "years": [str(year) for year in range(2010, 2026)],
+}

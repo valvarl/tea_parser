@@ -40,7 +40,7 @@ services:
       dockerfile: docker/Dockerfile.backend
     command: ["python", "main.py"]
     env_file:
-      - .env.app
+      - ../backend/.env.app
     ports: ["8000:8000"]
     depends_on:
       kafka:
@@ -60,7 +60,7 @@ services:
       dockerfile: docker/Dockerfile.backend
     command: ["python", "app/services/coordinator_service.py"]
     env_file:
-      - .env.app
+      - ../backend/.env.app
     depends_on:
       kafka:
         condition: service_healthy
@@ -80,7 +80,7 @@ services:
       dockerfile: docker/Dockerfile.backend
     command: ["python", "app/services/indexer_worker.py"]
     env_file:
-      - .env.app
+      - ../backend/.env.app
     depends_on:
       kafka:
         condition: service_healthy
@@ -94,7 +94,7 @@ services:
       dockerfile: docker/Dockerfile.backend
     command: ["python", "app/services/enricher_worker.py"]
     env_file:
-      - .env.app
+      - ../backend/.env.app
     depends_on:
       kafka:
         condition: service_healthy
@@ -107,7 +107,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.frontend
     env_file:
-      - .env.app
+      - ../backend/.env.app
     ports: ["3000:3000"]
     stdin_open: true
     tty: true

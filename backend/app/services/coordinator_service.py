@@ -28,7 +28,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
 # ─────────── logging ───────────
-configure_logging(LOG_LEVEL)
+configure_logging(service="coordinator-service", worker="coordinator-service", level=LOG_LEVEL)
 logger = logging.getLogger("coordinator-service")
 
 

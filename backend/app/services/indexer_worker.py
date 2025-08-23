@@ -20,6 +20,10 @@ MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 1))
 CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
 
+INDEX_RETRY_MAX = int(os.getenv("INDEX_RETRY_MAX", "3"))
+INDEX_RETRY_BASE_SEC = int(os.getenv("INDEX_RETRY_BASE_SEC", "60"))
+INDEX_RETRY_MAX_SEC = int(os.getenv("INDEX_RETRY_MAX_SEC", "3600"))
+
 configure_logging(service="indexer", worker="indexer-worker")
 logger = get_logger("indexer-worker")
 indexer = ProductIndexer()
@@ -112,107 +116,167 @@ async def _handle_search(
     trigger: str,
     prod: AIOKafkaProducer,
 ) -> None:
+    async def _sleep_backoff(attempt: int) -> int:
+        # exp backoff c капом
+        delay = min(INDEX_RETRY_MAX_SEC, INDEX_RETRY_BASE_SEC * (2 ** (attempt - 1)))
+        await asyncio.sleep(delay)
+        return delay
+
     try:
-        await prod.send_and_wait(TOPIC_INDEXER_STATUS, {"source": "indexer", "version": SERVICE_VERSION, "task_id": task_id, "status": "running", "ts": _now_ts(), "trigger": trigger})
-        logger.info("running", extra={"event": "running", "task_id": task_id, "trigger": trigger, "counts": {"max_pages": max_pages}})
+        await prod.send_and_wait(
+            TOPIC_INDEXER_STATUS,
+            {
+                "source": "indexer",
+                "version": SERVICE_VERSION,
+                "task_id": task_id,
+                "status": "running",
+                "ts": _now_ts(),
+                "trigger": trigger,
+            },
+        )
+        logger.info(
+            "running",
+            extra={
+                "event": "running",
+                "task_id": task_id,
+                "trigger": trigger,
+                "counts": {"max_pages": max_pages},
+            },
+        )
 
         now_ts = _now_ts()
         scraped = failed = page_no = inserted = updated = 0
 
-        try:
-            async for batch in indexer.iter_products(
-                query=query,
-                category=category,
-                start_page=1,
-                max_pages=max_pages,
-                headless=True,
-            ):
-                page_no += 1
-                batch_skus: List[str] = []
-                batch_ins = batch_upd = batch_fail = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async for batch in indexer.iter_products(
+                    query=query,
+                    category=category,
+                    start_page=1,
+                    max_pages=max_pages,
+                    headless=True,
+                ):
+                    page_no += 1
+                    batch_skus: List[str] = []
+                    batch_ins = batch_upd = batch_fail = 0
 
-                for p in batch:
-                    sku = str(p.get("sku") or "")
-                    if not sku:
-                        continue
-                    try:
-                        res = await db.index.update_one(
-                            {"sku": sku},
-                            {
-                                "$set": {
-                                    "last_seen_at": now_ts,
-                                    "is_active": True,
-                                    "task_id": task_id,
+                    for p in batch:
+                        sku = str(p.get("sku") or "")
+                        if not sku:
+                            continue
+                        try:
+                            res = await db.index.update_one(
+                                {"sku": sku},
+                                {
+                                    "$set": {
+                                        "last_seen_at": now_ts,
+                                        "is_active": True,
+                                        "task_id": task_id,
+                                    },
+                                    "$setOnInsert": {
+                                        "first_seen_at": now_ts,
+                                        "candidate_id": None,
+                                        "sku": sku,
+                                        "status": "indexed_auto",
+                                    },
                                 },
-                                "$setOnInsert": {
-                                    "first_seen_at": now_ts,
-                                    "candidate_id": None,
-                                    "sku": sku,
-                                    "status": "indexed_auto",
-                                },
+                                upsert=True,
+                            )
+                            is_insert = res.upserted_id is not None
+                            inserted += int(is_insert)
+                            updated += int(not is_insert)
+                            scraped += 1
+                            batch_skus.append(sku)
+                            batch_ins += int(is_insert)
+                            batch_upd += int(not is_insert)
+                        except Exception:
+                            failed += 1
+                            batch_fail += 1
+                            logger.error(
+                                "index upsert failed",
+                                extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku},
+                            )
+
+                    await prod.send_and_wait(
+                        TOPIC_INDEXER_STATUS,
+                        {
+                            "source": "indexer",
+                            "version": SERVICE_VERSION,
+                            "task_id": task_id,
+                            "status": "ok",
+                            "batch_id": page_no,
+                            "ts": _now_ts(),
+                            "trigger": trigger,
+                            "batch_data": {
+                                "batch_id": page_no,
+                                "pages": 1,
+                                "skus": batch_skus,
+                                "inserted": batch_ins,
+                                "updated": batch_upd,
+                                "failed": batch_fail,
                             },
-                            upsert=True,
-                        )
-                        is_insert = res.upserted_id is not None
-                        inserted += int(is_insert)
-                        updated  += int(not is_insert)
-                        scraped += 1
-                        batch_skus.append(sku)
-                        batch_ins += int(is_insert)
-                        batch_upd += int(not is_insert)
-                    except Exception:
-                        failed += 1
-                        batch_fail += 1
-                        logger.error("index upsert failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
+                            "scraped_products": scraped,
+                            "failed_products": failed,
+                            "inserted_products": inserted,
+                            "updated_products": updated,
+                        },
+                    )
+                    logger.info(
+                        "page done",
+                        extra={
+                            "event": "batch_ok",
+                            "task_id": task_id,
+                            "batch_id": page_no,
+                            "counts": {"inserted": batch_ins, "updated": batch_upd, "failed": batch_fail},
+                        },
+                    )
 
+                # если итерация прошла без CircuitOpen — завершаем
+                break
+
+            except CircuitOpen as co:
+                # ретраи внутри воркера, без участия координатора и БД
+                if attempt >= INDEX_RETRY_MAX:
+                    err = f"circuit_open_retry_exhausted: {co}"
+                    await prod.send_and_wait(
+                        TOPIC_INDEXER_STATUS,
+                        {
+                            "source": "indexer",
+                            "version": SERVICE_VERSION,
+                            "task_id": task_id,
+                            "status": "failed",
+                            "error": err,
+                            "error_message": err,
+                            "reason_code": "circuit_open_retry_exhausted",
+                            "ts": _now_ts(),
+                            "trigger": trigger,
+                        },
+                    )
+                    logger.error("indexer failed after retries", extra={"event": "failed", "task_id": task_id, "reason_code": "circuit_open_retry_exhausted"})
+                    return
+                # информируем, что будет повтор
+                delay = min(INDEX_RETRY_MAX_SEC, INDEX_RETRY_BASE_SEC * (2 ** (attempt - 1)))
                 await prod.send_and_wait(
                     TOPIC_INDEXER_STATUS,
                     {
                         "source": "indexer",
                         "version": SERVICE_VERSION,
                         "task_id": task_id,
-                        "status": "ok",
-                        "batch_id": page_no,
+                        "status": "retrying",
+                        "attempt": attempt,
+                        "next_retry_in_sec": delay,
                         "ts": _now_ts(),
                         "trigger": trigger,
-                        "batch_data": {
-                            "batch_id": page_no,
-                            "pages": 1,
-                            "skus": batch_skus,
-                            "inserted": batch_ins,
-                            "updated": batch_upd,
-                            "failed": batch_fail,
-                        },
-                        "scraped_products": scraped,
-                        "failed_products": failed,
-                        "inserted_products": inserted,
-                        "updated_products": updated,
                     },
                 )
-                logger.info("page done", extra={"event": "batch_ok", "task_id": task_id, "batch_id": page_no, "counts": {"inserted": batch_ins, "updated": batch_upd, "failed": batch_fail}})
-
-        except CircuitOpen as co:
-            next_retry_at = getattr(co, "next_retry_at", _now_ts() + 600)
-            await prod.send_and_wait(
-                TOPIC_INDEXER_STATUS,
-                {
-                    "source": "indexer",
-                    "version": SERVICE_VERSION,
-                    "task_id": task_id,
-                    "status": "deferred",
-                    "reason": str(co),
-                    "reason_code": "circuit_open",
-                    "next_retry_at": next_retry_at,
-                    "scraped_products": scraped,
-                    "failed_products": failed,
-                    "inserted_products": inserted,
-                    "updated_products": updated,
-                    "ts": _now_ts(),
-                    "trigger": trigger,
-                },
-            )
-            logger.warning("deferred", extra={"event": "deferred", "task_id": task_id, "reason_code": "circuit_open", "next_retry_at": next_retry_at})
-            return
+                logger.warning(
+                    "retrying due to circuit open",
+                    extra={"event": "retrying", "task_id": task_id, "attempt": attempt, "delay_sec": delay},
+                )
+                await asyncio.sleep(delay)
+                continue
 
         total = scraped + failed
         await prod.send_and_wait(
@@ -232,12 +296,25 @@ async def _handle_search(
                 "trigger": trigger,
             },
         )
-        logger.info("task done", extra={"event": "task_done", "task_id": task_id, "counts": {"total": total, "failed": failed}})
+        logger.info(
+            "task done",
+            extra={"event": "task_done", "task_id": task_id, "counts": {"total": total, "failed": failed}},
+        )
 
     except Exception as e:
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
-            {"source": "indexer", "version": SERVICE_VERSION, "task_id": task_id, "status": "failed", "error": str(e), "error_message": str(e), "reason_code": "unexpected_error", "ts": _now_ts(), "trigger": trigger},
+            {
+                "source": "indexer",
+                "version": SERVICE_VERSION,
+                "task_id": task_id,
+                "status": "failed",
+                "error": str(e),
+                "error_message": str(e),
+                "reason_code": "unexpected_error",
+                "ts": _now_ts(),
+                "trigger": trigger,
+            },
         )
         logger.exception("task failed", extra={"event": "failed", "task_id": task_id, "reason_code": "unexpected_error"})
 
