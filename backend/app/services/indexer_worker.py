@@ -257,7 +257,7 @@ async def _handle_add_collection_members(
         if not skus:
             await _send_status(
                 prod,
-                {"task_id": task_id, "status": "ok", "batch_id": batch_id, "trigger": trigger, "batch_data": {"batch_id": batch_id, "pages": 0, "skus": [], "inserted": 0, "updated": 0}},
+                {"task_id": task_id, "status": "ok", "batch_id": batch_id, "trigger": trigger, "batch_data": {"batch_id": batch_id, "pages": 0, "skus": [], "inserted": 0, "updated": 0, "new_skus": []}},
             )
             logger.info("collections batch empty", extra={"event": "collections_empty", "task_id": task_id, "batch_id": batch_id})
             return
@@ -265,6 +265,7 @@ async def _handle_add_collection_members(
         now_ts = _now_ts()
         inserted = 0
         updated = 0
+        new_skus: List[str] = []
 
         coll_map = await _map_sku_to_collection_hashes(task_id=task_id, skus=skus)
 
@@ -283,6 +284,8 @@ async def _handle_add_collection_members(
                 is_insert = res.upserted_id is not None
                 inserted += int(is_insert)
                 updated += int(not is_insert)
+                if is_insert:
+                    new_skus.append(sku)
             except Exception:
                 logger.error("index upsert (collections) failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
 
@@ -293,12 +296,12 @@ async def _handle_add_collection_members(
                 "status": "ok",
                 "batch_id": batch_id,
                 "trigger": trigger,
-                "batch_data": {"batch_id": batch_id, "pages": 0, "skus": skus, "inserted": inserted, "updated": updated},
+                "batch_data": {"batch_id": batch_id, "pages": 0, "skus": skus, "inserted": inserted, "updated": updated, "new_skus": new_skus},
             },
         )
         logger.info(
             "collections batch done",
-            extra={"event": "collections_ok", "task_id": task_id, "batch_id": batch_id, "counts": {"inserted": inserted, "updated": updated}},
+            extra={"event": "collections_ok", "task_id": task_id, "batch_id": batch_id, "counts": {"inserted": inserted, "updated": updated, "new_skus": len(new_skus)}},
         )
     except Exception as e:
         await _send_status(

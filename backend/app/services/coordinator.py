@@ -58,6 +58,35 @@ def _stable_hash(s: str) -> str:
 def _sleep_ms(ms: int) -> asyncio.Future:
     return asyncio.sleep(max(0, ms) / 1000.0)
 
+def _build_task_result(stats_doc: Dict[str, Any], finished_at: datetime) -> Dict[str, Any]:
+    stats = (stats_doc or {}).get("stats", {}) or {}
+    started_at = (stats_doc or {}).get("started_at")
+    duration_sec = None
+    if started_at:
+        try:
+            duration_sec = int((finished_at - started_at).total_seconds())
+        except Exception:
+            pass
+    return {
+        "indexer": {
+            "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
+            "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
+            "updated": int(((stats.get("index") or {}).get("updated")) or 0),
+            "pages": int(((stats.get("index") or {}).get("pages")) or 0),
+        },
+        "enricher": {
+            "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
+            "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
+            "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
+            "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
+            "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+        },
+        "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
+        "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
+        "duration_total_sec": duration_sec,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
 
 # ========= generic helpers =========
 
@@ -177,6 +206,8 @@ def build_collection_hash(item: Dict[str, Any]) -> str:
     return _stable_hash(sig)
 
 def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
+    # Store datetime for timestamps (Mongo TTL & analytics friendly)
+    now = _now_dt()
     return {
         "task_id": task_id,
         "status": "queued",
@@ -186,8 +217,8 @@ def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         "aspect_name": item.get("aspect_name"),
         "collection_hash": build_collection_hash(item),
         "skus": [{"sku": s, "status": "queued"} for s in item["skus"]],
-        "created_at": _now_ts(),
-        "updated_at": _now_ts(),
+        "created_at": now,
+        "updated_at": now,
     }
 
 def build_processing_order(grouped: Dict[str, List[Dict[str, Any]]]) -> List[str]:
@@ -203,7 +234,7 @@ def build_processing_order(grouped: Dict[str, List[Dict[str, Any]]]) -> List[str
 
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
     created_count = 0
-    now = _now_ts()
+    now = _now_dt()
     for bucket in ("collections", "aspects", "other_offers"):
         for item in grouped.get(bucket, []):
             doc = to_collection_doc(item, task_id)
@@ -264,7 +295,8 @@ def _dedup_key(worker: str, payload: Dict[str, Any]) -> str:
 
 async def record_worker_event(task_id: str, worker: str, payload: Dict[str, Any]) -> str:
     ev_hash = _dedup_key(worker, payload)
-    ts = int(payload.get("ts") or _now_ts())
+    ts_int = int(payload.get("ts") or _now_ts())
+    ts_dt = datetime.utcfromtimestamp(ts_int)
     await db.worker_events.update_one(
         {"task_id": task_id, "worker": worker, "event_hash": ev_hash},
         {
@@ -274,14 +306,16 @@ async def record_worker_event(task_id: str, worker: str, payload: Dict[str, Any]
                 "event_hash": ev_hash,
                 "payload": payload,
                 "metrics_applied": False,
-                "ts": ts,
+                # Keep both: int ts comes from workers; ts_dt enables TTL.
+                "ts": ts_int,
+                "ts_dt": ts_dt,
             }
         },
         upsert=True,
     )
     await db.scraping_tasks.update_one(
         {"id": task_id},
-        {"$max": {"last_event_ts": ts}, "$currentDate": {"updated_at": True}},
+        {"$max": {"last_event_ts": ts_int}, "$currentDate": {"updated_at": True}},
     )
     return ev_hash
 
@@ -294,6 +328,7 @@ async def acquire_event_for_metrics(task_id: str, worker: str, ev_hash: str) -> 
     return res is not None
 
 async def mark_forwarded_once(task_id: str, worker: str, batch_id: int | str) -> bool:
+    # 'ts' as datetime (Mongo TTL works only with date types)
     res = await db.worker_progress.update_one(
         {"task_id": task_id, "worker": worker, "batch_id": str(batch_id)},
         {
@@ -301,7 +336,7 @@ async def mark_forwarded_once(task_id: str, worker: str, batch_id: int | str) ->
                 "task_id": task_id,
                 "worker": worker,
                 "batch_id": str(batch_id),
-                "ts": _now_ts(),
+                "ts": _now_dt(),
             }
         },
         upsert=True,
@@ -482,12 +517,14 @@ class Coordinator:
                         logger.info("indexer running", extra={"event": "running", "task_id": task_id})
 
                     if st.get("status") == "ok":
-                        skus = list((st.get("batch_data") or {}).get("skus", []) or [])
+                        bd = st.get("batch_data") or {}
+                        # Prefer 'new_skus' when present (avoids re-enrichment).
+                        to_forward = list(bd.get("new_skus") or bd.get("skus") or [])
                         batch_id = st.get("batch_id")
 
-                        if skus and batch_id is not None:
+                        if to_forward and batch_id is not None:
                             if await mark_forwarded_once(task_id, "indexer->enricher", batch_id):
-                                for chunk in chunked(skus, ENRICHER_BATCH_SIZE):
+                                for chunk in chunked(to_forward, ENRICHER_BATCH_SIZE):
                                     await prod_enr.send_and_wait(
                                         TOPIC_ENRICHER_CMD,
                                         {
@@ -505,9 +542,9 @@ class Coordinator:
                                         await _sleep_ms(FORWARD_THROTTLE_DELAY_MS)
 
                         if await acquire_event_for_metrics(task_id, "indexer", ev_hash):
-                            bd = st.get("batch_data") or {}
                             ins = int(bd.get("inserted", 0))
-                            upd = int(bd.get("updated", 0))
+                            # Indexer now reports 'matched' (not 'updated'); keep backward compat.
+                            upd = int(bd.get("updated", bd.get("matched", 0)))
                             pgs = int(bd.get("pages", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
@@ -546,7 +583,7 @@ class Coordinator:
                             {
                                 "error_message": err,
                                 "workers.indexer.last_error": err,
-                                "workers.indexer.last_error_at": _now_ts(),
+                                "workers.indexer.last_error_at": _now_dt(),
                                 "workers.indexer.finished_at": _now_dt(),
                             },
                         )
@@ -614,7 +651,7 @@ class Coordinator:
                             {
                                 "error_message": err,
                                 "workers.enricher.last_error": err,
-                                "workers.enricher.last_error_at": _now_ts(),
+                                "workers.enricher.last_error_at": _now_dt(),
                                 "workers.enricher.finished_at": _now_dt(),
                             },
                         )
@@ -638,40 +675,8 @@ class Coordinator:
         await push_status(task_id, final_status)
 
         stats_doc = await db.scraping_tasks.find_one({"id": task_id}, {"stats": 1, "started_at": 1})
-        stats = (stats_doc or {}).get("stats", {}) or {}
-        started_at = (stats_doc or {}).get("started_at")
-        duration_sec = None
-        if started_at:
-            try:
-                duration_sec = int((finished_at - started_at).total_seconds())  # type: ignore[operator]
-            except Exception:
-                pass
-
-        result = {
-            "indexer": {
-                "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
-                "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
-                "updated": int(((stats.get("index") or {}).get("updated")) or 0),
-                "pages": int(((stats.get("index") or {}).get("pages")) or 0),
-            },
-            "enricher": {
-                "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
-                "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
-                "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
-                "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-                "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
-            },
-            "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
-            "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
-            "duration_total_sec": duration_sec,
-            "started_at": started_at,
-            "finished_at": finished_at,
-        }
-
-        await db.scraping_tasks.update_one(
-            {"id": task_id},
-            {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
-        )
+        result = _build_task_result(stats_doc, finished_at)
+        await db.scraping_tasks.update_one({"id": task_id}, {"$set": {"result": result}, "$currentDate": {"updated_at": True}})
 
         logger.info("task finalized", extra={"event": "final", "task_id": task_id, "status": final_status})
 
@@ -683,8 +688,8 @@ class Coordinator:
     async def _heartbeat_monitor(self) -> None:
         try:
             while True:
-                now = _now_ts()
-                deadline = now - HEARTBEAT_DEADLINE_SEC
+                now_ts = _now_ts()
+                deadline = now_ts - HEARTBEAT_DEADLINE_SEC
                 cur = db.scraping_tasks.find(
                     {"status": TaskStatus.running, "last_event_ts": {"$lt": deadline}},
                     {"id": 1, "last_event_ts": 1},
@@ -699,8 +704,8 @@ class Coordinator:
                             "workers.enricher.status": "stalled",
                             "workers.indexer.last_error": "inactivity_timeout",
                             "workers.enricher.last_error": "inactivity_timeout",
-                            "workers.indexer.last_error_at": now,
-                            "workers.enricher.last_error_at": now,
+                            "workers.indexer.last_error_at": _now_dt(),
+                            "workers.enricher.last_error_at": _now_dt(),
                         },
                     )
                     await push_status(task_id, TaskStatus.failed, reason="inactivity_timeout")
@@ -780,10 +785,13 @@ class Coordinator:
                     {"$inc": {"stats.forwarded.from_collections": len(all_skus)}, "$currentDate": {"updated_at": True}},
                 )
 
-            await self._send_indexer_and_wait(new_task_id, all_skus)
+            # 1) Indexer upserts collection SKUs and returns 'new_skus' per batch.
+            new_skus = await self._send_indexer_and_wait(new_task_id, all_skus)
+
             await patch_task(new_task_id, {"workers.indexer.status": "task_done"})
 
-            await self._send_enricher_and_wait(new_task_id, all_skus)
+            # 2) Enrich ONLY new_skus to avoid re-enrichment.
+            await self._send_enricher_and_wait(new_task_id, new_skus)
             await patch_task(new_task_id, {"workers.enricher.status": "task_done"})
 
             await db.collections.update_many(
@@ -796,38 +804,9 @@ class Coordinator:
             await push_status(new_task_id, TaskStatus.finished)
 
             stats_doc = await db.scraping_tasks.find_one({"id": new_task_id}, {"stats": 1, "started_at": 1})
-            stats = (stats_doc or {}).get("stats", {}) or {}
-            started_at = (stats_doc or {}).get("started_at")
-            duration_sec = None
-            if started_at:
-                try:
-                    duration_sec = int((finished_at - started_at).total_seconds())  # type: ignore[operator]
-                except Exception:
-                    pass
-            result = {
-                "indexer": {
-                    "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
-                    "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
-                    "updated": int(((stats.get("index") or {}).get("updated")) or 0),
-                    "pages": int(((stats.get("index") or {}).get("pages")) or 0),
-                },
-                "enricher": {
-                    "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
-                    "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
-                    "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
-                    "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-                    "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
-                },
-                "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
-                "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
-                "duration_total_sec": duration_sec,
-                "started_at": started_at,
-                "finished_at": finished_at,
-            }
-            await db.scraping_tasks.update_one(
-                {"id": new_task_id},
-                {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
-            )
+            result = _build_task_result(stats_doc, finished_at)
+            await db.scraping_tasks.update_one({"id": new_task_id}, {"$set": {"result": result}, "$currentDate": {"updated_at": True}})
+
         except Exception as e:
             logger.exception("collections follow-up failed", extra={"event": "failed", "task_id": new_task_id})
             await patch_task(new_task_id, {"error_message": str(e)})
@@ -852,9 +831,12 @@ class Coordinator:
 
         try:
             if ((doc or {}).get("workers", {}).get("indexer") or {}).get("status") != "task_done":
-                await self._send_indexer_and_wait(task_id, all_skus)
+                new_skus = await self._send_indexer_and_wait(task_id, all_skus)
+            else:
+                new_skus = []
+
             if ((doc or {}).get("workers", {}).get("enricher") or {}).get("status") != "task_done":
-                await self._send_enricher_and_wait(task_id, all_skus)
+                await self._send_enricher_and_wait(task_id, new_skus)
         except TimeoutError as e:
             await patch_task(task_id, {
                 "status": TaskStatus.deferred,
@@ -882,38 +864,8 @@ class Coordinator:
         await push_status(task_id, TaskStatus.finished)
 
         stats_doc = await db.scraping_tasks.find_one({"id": task_id}, {"stats": 1, "started_at": 1})
-        stats = (stats_doc or {}).get("stats", {}) or {}
-        started_at = (stats_doc or {}).get("started_at")
-        duration_sec = None
-        if started_at:
-            try:
-                duration_sec = int((finished_at - started_at).total_seconds())
-            except Exception:
-                pass
-        result = {
-            "indexer": {
-                "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
-                "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
-                "updated": int(((stats.get("index") or {}).get("updated")) or 0),
-                "pages": int(((stats.get("index") or {}).get("pages")) or 0),
-            },
-            "enricher": {
-                "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
-                "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
-                "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
-                "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-                "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
-            },
-            "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
-            "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
-            "duration_total_sec": duration_sec,
-            "started_at": started_at,
-            "finished_at": finished_at,
-        }
-        await db.scraping_tasks.update_one(
-            {"id": task_id},
-            {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
-        )
+        result = _build_task_result(stats_doc, finished_at)
+        await db.scraping_tasks.update_one({"id": task_id}, {"$set": {"result": result}, "$currentDate": {"updated_at": True}})
 
     # ----- blocking waits for collections follow-up -----
 
@@ -925,9 +877,16 @@ class Coordinator:
         worker: str,
         timeout_sec: int,
         expected_batches: Optional[int] = None,
-    ) -> None:
+        collect_new_index_skus: bool = False,
+    ) -> List[str]:
+        """
+        Waits for batches from a given worker. When 'collect_new_index_skus' is True and worker='indexer',
+        aggregates 'new_skus' across batches and returns a unique, normalized list.
+        """
         last_progress = time.time()
         done_batches: set[int] = set()
+        new_skus_acc: List[str] = []
+
         while True:
             remaining = timeout_sec - (time.time() - last_progress)
             if remaining <= 0:
@@ -945,11 +904,11 @@ class Coordinator:
                 )
 
                 if st.get("status") == "ok":
+                    bd = st.get("batch_data") or {}
                     if await acquire_event_for_metrics(task_id, worker, ev_hash):
-                        bd = st.get("batch_data") or {}
                         if worker == "indexer":
                             ins = int(bd.get("inserted", 0))
-                            upd = int(bd.get("updated", 0))
+                            upd = int(bd.get("updated", bd.get("matched", 0)))
                             pgs = int(bd.get("pages", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
@@ -960,6 +919,10 @@ class Coordinator:
                                     "stats.index.pages": pgs,
                                 }, "$currentDate": {"updated_at": True}},
                             )
+                            if collect_new_index_skus:
+                                ns = _normalize_skus(bd.get("new_skus") or [])
+                                if ns:
+                                    new_skus_acc.extend(ns)
                         elif worker == "enricher":
                             inc = {
                                 "stats.enrich.processed": int(bd.get("processed", 0)),
@@ -983,9 +946,18 @@ class Coordinator:
             finally:
                 await status_consumer.commit()
 
-    async def _send_indexer_and_wait(self, task_id: str, skus: List[str], *, batch_size: int = 200, timeout_sec: int = 600) -> None:
+        # Return unique normalized list (only relevant when collect_new_index_skus).
+        if collect_new_index_skus:
+            return _normalize_skus(new_skus_acc)
+        return []
+
+    async def _send_indexer_and_wait(self, task_id: str, skus: List[str], *, batch_size: int = 200, timeout_sec: int = 600) -> List[str]:
+        """
+        Sends 'add_collection_members' to the indexer and waits for all batches.
+        Returns the union of 'new_skus' reported by the indexer across batches.
+        """
         if not skus:
-            return
+            return []
         cons = new_consumer(TOPIC_INDEXER_STATUS, self._stable_group("idx-col", task_id), offset="latest", manual_commit=True)
         await cons.start()
         prod = await new_producer()
@@ -997,13 +969,15 @@ class Coordinator:
                     {"cmd": "add_collection_members", "task_id": task_id, "batch_id": b_id, "skus": batch, "trigger": "collections_followup"},
                 )
                 batch_ids.append(b_id)
-            await self._wait_for_batches(
+            new_skus = await self._wait_for_batches(
                 task_id=task_id,
                 status_consumer=cons,
                 worker="indexer",
                 timeout_sec=timeout_sec,
                 expected_batches=len(batch_ids),
+                collect_new_index_skus=True,
             )
+            return new_skus
         finally:
             await cons.stop()
             await prod.stop()
@@ -1025,8 +999,8 @@ class Coordinator:
                             "batch_id": b_id,
                             "skus": batch,
                             "status": "in_progress",
-                            "created_at": _now_ts(),
-                            "updated_at": _now_ts(),
+                            "created_at": _now_dt(),
+                            "updated_at": _now_dt(),
                             "source": "collections_followup",
                         }
                     },
@@ -1065,13 +1039,17 @@ class Coordinator:
                 unique=True,
                 name="uniq_worker_event",
             )
-            await db.worker_events.create_index([("ts", 1)], expireAfterSeconds=14 * 24 * 3600, name="ttl_worker_events")
+            # TTL must be on a date field -> use 'ts_dt'
+            await db.worker_events.create_index([("ts_dt", 1)], expireAfterSeconds=14 * 24 * 3600, name="ttl_worker_events")
+
             await db.worker_progress.create_index(
                 [("task_id", 1), ("worker", 1), ("batch_id", 1)],
                 unique=True,
                 name="uniq_worker_progress",
             )
+            # 'ts' in worker_progress is datetime now
             await db.worker_progress.create_index([("ts", 1)], expireAfterSeconds=60 * 24 * 3600, name="ttl_worker_progress")
+
             await db.enrich_batches.create_index(
                 [("task_id", 1), ("batch_id", 1)],
                 unique=True,
