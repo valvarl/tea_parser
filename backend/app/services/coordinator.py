@@ -628,6 +628,10 @@ class Coordinator:
                         )
 
                     if st.get("status") == "task_done" and st.get("done") is True:
+                        await patch_task(task_id, {
+                            "workers.indexer.status": "task_done",
+                            "workers.indexer.finished_at": _now_dt()
+                        })
                         await prod_enr.send_and_wait(
                             TOPIC_ENRICHER_CMD, {"cmd": "enrich_skus", "task_id": task_id, "trigger": "finalize_from_indexer"}
                         )
@@ -714,7 +718,10 @@ class Coordinator:
                         )
 
                     if st.get("status") == "task_done" and st.get("done") is True:
-                        await patch_task(task_id, {"workers.enricher.finished_at": _now_dt()})
+                        await patch_task(task_id, {
+                            "workers.enricher.status": "task_done",
+                            "workers.enricher.finished_at": _now_dt()
+                        })
                         logger.info("enricher done", extra={"event": "task_done", "task_id": task_id})
                         enr_done = True
                         await c_enr.commit()
@@ -939,15 +946,21 @@ class Coordinator:
         *,
         task_id: str,
         status_consumer: AIOKafkaConsumer,
-        worker: str,
+        worker: str,  # "indexer" | "enricher"
         timeout_sec: int,
-        expected_batches: Optional[int] = None,
+        expected_batches: Optional[int] = None,  # telemetry only
         collect_new_index_skus: bool = False,
         update_collections_per_batch: bool = True,
     ) -> List[str]:
-        """
-        Waits for batches from a given worker. When 'collect_new_index_skus' is True and worker='indexer',
-        aggregates 'new_skus' across batches and returns a unique, normalized list.
+        """Consume status events until we see explicit task_done for this task/worker.
+
+        - On each 'ok':
+            * apply metrics once (via acquire_event_for_metrics),
+            * (indexer) collect 'new_skus' if requested,
+            * (enricher) update collection_members statuses (processed / dlq) for the SKUs of the batch.
+        - On 'running' (including heartbeats) just refresh the inactivity timer.
+        - On 'failed' raise RuntimeError to abort the follow-up.
+        - Returns a normalized list of 'new_skus' (only for indexer-mode when collect_new_index_skus=True).
         """
         last_progress = time.time()
         done_batches: set[int] = set()
@@ -956,12 +969,14 @@ class Coordinator:
         while True:
             remaining = timeout_sec - (time.time() - last_progress)
             if remaining <= 0:
-                raise TimeoutError(f"{worker} wait inactivity timeout; done={len(done_batches)}")
+                raise TimeoutError(f"{worker} wait inactivity timeout; batches_done={len(done_batches)} of {expected_batches or 0}")
+
             msg = await asyncio.wait_for(status_consumer.getone(), timeout=remaining)
-            st = msg.value or {}
+            st: Dict[str, Any] = msg.value or {}
             try:
                 if st.get("task_id") != task_id:
                     continue
+
                 ev_hash = await record_worker_event(task_id, worker, st)
                 ts = int(st.get("ts") or _now_ts())
                 await db.scraping_tasks.update_one(
@@ -969,8 +984,15 @@ class Coordinator:
                     {"$max": {"last_event_ts": ts}, "$currentDate": {"updated_at": True}},
                 )
 
-                if st.get("status") == "ok":
+                status = (st.get("status") or "").lower()
+
+                if status == "running":
+                    # Heartbeat / start — keep the timer fresh
+                    last_progress = time.time()
+
+                elif status == "ok":
                     bd = st.get("batch_data") or {}
+                    # Apply metrics once
                     if await acquire_event_for_metrics(task_id, worker, ev_hash):
                         if worker == "indexer":
                             ins = int(bd.get("inserted", 0))
@@ -978,12 +1000,15 @@ class Coordinator:
                             pgs = int(bd.get("pages", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
-                                {"$inc": {
-                                    "stats.index.indexed": ins + upd,
-                                    "stats.index.inserted": ins,
-                                    "stats.index.updated": upd,
-                                    "stats.index.pages": pgs,
-                                }, "$currentDate": {"updated_at": True}},
+                                {
+                                    "$inc": {
+                                        "stats.index.indexed": ins + upd,
+                                        "stats.index.inserted": ins,
+                                        "stats.index.updated": upd,
+                                        "stats.index.pages": pgs,
+                                    },
+                                    "$currentDate": {"updated_at": True},
+                                },
                             )
                             if collect_new_index_skus:
                                 ns = _normalize_skus(bd.get("new_skus") or [])
@@ -1001,6 +1026,7 @@ class Coordinator:
                                 inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
                             await db.scraping_tasks.update_one({"id": task_id}, {"$inc": inc, "$currentDate": {"updated_at": True}})
 
+                    # Per-batch collections update (only for enricher)
                     if worker == "enricher" and update_collections_per_batch:
                         processed_skus = [str(s).strip() for s in (bd.get("skus") or []) if str(s).strip()]
                         dlq_skus: List[str] = []
@@ -1008,7 +1034,7 @@ class Coordinator:
                         if b_id is not None:
                             dlq_docs = await db.enrich_dlq.find(
                                 {"task_id": task_id, "batch_id": int(b_id)},
-                                {"sku": 1, "_id": 0}
+                                {"sku": 1, "_id": 0},
                             ).to_list(None)
                             dlq_skus = [str(d.get("sku")).strip() for d in dlq_docs if d.get("sku")]
 
@@ -1018,35 +1044,73 @@ class Coordinator:
                             dlq_skus=dlq_skus,
                         )
 
-                if st.get("status") == "ok" and st.get("batch_id"):
-                    done_batches.add(int(st["batch_id"]))
+                    # Telemetry about batches — does NOT end the wait loop
+                    if st.get("batch_id") is not None:
+                        done_batches.add(int(st["batch_id"]))
                     last_progress = time.time()
-                    if expected_batches is not None and len(done_batches) >= expected_batches:
-                        break
 
-                if st.get("status") == "task_done" and st.get("done") is True:
+                elif status == "failed":
+                    reason = st.get("reason_code") or "unexpected_error"
+                    err = st.get("error") or st.get("error_message") or reason
+                    raise RuntimeError(f"{worker} reported failure: {reason}: {err}")
+
+                elif status == "task_done" and st.get("done") is True:
+                    # explicit finalization point
+                    last_progress = time.time()
                     break
+
+                # other statuses are ignored but keep consuming
             finally:
                 await status_consumer.commit()
 
-        if collect_new_index_skus:
-            return _normalize_skus(new_skus_acc)
-        return []
+        return _normalize_skus(new_skus_acc) if collect_new_index_skus else []
 
-    async def _send_indexer_and_wait(self, task_id: str, skus: List[str], *, batch_size: int = 200, timeout_sec: int = 600) -> List[str]:
-        if not skus:
-            return []
-        cons = new_consumer(TOPIC_INDEXER_STATUS, self._stable_group("idx-col", task_id), offset="latest", manual_commit=True)
+    async def _send_indexer_and_wait(
+        self,
+        task_id: str,
+        skus: List[str],
+        *,
+        batch_size: int = 200,
+        timeout_sec: int = 600,
+    ) -> List[str]:
+        """Send add_collection_members batches to indexer and wait for the final task_done.
+        Returns unique normalized list of 'new_skus' reported by indexer."""
+        cons = new_consumer(
+            TOPIC_INDEXER_STATUS,
+            self._stable_group("idx-col", task_id),
+            offset="latest",
+            manual_commit=True,
+        )
         await cons.start()
         prod = await new_producer()
         try:
-            batch_ids = []
+            batch_ids: List[int] = []
+            # Send data batches (if any)
             for b_id, batch in enumerate(batched(skus, batch_size), start=1):
                 await prod.send_and_wait(
                     TOPIC_INDEXER_CMD,
-                    {"cmd": "add_collection_members", "task_id": task_id, "batch_id": b_id, "skus": batch, "trigger": "collections_followup"},
+                    {
+                        "cmd": "add_collection_members",
+                        "task_id": task_id,
+                        "batch_id": b_id,
+                        "skus": batch,
+                        "trigger": "collections_followup",
+                    },
                 )
                 batch_ids.append(b_id)
+
+            # Explicit finalize → indexer must respond with task_done
+            await prod.send_and_wait(
+                TOPIC_INDEXER_CMD,
+                {
+                    "cmd": "add_collection_members",
+                    "task_id": task_id,
+                    "trigger": "collections_followup_finalize",
+                    "skus": [],  # sentinel
+                },
+            )
+
+            # Wait for task_done; also aggregate new_skus from 'ok' events
             new_skus = await self._wait_for_batches(
                 task_id=task_id,
                 status_consumer=cons,
@@ -1054,20 +1118,34 @@ class Coordinator:
                 timeout_sec=timeout_sec,
                 expected_batches=len(batch_ids),
                 collect_new_index_skus=True,
+                update_collections_per_batch=False,
             )
             return new_skus
         finally:
             await cons.stop()
             await prod.stop()
 
-    async def _send_enricher_and_wait(self, task_id: str, skus: List[str], *, batch_size: int = 100, timeout_sec: int = 900) -> None:
-        if not skus:
-            return
-        cons = new_consumer(TOPIC_ENRICHER_STATUS, self._stable_group("enr-col", task_id), offset="latest", manual_commit=True)
+    async def _send_enricher_and_wait(
+        self,
+        task_id: str,
+        skus: List[str],
+        *,
+        batch_size: int = 100,
+        timeout_sec: int = 900,
+    ) -> None:
+        """Send enrich_skus batches to enricher and wait for final task_done.
+        While waiting, per 'ok' batch updates collection_members and finalizes collections when ready."""
+        cons = new_consumer(
+            TOPIC_ENRICHER_STATUS,
+            self._stable_group("enr-col", task_id),
+            offset="latest",
+            manual_commit=True,
+        )
         await cons.start()
         prod = await new_producer()
         try:
-            batch_ids = []
+            batch_ids: List[int] = []
+            # Send data batches (if any)
             for b_id, batch in enumerate(batched(skus, batch_size), start=1):
                 await db.enrich_batches.update_one(
                     {"task_id": task_id, "batch_id": b_id},
@@ -1086,7 +1164,13 @@ class Coordinator:
                 )
                 await prod.send_and_wait(
                     TOPIC_ENRICHER_CMD,
-                    {"cmd": "enrich_skus", "task_id": task_id, "batch_id": b_id, "skus": batch, "trigger": "collections_followup"},
+                    {
+                        "cmd": "enrich_skus",
+                        "task_id": task_id,
+                        "batch_id": b_id,
+                        "skus": batch,
+                        "trigger": "collections_followup",
+                    },
                 )
                 await db.scraping_tasks.update_one(
                     {"id": task_id},
@@ -1094,12 +1178,25 @@ class Coordinator:
                 )
                 batch_ids.append(b_id)
 
+            # Explicit finalize → enricher must respond with task_done
+            await prod.send_and_wait(
+                TOPIC_ENRICHER_CMD,
+                {
+                    "cmd": "enrich_skus",
+                    "task_id": task_id,
+                    "trigger": "collections_followup_finalize",
+                },
+            )
+
+            # Wait for task_done; on each 'ok' batch update collection members
             await self._wait_for_batches(
                 task_id=task_id,
                 status_consumer=cons,
                 worker="enricher",
                 timeout_sec=timeout_sec,
                 expected_batches=len(batch_ids),
+                collect_new_index_skus=False,
+                update_collections_per_batch=True,
             )
         finally:
             await cons.stop()
