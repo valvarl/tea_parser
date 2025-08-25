@@ -520,7 +520,7 @@ class ProductEnricher:
         async with await ctx.new_page() as page:
             
             # https://github.com/daijro/camoufox/issues/314
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(2.0)
             self.page_nav_sem.release()
 
             print("before load", flush=True)

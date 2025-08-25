@@ -375,8 +375,8 @@ class Coordinator:
                 "params.category_id": category_id,
                 "params.max_pages": max_pages,
                 "stats": {
-                    "index": {"pages": 0, "inserted": 0, "updated": 0, "failed": 0, "scraped": 0},
-                    "enrich": {"processed": 0, "failed": 0, "reviews_saved": 0, "dlq": 0},
+                    "index": {"indexed": 0, "inserted": 0, "updated": 0, "pages": 0},
+                    "enrich": {"processed": 0, "inserted": 0, "updated": 0, "reviews_saved": 0, "dlq": 0},
                     "forwarded": {"to_enricher": 0, "from_collections": 0},
                 },
                 "started_at": _now_dt(),
@@ -507,19 +507,14 @@ class Coordinator:
 
                         if await acquire_event_for_metrics(task_id, "indexer", ev_hash):
                             bd = st.get("batch_data") or {}
-                            ins = int(bd.get("inserted", 0))
-                            upd = int(bd.get("updated", 0))
-                            pages = int(bd.get("pages", 0))
-                            failed = int(bd.get("failed", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
                                 {
                                     "$inc": {
-                                        "stats.index.pages": pages,
-                                        "stats.index.inserted": ins,
-                                        "stats.index.updated": upd,
-                                        "stats.index.scraped": ins + upd,
-                                        "stats.index.failed": failed,
+                                        "stats.index.indexed": int(bd.get("products_indexed", 0)),
+                                        "stats.index.inserted": int(bd.get("products_inserted", 0)),
+                                        "stats.index.updated": int(bd.get("products_updated", 0)),
+                                        "stats.index.pages": int(bd.get("pages_indexed", 0)),
                                     },
                                     "$currentDate": {"updated_at": True},
                                 },
@@ -559,13 +554,15 @@ class Coordinator:
                         return
 
                     if st.get("status") == "task_done":
-                        await patch_task(task_id, {"workers.indexer.status": st.get("status"), "workers.indexer.stats": {
-                            "scraped_products": int(st.get("scraped_products", 0)),
-                            "failed_products": int(st.get("failed_products", 0)),
-                            "inserted_products": int(st.get("inserted_products", 0)),
-                            "updated_products": int(st.get("updated_products", 0)),
-                            "total_products": int(st.get("total_products", 0)),
-                        }})
+                        await patch_task(task_id, {
+                            "workers.indexer.status": st.get("status"), 
+                            "workers.indexer.stats": {
+                                "indexed": int(bd.get("products_indexed", 0)),
+                                "inserted": int(bd.get("products_inserted", 0)),
+                                "updated": int(bd.get("products_updated", 0)),
+                                "pages": int(bd.get("pages_indexed", 0)),
+                            }
+                        })
                     else:
                         await patch_task(task_id, {"workers.indexer.status": st.get("status")})
 
@@ -599,16 +596,15 @@ class Coordinator:
                     if st.get("status") == "ok":
                         if await acquire_event_for_metrics(task_id, "enricher", ev_hash):
                             bd = st.get("batch_data") or {}
-                            processed = int(bd.get("processed", st.get("scraped_products", 0)))
-                            failed = int(bd.get("failed", st.get("failed_products", 0)))
-                            inc: Dict[str, int] = {
-                                "stats.enrich.processed": processed,
-                                "stats.enrich.failed": failed,
+                            inc = {
+                                "stats.enrich.processed": int(bd.get("processed", 0)),
+                                "stats.enrich.inserted": int(bd.get("inserted", 0)),
+                                "stats.enrich.updated": int(bd.get("updated", 0)),
                             }
-                            if "saved_reviews" in bd or "saved_reviews" in st:
-                                inc["stats.enrich.reviews_saved"] = int(bd.get("saved_reviews", st.get("saved_reviews", 0)))
-                            if "dlq" in bd or "dlq" in st:
-                                inc["stats.enrich.dlq"] = int(bd.get("dlq", st.get("dlq", 0)))
+                            if "saved_reviews" in bd:
+                                inc["stats.enrich.reviews_saved"] = int(bd.get("saved_reviews", 0))
+                            if "dlq" in bd:
+                                inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
                                 {"$inc": inc, "$currentDate": {"updated_at": True}},
@@ -616,6 +612,20 @@ class Coordinator:
 
                     if st.get("status") == "task_done" and st.get("done") is True:
                         await patch_task(task_id, {"workers.enricher.finished_at": _now_dt()})
+
+                        sums_doc = await db.scraping_tasks.find_one({"id": task_id}, {"stats.enrich": 1})
+                        sums = ((sums_doc or {}).get("stats") or {}).get("enrich") or {}
+                        await patch_task(task_id, {
+                            "workers.enricher.status": "task_done",
+                            "workers.enricher.stats": {
+                                "processed": int(sums.get("processed", 0)),
+                                "inserted": int(sums.get("inserted", 0)),
+                                "updated": int(sums.get("updated", 0)),
+                                "reviews_saved": int(sums.get("reviews_saved", 0)),
+                                "dlq": int(sums.get("dlq", 0)),
+                            }
+                        })
+
                         logger.info("enricher done", extra={"event": "task_done", "task_id": task_id})
                         enr_done = True
                         await c_enr.commit()
@@ -669,14 +679,19 @@ class Coordinator:
                 pass
 
         result = {
-            "indexed_total": int(((stats.get("index") or {}).get("scraped")) or 0),
-            "indexed_new": int(((stats.get("index") or {}).get("inserted")) or 0),
-            "indexed_updated": int(((stats.get("index") or {}).get("updated")) or 0),
-            "index_errors": int(((stats.get("index") or {}).get("failed")) or 0),
-            "enriched_total": int(((stats.get("enrich") or {}).get("processed")) or 0),
-            "enrich_errors": int(((stats.get("enrich") or {}).get("failed")) or 0),
-            "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-            "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+            "indexer": {
+                "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
+                "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
+                "updated": int(((stats.get("index") or {}).get("updated")) or 0),
+                "pages": int(((stats.get("index") or {}).get("pages")) or 0),
+            },
+            "enricher": {
+                "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
+                "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
+                "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
+                "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
+                "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+            },
             "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
             "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
             "duration_total_sec": duration_sec,
@@ -814,14 +829,19 @@ class Coordinator:
                 except Exception:
                     pass
             result = {
-                "indexed_total": int(((stats.get("index") or {}).get("scraped")) or 0),
-                "indexed_new": int(((stats.get("index") or {}).get("inserted")) or 0),
-                "indexed_updated": int(((stats.get("index") or {}).get("updated")) or 0),
-                "index_errors": int(((stats.get("index") or {}).get("failed")) or 0),
-                "enriched_total": int(((stats.get("enrich") or {}).get("processed")) or 0),
-                "enrich_errors": int(((stats.get("enrich") or {}).get("failed")) or 0),
-                "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-                "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+                "indexer": {
+                    "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
+                    "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
+                    "updated": int(((stats.get("index") or {}).get("updated")) or 0),
+                    "pages": int(((stats.get("index") or {}).get("pages")) or 0),
+                },
+                "enricher": {
+                    "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
+                    "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
+                    "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
+                    "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
+                    "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+                },
                 "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
                 "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
                 "duration_total_sec": duration_sec,
@@ -901,14 +921,19 @@ class Coordinator:
             except Exception:
                 pass
         result = {
-            "indexed_total": int(((stats.get("index") or {}).get("scraped")) or 0),
-            "indexed_new": int(((stats.get("index") or {}).get("inserted")) or 0),
-            "indexed_updated": int(((stats.get("index") or {}).get("updated")) or 0),
-            "index_errors": int(((stats.get("index") or {}).get("failed")) or 0),
-            "enriched_total": int(((stats.get("enrich") or {}).get("processed")) or 0),
-            "enrich_errors": int(((stats.get("enrich") or {}).get("failed")) or 0),
-            "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
-            "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+            "indexer": {
+                "indexed": int(((stats.get("index") or {}).get("indexed")) or 0),
+                "inserted": int(((stats.get("index") or {}).get("inserted")) or 0),
+                "updated": int(((stats.get("index") or {}).get("updated")) or 0),
+                "pages": int(((stats.get("index") or {}).get("pages")) or 0),
+            },
+            "enricher": {
+                "processed": int(((stats.get("enrich") or {}).get("processed")) or 0),
+                "inserted": int(((stats.get("enrich") or {}).get("inserted")) or 0),
+                "updated": int(((stats.get("enrich") or {}).get("updated")) or 0),
+                "reviews_saved": int(((stats.get("enrich") or {}).get("reviews_saved")) or 0),
+                "dlq": int(((stats.get("enrich") or {}).get("dlq")) or 0),
+            },
             "forwarded_to_enricher": int(((stats.get("forwarded") or {}).get("to_enricher")) or 0),
             "collections_followup_total": int(((stats.get("collections") or {}).get("skus_to_process")) or 0),
             "duration_total_sec": duration_sec,
@@ -923,6 +948,7 @@ class Coordinator:
     # ----- blocking waits for collections follow-up -----
 
     async def _wait_for_batches(
+        self,
         *,
         task_id: str,
         status_consumer: AIOKafkaConsumer,

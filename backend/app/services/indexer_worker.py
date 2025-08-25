@@ -145,7 +145,11 @@ async def _handle_search(
         )
 
         now_ts = _now_ts()
-        scraped = failed = page_no = inserted = updated = 0
+        products_indexed = 0
+        products_inserted = 0
+        products_updated = 0
+        pages_indexed = 0
+        page_no = 0
 
         attempt = 0
         while True:
@@ -159,6 +163,8 @@ async def _handle_search(
                     headless=True,
                 ):
                     page_no += 1
+                    pages_indexed += 1
+                    
                     batch_skus: List[str] = []
                     batch_ins = batch_upd = batch_fail = 0
 
@@ -185,19 +191,19 @@ async def _handle_search(
                                 upsert=True,
                             )
                             is_insert = res.upserted_id is not None
-                            inserted += int(is_insert)
-                            updated += int(not is_insert)
-                            scraped += 1
-                            batch_skus.append(sku)
                             batch_ins += int(is_insert)
                             batch_upd += int(not is_insert)
+                            batch_skus.append(sku)
                         except Exception:
-                            failed += 1
-                            batch_fail += 1
                             logger.error(
                                 "index upsert failed",
                                 extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku},
                             )
+
+                    batch_products_indexed = batch_ins + batch_upd
+                    products_indexed += batch_products_indexed
+                    products_inserted += batch_ins
+                    products_updated += batch_upd
 
                     await prod.send_and_wait(
                         TOPIC_INDEXER_STATUS,
@@ -211,16 +217,16 @@ async def _handle_search(
                             "trigger": trigger,
                             "batch_data": {
                                 "batch_id": page_no,
-                                "pages": 1,
                                 "skus": batch_skus,
-                                "inserted": batch_ins,
-                                "updated": batch_upd,
-                                "failed": batch_fail,
+                                "products_indexed": batch_products_indexed,
+                                "products_inserted": batch_ins,
+                                "products_updated": batch_upd,
+                                "pages_indexed": 1,
                             },
-                            "scraped_products": scraped,
-                            "failed_products": failed,
-                            "inserted_products": inserted,
-                            "updated_products": updated,
+                            "products_indexed": products_indexed,
+                            "products_inserted": products_inserted,
+                            "products_updated": products_updated,
+                            "pages_indexed": pages_indexed,
                         },
                     )
                     logger.info(
@@ -229,7 +235,12 @@ async def _handle_search(
                             "event": "batch_ok",
                             "task_id": task_id,
                             "batch_id": page_no,
-                            "counts": {"inserted": batch_ins, "updated": batch_upd, "failed": batch_fail},
+                            "counts": {
+                                "products_indexed": batch_products_indexed,
+                                "products_inserted": batch_ins,
+                                "products_updated": batch_upd,
+                                "pages_indexed": 1,
+                            },
                         },
                     )
 
@@ -278,7 +289,6 @@ async def _handle_search(
                 await asyncio.sleep(delay)
                 continue
 
-        total = scraped + failed
         await prod.send_and_wait(
             TOPIC_INDEXER_STATUS,
             {
@@ -287,18 +297,26 @@ async def _handle_search(
                 "task_id": task_id,
                 "status": "task_done",
                 "done": True,
-                "scraped_products": scraped,
-                "failed_products": failed,
-                "inserted_products": inserted,
-                "updated_products": updated,
-                "total_products": total,
+                "products_indexed": products_indexed,
+                "products_inserted": products_inserted,
+                "products_updated": products_updated,
+                "pages_indexed": pages_indexed,
                 "ts": _now_ts(),
                 "trigger": trigger,
             },
         )
         logger.info(
             "task done",
-            extra={"event": "task_done", "task_id": task_id, "counts": {"total": total, "failed": failed}},
+            extra={
+                "event": "task_done",
+                "task_id": task_id,
+                "counts": {
+                    "products_indexed": products_indexed,
+                    "products_inserted": products_inserted,
+                    "products_updated": products_updated,
+                    "pages_indexed": pages_indexed,
+                },
+            },
         )
 
     except Exception as e:
