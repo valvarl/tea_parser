@@ -3,6 +3,7 @@ import axios from "axios";
 import PropTypes from "prop-types";
 import "./App.css";
 import ProductModal from "./components/ProductModal";
+import TaskItem from "./components/TaskItem";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
@@ -257,6 +258,10 @@ export default function App() {
   const [pageSize, setPageSize] = useState(24);
   const [selectedTeaType, setSelectedTeaType] = useState("");
   const [tasks, setTasks] = useState([]);
+  const [tasksParentFilter, setTasksParentFilter] = useState("");
+  const [productsMode, setProductsMode] = useState("all"); // all | byTask
+  const [productsTaskId, setProductsTaskId] = useState("");
+  const [productsScope, setProductsScope] = useState("task"); // task | pipeline
   const [stats, setStats] = useState({});
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("puer");
@@ -310,9 +315,13 @@ export default function App() {
   }, []);
 
   const fetchTasks = useCallback(async () => {
-    const res = await api.get("/scrape/tasks");
-    setTasks(Array.isArray(res.data) ? res.data : []);
-  }, []);
+    const params = new URLSearchParams();
+    if (tasksParentFilter) params.set("parent_task_id", tasksParentFilter);
+    params.set("limit", "200");
+    const res = await api.get(`/tasks?${params.toString()}`);
+    const items = res.data?.items || res.data || [];
+    setTasks(items);
+  }, [tasksParentFilter]);
 
   const fetchCategories = useCallback(async () => {
     const res = await api.get("/categories");
@@ -320,6 +329,18 @@ export default function App() {
   }, []);
 
   const fetchProducts = useCallback(async () => {
+    // режим: товары одной задачи
+    if (productsMode === "byTask" && productsTaskId) {
+      const params = new URLSearchParams();
+      params.set("limit", String(pageSize));
+      params.set("skip", String((page - 1) * pageSize));
+      params.set("scope", productsScope); // 'task' | 'pipeline'
+      const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`);
+      setProducts(res.data?.items || []);
+      setTotalProducts(res.data?.total || 0);
+      return;
+    }
+    // режим: общий список
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("skip", String((page - 1) * pageSize));
@@ -327,7 +348,20 @@ export default function App() {
     const res = await api.get(`/products?${params.toString()}`);
     setProducts(res.data?.items || []);
     setTotalProducts(res.data?.total || 0);
-  }, [page, pageSize, selectedTeaType]);
+  }, [page, pageSize, selectedTeaType, productsMode, productsTaskId, productsScope]);
+
+  const openProductsForTask = useCallback((taskId, scope = "task") => {
+    setProductsMode("byTask");
+    setProductsTaskId(taskId);
+    setProductsScope(scope);
+    setActiveTab("products");
+    setPage(1);
+  }, []);
+
+  const openChildrenTasks = useCallback((taskId) => {
+    setTasksParentFilter(taskId);
+    setActiveTab("tasks");
+  }, []);
 
   useEffect(() => {
     fetchStats().catch(() => {});
@@ -708,71 +742,22 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full table-auto">
-                  <thead>
-                    <tr className="bg-gray-50">
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Query
-                      </th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Status
-                      </th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Products
-                      </th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Created
-                      </th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Finished
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-gray-200">
-                    {tasks.map((t) => (
-                      <tr key={t.id} className="hover:bg-gray-50">
-                        <td className="px-4 py-4 whitespace-nowrap">
-                          <div className="font-medium text-gray-900">
-                            {t.search_term}
-                          </div>
-                          {t.error_message && (
-                            <div className="text-sm text-red-600">
-                              {t.error_message}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-4 py-4 whitespace-nowrap">
-                          <StatusBadge status={t.status} />
-                        </td>
-                        <td className="px-4 py-4 whitespace-nowrap">
-                          <div className="text-sm text-gray-900">
-                            {t.scraped_products || 0} / {t.total_products || 0}
-                          </div>
-                          {Number(t.failed_products || 0) > 0 && (
-                            <div className="text-sm text-red-600">
-                              {t.failed_products} failed
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {formatDate(t.created_at)}
-                        </td>
-                        <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {formatDate(t.finished_at)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="space-y-3">
+                {tasks.map((t) => (
+                  <TaskItem
+                    key={t.id}
+                    task={t}
+                    onOpenProducts={openProductsForTask}
+                    onOpenChildren={openChildrenTasks}
+                  />
+                ))}
+                {tasks.length === 0 && (
+                  <div className="text-center py-12">
+                    <div className="text-6xl mb-4">⚙️</div>
+                    <p className="text-gray-500">No tasks found</p>
+                  </div>
+                )}
               </div>
-
-              {tasks.length === 0 && (
-                <div className="text-center py-12">
-                  <div className="text-6xl mb-4">⚙️</div>
-                  <p className="text-gray-500">No tasks found</p>
-                </div>
-              )}
             </div>
           </div>
         )}
