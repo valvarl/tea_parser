@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from pymongo import UpdateOne, errors as pme
 
 from app.core.logging import configure_logging, get_logger
 from app.db.mongo import db
@@ -244,7 +245,7 @@ async def _insert_collection_members(task_id: str, collection_hash: str, skus: L
         if not s:
             continue
         ops.append(
-            pymongo.UpdateOne(
+            UpdateOne(
                 {"task_id": task_id, "collection_hash": collection_hash, "sku": s},
                 {"$setOnInsert": {"task_id": task_id, "collection_hash": collection_hash, "sku": s,
                                   "status": "queued", "created_at": now}, "$set": {"updated_at": now}},
@@ -252,7 +253,6 @@ async def _insert_collection_members(task_id: str, collection_hash: str, skus: L
             )
         )
     if ops:
-        from pymongo import errors as pme
         try:
             await db.collection_members.bulk_write(ops, ordered=False)
         except pme.BulkWriteError as e:
@@ -288,7 +288,6 @@ async def _sync_collection_counts(task_id: str, hashes: List[str]) -> None:
 
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
     """Create/extend collections and populate collection_members (queued)."""
-    from pymongo import UpdateOne
     created_count = 0
     now = _now_dt()
     touched_hashes: set[str] = set()
