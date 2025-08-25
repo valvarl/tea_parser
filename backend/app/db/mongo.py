@@ -1,11 +1,4 @@
-"""
-Подключение к MongoDB и удобные хелперы.
-
-Импортируйте:
-    from app.db.mongo import db        # объект AsyncIOMotorDatabase
-или
-    from app.db.mongo import get_db    # Depends-функция для FastAPI
-"""
+from __future__ import annotations
 
 from functools import lru_cache
 from typing import AsyncGenerator
@@ -14,45 +7,42 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from app.core.config import get_settings
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Client / Database singletons
-# ──────────────────────────────────────────────────────────────────────────────
 
-
-@lru_cache
-def _get_client() -> AsyncIOMotorClient:
-    """Создаёт (и кэширует) единственный экземпляр Mongo-клиента."""
+@lru_cache(maxsize=1)
+def get_client() -> AsyncIOMotorClient:
     settings = get_settings()
-    return AsyncIOMotorClient(settings.MONGO_URL)
+    return AsyncIOMotorClient(
+        settings.mongo_url,
+        uuidRepresentation="standard",
+        tz_aware=True,
+        serverSelectionTimeoutMS=10_000,
+        connectTimeoutMS=10_000,
+        socketTimeoutMS=20_000,
+        maxPoolSize=100,
+        retryWrites=True,
+    )
 
-client: AsyncIOMotorClient = _get_client()
-db: AsyncIOMotorDatabase = client[get_settings().DB_NAME]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI dependencies
-# ──────────────────────────────────────────────────────────────────────────────
+def get_db_handle() -> AsyncIOMotorDatabase:
+    return get_client()[get_settings().db_name]
+
+
+# Module-level singletons (safe to reuse across the app)
+client: AsyncIOMotorClient = get_client()
+db: AsyncIOMotorDatabase = get_db_handle()
 
 
 async def get_db() -> AsyncGenerator[AsyncIOMotorDatabase, None]:
-    """
-    Зависимость для роутеров / сервисов:
-
-    ```python
-    from fastapi import Depends
-    from app.db.mongo import get_db
-
-    async def my_endpoint(db = Depends(get_db)):
-        ...
-    ```
-    """
     yield db
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Shutdown helper
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 def close_mongo_client() -> None:
-    """Вызывайте из события shutdown (`app.add_event_handler`)."""
     client.close()
+
+
+async def ping_mongo() -> bool:
+    try:
+        await db.command("ping")
+        return True
+    except Exception:
+        return False

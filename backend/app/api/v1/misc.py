@@ -7,7 +7,6 @@ from fastapi import APIRouter
 from app.db.mongo import db
 from app.models.task import ScrapingStats
 from app.utils.search import generate_search_queries
-from app.utils.captcha import captcha_solver
 
 router = APIRouter(tags=["misc"], prefix="/v1")
 
@@ -44,7 +43,6 @@ async def get_scraping_stats():
         finished_tasks=finished,
         failed_tasks=failed,
         total_products=products_total,
-        captcha_solves=captcha_solver.solve_count,
         error_rate=error_rate,
     )
 

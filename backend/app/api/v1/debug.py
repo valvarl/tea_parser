@@ -5,8 +5,8 @@ import asyncio
 from fastapi import APIRouter
 
 # from app.services.indexer import indexer
-from app.utils.proxy import proxy_pool
-from app.utils.captcha import captcha_solver
+# from app.utils.proxy import proxy_pool
+# from app.utils.captcha import captcha_solver
 from app.utils.ozon_ping import ozon_ping
 
 router = APIRouter(prefix="/debug", tags=["debug"])

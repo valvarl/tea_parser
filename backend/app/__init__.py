@@ -5,7 +5,7 @@ from app.core.logging import configure_logging
 from app.db.mongo import close_mongo_client
 
 def create_app() -> FastAPI:
-    configure_logging()
+    configure_logging(service="backend")
     app = FastAPI(title="Chinese Tea Scraper API", version="1.0.0")
     app.include_router(api_router, prefix="/api")
     app.add_middleware(
