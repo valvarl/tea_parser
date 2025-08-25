@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import time
 from datetime import datetime
@@ -100,14 +99,16 @@ def chunked(seq: Iterable[Any], size: int) -> Iterable[List[Any]]:
     if buf:
         yield buf
 
-def batched(seq: List[int | str], n: int) -> Iterable[List[int | str]]:
+def batched(seq: List[str], n: int) -> Iterable[List[str]]:
+    # ensure string SKUs
+    seq = [str(x).strip() for x in seq if str(x).strip()]
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
 
 def squash_sku(obj: Any, key: str = "sku") -> Any:
     if isinstance(obj, dict):
         if len(obj) == 1 and key in obj:
-            return obj[key]
+            return str(obj[key])
         return {k: squash_sku(v, key) for k, v in obj.items()}
     if isinstance(obj, list):
         return [squash_sku(x, key) for x in obj]
@@ -120,7 +121,7 @@ def squash_sku(obj: Any, key: str = "sku") -> Any:
 
 async def prepare_collection(parent_sku: str) -> Optional[Dict[str, Any]]:
     doc = await db.candidates.find_one(
-        {"sku": parent_sku},
+        {"sku": str(parent_sku)},
         {
             "_id": 0,
             "collections.sku": 1,
@@ -206,17 +207,18 @@ def build_collection_hash(item: Dict[str, Any]) -> str:
     return _stable_hash(sig)
 
 def to_collection_doc(item: Dict[str, Any], task_id: str) -> Dict[str, Any]:
-    # Store datetime for timestamps (Mongo TTL & analytics friendly)
+    """Collection document (no embedded SKUs)."""
     now = _now_dt()
+    total = len(item["skus"])
     return {
         "task_id": task_id,
-        "status": "queued",
-        "come_from": item["come_from"],
+        "collection_hash": build_collection_hash(item),
         "type": item["type"],
+        "come_from": item["come_from"],
         "aspect_key": item.get("aspect_key"),
         "aspect_name": item.get("aspect_name"),
-        "collection_hash": build_collection_hash(item),
-        "skus": [{"sku": s, "status": "queued"} for s in item["skus"]],
+        "status": "queued",  # becomes 'processed' only when queued_count == 0
+        "counts": {"total": total, "queued": total, "processed": 0, "dlq": 0},
         "created_at": now,
         "updated_at": now,
     }
@@ -227,25 +229,88 @@ def build_processing_order(grouped: Dict[str, List[Dict[str, Any]]]) -> List[str
     for bucket in ("aspects", "collections", "other_offers"):
         for item in grouped.get(bucket, []) or []:
             for s in item.get("skus", []):
-                if s not in seen:
+                s = str(s).strip()
+                if s and s not in seen:
                     seen.add(s)
                     ordered.append(s)
     return ordered
 
+async def _insert_collection_members(task_id: str, collection_hash: str, skus: List[str]) -> None:
+    """Idempotent upsert of members (queued by default)."""
+    now = _now_dt()
+    ops = []
+    for raw in skus:
+        s = str(raw).strip()
+        if not s:
+            continue
+        ops.append(
+            pymongo.UpdateOne(
+                {"task_id": task_id, "collection_hash": collection_hash, "sku": s},
+                {"$setOnInsert": {"task_id": task_id, "collection_hash": collection_hash, "sku": s,
+                                  "status": "queued", "created_at": now}, "$set": {"updated_at": now}},
+                upsert=True,
+            )
+        )
+    if ops:
+        from pymongo import errors as pme
+        try:
+            await db.collection_members.bulk_write(ops, ordered=False)
+        except pme.BulkWriteError as e:
+            logger.warning("collection_members bulk upsert partial", extra={"event": "bulk_members_partial", "error": str(e)})
+
+async def _sync_collection_counts(task_id: str, hashes: List[str]) -> None:
+    """Recalculate counts from collection_members and finalize collections if queued==0."""
+    if not hashes:
+        return
+    pipeline = [
+        {"$match": {"task_id": task_id, "collection_hash": {"$in": hashes}}},
+        {"$group": {
+            "_id": "$collection_hash",
+            "total": {"$sum": 1},
+            "queued": {"$sum": {"$cond": [{"$eq": ["$status", "queued"]}, 1, 0]}},
+            "processed": {"$sum": {"$cond": [{"$eq": ["$status", "processed"]}, 1, 0]}},
+            "dlq": {"$sum": {"$cond": [{"$eq": ["$status", "dlq"]}, 1, 0]}},
+        }},
+    ]
+    async for g in db.collection_members.aggregate(pipeline):
+        ch = g["_id"]
+        queued = int(g.get("queued", 0))
+        patch = {
+            "counts.total": int(g.get("total", 0)),
+            "counts.queued": queued,
+            "counts.processed": int(g.get("processed", 0)),
+            "counts.dlq": int(g.get("dlq", 0)),
+            "updated_at": _now_dt(),
+        }
+        if queued == 0:
+            patch["status"] = "processed"
+        await db.collections.update_one({"task_id": task_id, "collection_hash": ch}, {"$set": patch})
+
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
+    """Create/extend collections and populate collection_members (queued)."""
+    from pymongo import UpdateOne
     created_count = 0
     now = _now_dt()
+    touched_hashes: set[str] = set()
+
+    # Upsert collection documents (no embedded SKUs)
     for bucket in ("collections", "aspects", "other_offers"):
         for item in grouped.get(bucket, []):
             doc = to_collection_doc(item, task_id)
-            on_insert = {k: v for k, v in doc.items() if k != "updated_at"}
+            filt = {"task_id": task_id, "collection_hash": doc["collection_hash"]}
             res = await db.collections.update_one(
-                {"collection_hash": doc["collection_hash"]},
-                {"$setOnInsert": on_insert, "$set": {"updated_at": now}},
+                filt,
+                {"$setOnInsert": doc, "$set": {"updated_at": now}},
                 upsert=True,
             )
             if res.upserted_id is not None:
                 created_count += 1
+            touched_hashes.add(doc["collection_hash"])
+            # Upsert members for this collection
+            await _insert_collection_members(task_id, doc["collection_hash"], item["skus"])
+
+    # Recalculate counts from collection_members and finalize if applicable
+    await _sync_collection_counts(task_id, list(touched_hashes))
     processing_order = build_processing_order(grouped)
     return created_count, processing_order
 
@@ -306,9 +371,8 @@ async def record_worker_event(task_id: str, worker: str, payload: Dict[str, Any]
                 "event_hash": ev_hash,
                 "payload": payload,
                 "metrics_applied": False,
-                # Keep both: int ts comes from workers; ts_dt enables TTL.
-                "ts": ts_int,
-                "ts_dt": ts_dt,
+                "ts": ts_int,      # wire-level int
+                "ts_dt": ts_dt,    # ISODate for TTL
             }
         },
         upsert=True,
@@ -328,7 +392,6 @@ async def acquire_event_for_metrics(task_id: str, worker: str, ev_hash: str) -> 
     return res is not None
 
 async def mark_forwarded_once(task_id: str, worker: str, batch_id: int | str) -> bool:
-    # 'ts' as datetime (Mongo TTL works only with date types)
     res = await db.worker_progress.update_one(
         {"task_id": task_id, "worker": worker, "batch_id": str(batch_id)},
         {
@@ -336,7 +399,7 @@ async def mark_forwarded_once(task_id: str, worker: str, batch_id: int | str) ->
                 "task_id": task_id,
                 "worker": worker,
                 "batch_id": str(batch_id),
-                "ts": _now_dt(),
+                "ts": _now_dt(),  # ISODate
             }
         },
         upsert=True,
@@ -518,7 +581,6 @@ class Coordinator:
 
                     if st.get("status") == "ok":
                         bd = st.get("batch_data") or {}
-                        # Prefer 'new_skus' when present (avoids re-enrichment).
                         to_forward = list(bd.get("new_skus") or bd.get("skus") or [])
                         batch_id = st.get("batch_id")
 
@@ -530,7 +592,7 @@ class Coordinator:
                                         {
                                             "cmd": "enrich_skus",
                                             "task_id": task_id,
-                                            "skus": chunk,
+                                            "skus": [str(x).strip() for x in chunk],
                                             "trigger": "indexer_forward",
                                         },
                                     )
@@ -543,7 +605,6 @@ class Coordinator:
 
                         if await acquire_event_for_metrics(task_id, "indexer", ev_hash):
                             ins = int(bd.get("inserted", 0))
-                            # Indexer now reports 'matched' (not 'updated'); keep backward compat.
                             upd = int(bd.get("updated", bd.get("matched", 0)))
                             pgs = int(bd.get("pages", 0))
                             await db.scraping_tasks.update_one(
@@ -632,10 +693,25 @@ class Coordinator:
                                 inc["stats.enrich.reviews_saved"] = int(bd.get("reviews_saved", 0))
                             if "dlq" in bd:
                                 inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
-                            await db.scraping_tasks.update_one(
-                                {"id": task_id},
-                                {"$inc": inc, "$currentDate": {"updated_at": True}},
-                            )
+                            await db.scraping_tasks.update_one({"id": task_id}, {"$inc": inc, "$currentDate": {"updated_at": True}})
+
+                        # Per-batch collection members update
+                        bd = st.get("batch_data") or {}
+                        processed_skus = [str(s).strip() for s in (bd.get("skus") or []) if str(s).strip()]
+                        dlq_skus: List[str] = []
+                        b_id = st.get("batch_id")
+                        if b_id is not None:
+                            dlq_docs = await db.enrich_dlq.find(
+                                {"task_id": task_id, "batch_id": int(b_id)},
+                                {"sku": 1, "_id": 0}
+                            ).to_list(None)
+                            dlq_skus = [str(d.get("sku")).strip() for d in dlq_docs if d.get("sku")]
+
+                        await self._update_collections_per_skus(
+                            task_id=task_id,
+                            processed_skus=processed_skus,
+                            dlq_skus=dlq_skus,
+                        )
 
                     if st.get("status") == "task_done" and st.get("done") is True:
                         await patch_task(task_id, {"workers.enricher.finished_at": _now_dt()})
@@ -787,7 +863,6 @@ class Coordinator:
 
             # 1) Indexer upserts collection SKUs and returns 'new_skus' per batch.
             new_skus = await self._send_indexer_and_wait(new_task_id, all_skus)
-
             await patch_task(new_task_id, {"workers.indexer.status": "task_done"})
 
             # 2) Enrich ONLY new_skus to avoid re-enrichment.
@@ -930,8 +1005,6 @@ class Coordinator:
                         processed_skus = [str(s).strip() for s in (bd.get("skus") or []) if str(s).strip()]
                         dlq_skus: List[str] = []
                         b_id = st.get("batch_id")
-
-                        # DLQ берём из базы по связке (task_id, batch_id)
                         if b_id is not None:
                             dlq_docs = await db.enrich_dlq.find(
                                 {"task_id": task_id, "batch_id": int(b_id)},
@@ -956,16 +1029,11 @@ class Coordinator:
             finally:
                 await status_consumer.commit()
 
-        # Return unique normalized list (only relevant when collect_new_index_skus).
         if collect_new_index_skus:
             return _normalize_skus(new_skus_acc)
         return []
 
     async def _send_indexer_and_wait(self, task_id: str, skus: List[str], *, batch_size: int = 200, timeout_sec: int = 600) -> List[str]:
-        """
-        Sends 'add_collection_members' to the indexer and waits for all batches.
-        Returns the union of 'new_skus' reported by the indexer across batches.
-        """
         if not skus:
             return []
         cons = new_consumer(TOPIC_INDEXER_STATUS, self._stable_group("idx-col", task_id), offset="latest", manual_commit=True)
@@ -1040,37 +1108,36 @@ class Coordinator:
     # ----- utils -----
 
     async def _update_collections_per_skus(self, *, task_id: str, processed_skus: List[str], dlq_skus: List[str]) -> None:
-        """Atomically mark per-SKU statuses inside collections and finalize collections that have no queued items left."""
-        # Normalize & dedup
-        def _norm(xs: List[str]) -> List[str]:
-            return sorted({str(x).strip() for x in xs if str(x).strip()})
+        """Mark members by SKU and refresh collections' counters; finalize when queued==0."""
+        processed_skus = [s for s in {str(x).strip() for x in processed_skus} if s]
+        dlq_skus = [s for s in {str(x).strip() for x in dlq_skus} if s]
 
-        processed_skus = _norm(processed_skus)
-        dlq_skus = _norm(dlq_skus)
-
-        # Per-SKU status updates using arrayFilters (skip empty lists to avoid arrayFilters errors)
+        now = _now_dt()
         if processed_skus:
-            await db.collections.update_many(
-                {"task_id": task_id, "skus.sku": {"$in": processed_skus}},
-                {"$set": {"skus.$[e].status": "processed"}, "$currentDate": {"updated_at": True}},
-                array_filters=[{"e.sku": {"$in": processed_skus}}],
+            await db.collection_members.update_many(
+                {"task_id": task_id, "sku": {"$in": processed_skus}, "status": "queued"},
+                {"$set": {"status": "processed", "updated_at": now}},
             )
         if dlq_skus:
-            await db.collections.update_many(
-                {"task_id": task_id, "skus.sku": {"$in": dlq_skus}},
-                {"$set": {"skus.$[e].status": "dlq"}, "$currentDate": {"updated_at": True}},
-                array_filters=[{"e.sku": {"$in": dlq_skus}}],
+            await db.collection_members.update_many(
+                {"task_id": task_id, "sku": {"$in": dlq_skus}, "status": "queued"},
+                {"$set": {"status": "dlq", "updated_at": now}},
             )
 
-        # Finalize only collections where no queued SKUs remain
-        await db.collections.update_many(
-            {
-                "task_id": task_id,
-                "status": {"$ne": "processed"},
-                "skus": {"$not": {"$elemMatch": {"status": "queued"}}},
-            },
-            {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
-        )
+        affected = set()
+        if processed_skus:
+            ch1 = await db.collection_members.distinct(
+                "collection_hash", {"task_id": task_id, "sku": {"$in": processed_skus}}
+            )
+            affected.update(ch1)
+        if dlq_skus:
+            ch2 = await db.collection_members.distinct(
+                "collection_hash", {"task_id": task_id, "sku": {"$in": dlq_skus}}
+            )
+            affected.update(ch2)
+
+        if affected:
+            await _sync_collection_counts(task_id, [str(h) for h in affected])
 
     def _stable_group(self, prefix: str, task_id: str) -> str:
         return f"{prefix}-monitor-{task_id}"
@@ -1082,7 +1149,6 @@ class Coordinator:
                 unique=True,
                 name="uniq_worker_event",
             )
-            # TTL must be on a date field -> use 'ts_dt'
             await db.worker_events.create_index([("ts_dt", 1)], expireAfterSeconds=14 * 24 * 3600, name="ttl_worker_events")
 
             await db.worker_progress.create_index(
@@ -1090,8 +1156,25 @@ class Coordinator:
                 unique=True,
                 name="uniq_worker_progress",
             )
-            # 'ts' in worker_progress is datetime now
             await db.worker_progress.create_index([("ts", 1)], expireAfterSeconds=60 * 24 * 3600, name="ttl_worker_progress")
+
+            # collections: no embedded skus; unique per task
+            await db.collections.create_index(
+                [("task_id", 1), ("collection_hash", 1)],
+                unique=True,
+                name="uniq_collection_per_task",
+            )
+            await db.collections.create_index([("status", 1), ("updated_at", 1)], name="ix_collection_status_updated")
+
+            # collection_members: unique per (task, collection, sku); also lookup helpers
+            await db.collection_members.create_index(
+                [("task_id", 1), ("collection_hash", 1), ("sku", 1)],
+                unique=True,
+                name="uniq_member",
+            )
+            await db.collection_members.create_index([("task_id", 1), ("sku", 1)], name="ix_member_task_sku")
+            await db.collection_members.create_index([("task_id", 1), ("collection_hash", 1), ("status", 1)], name="ix_member_task_hash_status")
+            await db.collection_members.create_index([("updated_at", 1)], name="ix_member_updated_at")
 
             await db.enrich_batches.create_index(
                 [("task_id", 1), ("batch_id", 1)],

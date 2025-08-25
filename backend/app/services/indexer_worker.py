@@ -313,15 +313,15 @@ async def _handle_add_collection_members(
 
 async def _map_sku_to_collection_hashes(task_id: str, skus: List[str]) -> Dict[str, Set[str]]:
     mapping: Dict[str, Set[str]] = {s: set() for s in skus}
-    cur = db.collections.find({"task_id": task_id, "skus.sku": {"$in": skus}}, {"collection_hash": 1, "skus": 1})
-    async for col in cur:
-        ch = col.get("collection_hash")
-        if not ch:
-            continue
-        for sdoc in col.get("skus", []):
-            s = str(sdoc.get("sku") or "")
-            if s in mapping:
-                mapping[s].add(ch)
+    cur = db.collection_members.find(
+        {"task_id": task_id, "sku": {"$in": [str(s).strip() for s in skus]}},
+        {"collection_hash": 1, "sku": 1, "_id": 0},
+    )
+    async for doc in cur:
+        s = str(doc.get("sku") or "")
+        ch = doc.get("collection_hash")
+        if s and ch and s in mapping:
+            mapping[s].add(ch)
     return mapping
 
 
