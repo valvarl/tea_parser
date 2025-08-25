@@ -36,7 +36,7 @@ configure_logging(service="enricher", worker="enricher-worker")
 logger = get_logger("enricher-worker")
 
 enricher = ProductEnricher(
-    concurrency=CONCURRENCY_DEF,
+    concurrency=2,
     headless=True,
     reviews=REVIEWS_DEF,
     reviews_limit=REVIEWS_LIMIT_DEF,
@@ -261,6 +261,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     batch_id: Optional[int] = cmd.get("batch_id")
     trigger: str = cmd.get("trigger") or cmd.get("source") or "ad-hoc"
     skus: Optional[List[str]] = cmd.get("skus")
+    is_finalize = str(trigger or "").lower().endswith("finalize")
 
     # dynamic settings
     enricher.concurrency = int(cmd.get("concurrency", CONCURRENCY_DEF))
@@ -270,7 +271,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     batch_doc, batch_id, skus = await _acquire_or_create_batch(task_id, batch_id, skus, trigger)
 
     # finalize immediately (no work at all across the task)
-    if not skus and batch_id is None:
+    if is_finalize or (not skus and batch_id is None):
         await _emit_status(
             prod,
             {

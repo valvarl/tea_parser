@@ -297,9 +297,10 @@ async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str,
         for item in grouped.get(bucket, []):
             doc = to_collection_doc(item, task_id)
             filt = {"task_id": task_id, "collection_hash": doc["collection_hash"]}
+            on_insert = {k: v for k, v in doc.items() if k != "updated_at"}
             res = await db.collections.update_one(
                 filt,
-                {"$setOnInsert": doc, "$set": {"updated_at": now}},
+                {"$setOnInsert": on_insert, "$set": {"updated_at": now}},
                 upsert=True,
             )
             if res.upserted_id is not None:

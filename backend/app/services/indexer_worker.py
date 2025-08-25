@@ -249,15 +249,34 @@ async def _handle_add_collection_members(
     trigger: str,
     prod: AIOKafkaProducer,
 ) -> None:
+    is_finalize = str(trigger or "").lower().endswith("finalize")
     logger.info(
         "collections batch start",
         extra={"event": "collections_start", "task_id": task_id, "batch_id": batch_id, "skus_count": len(skus)},
     )
     try:
+        if is_finalize or (not skus and batch_id is None):
+            await _send_status(
+                prod,
+                {"task_id": task_id, "status": "task_done", "done": True, "trigger": trigger},
+            )
+            logger.info("collections finalize", extra={"event": "collections_finalize", "task_id": task_id, "trigger": trigger})
+            return
+        
+        # empty batch -> OK with zeros
         if not skus:
             await _send_status(
                 prod,
-                {"task_id": task_id, "status": "ok", "batch_id": batch_id, "trigger": trigger, "batch_data": {"batch_id": batch_id, "pages": 0, "skus": [], "inserted": 0, "updated": 0, "new_skus": []}},
+                {
+                    "task_id": task_id,
+                    "status": "ok",
+                    "batch_id": batch_id,
+                    "trigger": trigger,
+                    "batch_data": {
+                        "batch_id": batch_id, "pages": 0, "skus": [],
+                        "inserted": 0, "updated": 0, "new_skus": []
+                    },
+                },
             )
             logger.info("collections batch empty", extra={"event": "collections_empty", "task_id": task_id, "batch_id": batch_id})
             return
