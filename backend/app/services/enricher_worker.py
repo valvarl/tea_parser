@@ -324,7 +324,7 @@ async def _handle_message(cmd: Dict[str, Any], prod: AIOKafkaProducer) -> None:
     processed = 0
     inserted_cnt = 0
     updated_cnt = 0
-    transient_failed = 0  # для enrich_batches/логов, не для итоговых метрик
+    transient_failed = 0
     saved_reviews = 0
 
     # persist enriched candidates

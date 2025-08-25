@@ -31,7 +31,7 @@ RETRY_BACKOFF_BASE = int(os.getenv("RETRY_BACKOFF_BASE", "60"))
 RETRY_BACKOFF_MAX = int(os.getenv("RETRY_BACKOFF_MAX", "3600"))
 
 FORWARD_THROTTLE_DELAY_MS = int(os.getenv("FORWARD_THROTTLE_DELAY_MS", "0"))
-MAX_RUNNING_TASKS = int(os.getenv("MAX_RUNNING_TASKS", "0"))  # 0 = unlimited
+MAX_RUNNING_TASKS = int(os.getenv("MAX_RUNNING_TASKS", "0"))
 
 configure_logging(service="coordinator", worker="coordinator")
 logger = get_logger("coordinator")
@@ -279,7 +279,6 @@ async def record_worker_event(task_id: str, worker: str, payload: Dict[str, Any]
         },
         upsert=True,
     )
-    # keep-alive для heartbeat
     await db.scraping_tasks.update_one(
         {"id": task_id},
         {"$max": {"last_event_ts": ts}, "$currentDate": {"updated_at": True}},
@@ -377,11 +376,14 @@ class Coordinator:
                 "stats": {
                     "index": {"indexed": 0, "inserted": 0, "updated": 0, "pages": 0},
                     "enrich": {"processed": 0, "inserted": 0, "updated": 0, "reviews_saved": 0, "dlq": 0},
+                    "collections": {"created_collections": 0, "skus_to_process": 0},
                     "forwarded": {"to_enricher": 0, "from_collections": 0},
                 },
                 "started_at": _now_dt(),
             },
         )
+        await push_status(task_id, TaskStatus.running)
+        await patch_task(task_id, {"last_event_ts": _now_ts()})
 
         idx_group = self._stable_group("idx", task_id)
         enr_group = self._stable_group("enr", task_id)
@@ -400,7 +402,7 @@ class Coordinator:
         )
         logger.info("indexer command sent", extra={"event": "send_cmd", "task_id": task_id, "trigger": "search"})
 
-        watcher = asyncio.create_task(self._watch_both(task_id, search_term, category_id, max_pages, c_idx, c_enr))
+        watcher = asyncio.create_task(self._watch_both(task_id, c_idx, c_enr))
         self._tasks.add(watcher)
         watcher.add_done_callback(self._tasks.discard)
 
@@ -413,6 +415,10 @@ class Coordinator:
         async for t in cur:
             task_id = t["id"]
             task_type = t.get("task_type") or "scrape"
+
+            if (t.get("status") or None) != TaskStatus.running:
+                await push_status(task_id, TaskStatus.running)
+                await patch_task(task_id, {"last_event_ts": _now_ts()})
 
             if task_type == "collections":
                 watcher = asyncio.create_task(self._resume_collections_task(task_id))
@@ -435,14 +441,11 @@ class Coordinator:
                     {"task_id": task_id, "search_term": search_term, "category_id": category_id, "max_pages": max_pages, "trigger": "resume"}
                 )
 
-            watcher = asyncio.create_task(self._watch_both(task_id, search_term, category_id, max_pages, c_idx, c_enr))
+            watcher = asyncio.create_task(self._watch_both(task_id, c_idx, c_enr))
             self._tasks.add(watcher)
             watcher.add_done_callback(self._tasks.discard)
 
-    # ----- watchers -----
-
-    async def _watch_both(self, task_id: str, search_term: str, category_id: str, max_pages: int,
-                          c_idx: AIOKafkaConsumer, c_enr: AIOKafkaConsumer) -> None:
+    async def _watch_both(self, task_id: str, c_idx: AIOKafkaConsumer, c_enr: AIOKafkaConsumer) -> None:
         prod_enr = await new_producer()
         idx_done = False
         enr_done = False
@@ -484,7 +487,7 @@ class Coordinator:
 
                         if skus and batch_id is not None:
                             if await mark_forwarded_once(task_id, "indexer->enricher", batch_id):
-                                for i, chunk in enumerate(chunked(skus, ENRICHER_BATCH_SIZE), start=1):
+                                for chunk in chunked(skus, ENRICHER_BATCH_SIZE):
                                     await prod_enr.send_and_wait(
                                         TOPIC_ENRICHER_CMD,
                                         {
@@ -498,23 +501,22 @@ class Coordinator:
                                         {"id": task_id},
                                         {"$inc": {"stats.forwarded.to_enricher": len(chunk)}, "$currentDate": {"updated_at": True}},
                                     )
-                                    logger.info(
-                                        "forwarded to enricher",
-                                        extra={"event": "forward", "task_id": task_id, "batch_id": batch_id, "counts": {"skus": len(chunk)}},
-                                    )
                                     if FORWARD_THROTTLE_DELAY_MS > 0:
                                         await _sleep_ms(FORWARD_THROTTLE_DELAY_MS)
 
                         if await acquire_event_for_metrics(task_id, "indexer", ev_hash):
                             bd = st.get("batch_data") or {}
+                            ins = int(bd.get("inserted", 0))
+                            upd = int(bd.get("updated", 0))
+                            pgs = int(bd.get("pages", 0))
                             await db.scraping_tasks.update_one(
                                 {"id": task_id},
                                 {
                                     "$inc": {
-                                        "stats.index.indexed": int(bd.get("products_indexed", 0)),
-                                        "stats.index.inserted": int(bd.get("products_inserted", 0)),
-                                        "stats.index.updated": int(bd.get("products_updated", 0)),
-                                        "stats.index.pages": int(bd.get("pages_indexed", 0)),
+                                        "stats.index.indexed": ins + upd,
+                                        "stats.index.inserted": ins,
+                                        "stats.index.updated": upd,
+                                        "stats.index.pages": pgs,
                                     },
                                     "$currentDate": {"updated_at": True},
                                 },
@@ -553,19 +555,7 @@ class Coordinator:
                         await c_idx.commit()
                         return
 
-                    if st.get("status") == "task_done":
-                        await patch_task(task_id, {
-                            "workers.indexer.status": st.get("status"), 
-                            "workers.indexer.stats": {
-                                "indexed": int(bd.get("products_indexed", 0)),
-                                "inserted": int(bd.get("products_inserted", 0)),
-                                "updated": int(bd.get("products_updated", 0)),
-                                "pages": int(bd.get("pages_indexed", 0)),
-                            }
-                        })
-                    else:
-                        await patch_task(task_id, {"workers.indexer.status": st.get("status")})
-
+                    await patch_task(task_id, {"workers.indexer.status": st.get("status")})
                 finally:
                     await c_idx.commit()
 
@@ -601,8 +591,8 @@ class Coordinator:
                                 "stats.enrich.inserted": int(bd.get("inserted", 0)),
                                 "stats.enrich.updated": int(bd.get("updated", 0)),
                             }
-                            if "saved_reviews" in bd:
-                                inc["stats.enrich.reviews_saved"] = int(bd.get("saved_reviews", 0))
+                            if "reviews_saved" in bd:
+                                inc["stats.enrich.reviews_saved"] = int(bd.get("reviews_saved", 0))
                             if "dlq" in bd:
                                 inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
                             await db.scraping_tasks.update_one(
@@ -612,20 +602,6 @@ class Coordinator:
 
                     if st.get("status") == "task_done" and st.get("done") is True:
                         await patch_task(task_id, {"workers.enricher.finished_at": _now_dt()})
-
-                        sums_doc = await db.scraping_tasks.find_one({"id": task_id}, {"stats.enrich": 1})
-                        sums = ((sums_doc or {}).get("stats") or {}).get("enrich") or {}
-                        await patch_task(task_id, {
-                            "workers.enricher.status": "task_done",
-                            "workers.enricher.stats": {
-                                "processed": int(sums.get("processed", 0)),
-                                "inserted": int(sums.get("inserted", 0)),
-                                "updated": int(sums.get("updated", 0)),
-                                "reviews_saved": int(sums.get("reviews_saved", 0)),
-                                "dlq": int(sums.get("dlq", 0)),
-                            }
-                        })
-
                         logger.info("enricher done", extra={"event": "task_done", "task_id": task_id})
                         enr_done = True
                         await c_enr.commit()
@@ -647,14 +623,7 @@ class Coordinator:
                         await c_enr.commit()
                         return
 
-                    if st.get("status") == "task_done":
-                        await patch_task(task_id, {"workers.enricher.status": st.get("status"), "workers.enricher.stats": {
-                            "skus_enriched": int(st.get("enriched_products", st.get("enriched", 0))),
-                            "failed": int(st.get("failed_products", st.get("failed", 0))),
-                        }})
-                    else:
-                        await patch_task(task_id, {"workers.enricher.status": st.get("status")})
-
+                    await patch_task(task_id, {"workers.enricher.status": st.get("status")})
                 finally:
                     await c_enr.commit()
 
@@ -701,7 +670,7 @@ class Coordinator:
 
         await db.scraping_tasks.update_one(
             {"id": task_id},
-            {"$set": {"stats.final": stats, "result": result, "finalized_at": finished_at}, "$currentDate": {"updated_at": True}},
+            {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
         )
 
         logger.info("task finalized", extra={"event": "final", "task_id": task_id, "status": final_status})
@@ -782,7 +751,16 @@ class Coordinator:
         try:
             await push_status(new_task_id, TaskStatus.running)
             await db.scraping_tasks.update_one({"id": new_task_id},
-                {"$set": {"last_event_ts": _now_ts()}, "$currentDate": {"updated_at": True}})
+                {"$set": {
+                    "last_event_ts": _now_ts(),
+                    "stats": {
+                        "index": {"indexed": 0, "inserted": 0, "updated": 0, "pages": 0},
+                        "enrich": {"processed": 0, "inserted": 0, "updated": 0, "reviews_saved": 0, "dlq": 0},
+                        "collections": {"created_collections": 0, "skus_to_process": 0},
+                        "forwarded": {"to_enricher": 0, "from_collections": 0},
+                    },
+                    "started_at": _now_dt(),
+                }, "$currentDate": {"updated_at": True}})
 
             grouped = await aggregate_collections_for_task(parent_task_id)
             created_cnt, all_skus = await insert_new_collections(new_task_id, grouped)
@@ -791,10 +769,8 @@ class Coordinator:
                 new_task_id,
                 {
                     "workers.collector.status": "task_done",
-                    "workers.collector.stats": {"created_collections": created_cnt, "skus_discovered": len(all_skus)},
                     "stats.collections.created_collections": created_cnt,
                     "stats.collections.skus_to_process": len(all_skus),
-                    "started_at": _now_dt(),
                 },
             )
 
@@ -805,10 +781,10 @@ class Coordinator:
                 )
 
             await self._send_indexer_and_wait(new_task_id, all_skus)
-            await patch_task(new_task_id, {"workers.indexer.status": "task_done", "workers.indexer.stats.skus_sent": len(all_skus)})
+            await patch_task(new_task_id, {"workers.indexer.status": "task_done"})
 
             await self._send_enricher_and_wait(new_task_id, all_skus)
-            await patch_task(new_task_id, {"workers.enricher.status": "task_done", "workers.enricher.stats.skus_enriched": len(all_skus)})
+            await patch_task(new_task_id, {"workers.enricher.status": "task_done"})
 
             await db.collections.update_many(
                 {"task_id": new_task_id, "status": "queued"},
@@ -850,7 +826,7 @@ class Coordinator:
             }
             await db.scraping_tasks.update_one(
                 {"id": new_task_id},
-                {"$set": {"stats.final": stats, "result": result, "finalized_at": finished_at}, "$currentDate": {"updated_at": True}},
+                {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
             )
         except Exception as e:
             logger.exception("collections follow-up failed", extra={"event": "failed", "task_id": new_task_id})
@@ -861,11 +837,9 @@ class Coordinator:
 
     async def _resume_collections_task(self, task_id: str) -> None:
         doc = await db.scraping_tasks.find_one({"id": task_id}, {"status": 1, "workers": 1, "parent_task_id": 1, "started_at": 1, "stats": 1})
-        # Переводим в running, если не running
         if (doc or {}).get("status") != TaskStatus.running:
             await push_status(task_id, TaskStatus.running)
-            await db.scraping_tasks.update_one({"id": task_id},
-                {"$set": {"last_event_ts": _now_ts()}, "$currentDate": {"updated_at": True}})
+            await patch_task(task_id, {"last_event_ts": _now_ts()})
 
         grouped = await aggregate_collections_for_task((doc or {}).get("parent_task_id") or task_id)
         _, all_skus = await insert_new_collections(task_id, grouped)
@@ -882,7 +856,6 @@ class Coordinator:
             if ((doc or {}).get("workers", {}).get("enricher") or {}).get("status") != "task_done":
                 await self._send_enricher_and_wait(task_id, all_skus)
         except TimeoutError as e:
-            # Повторно откладываем и разруливаем мягко
             await patch_task(task_id, {
                 "status": TaskStatus.deferred,
                 "deferred_reason": "enricher_wait_timeout",
@@ -890,7 +863,6 @@ class Coordinator:
                 "error_message": str(e),
             })
             await push_status(task_id, TaskStatus.deferred, reason="enricher_wait_timeout")
-            # Попробуем ещё раз попозже
             asyncio.create_task(self._resume_collections_task(task_id))
             return
 
@@ -899,7 +871,6 @@ class Coordinator:
             {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
         )
 
-        # Помечаем воркеров и финализируем
         await patch_task(task_id, {
             "workers.indexer.status": "task_done",
             "workers.enricher.status": "task_done",
@@ -910,7 +881,6 @@ class Coordinator:
         await patch_task(task_id, {"finished_at": finished_at})
         await push_status(task_id, TaskStatus.finished)
 
-        # Считаем result (идемпотентно, как в create_and_run_collections_task)
         stats_doc = await db.scraping_tasks.find_one({"id": task_id}, {"stats": 1, "started_at": 1})
         stats = (stats_doc or {}).get("stats", {}) or {}
         started_at = (stats_doc or {}).get("started_at")
@@ -942,7 +912,7 @@ class Coordinator:
         }
         await db.scraping_tasks.update_one(
             {"id": task_id},
-            {"$set": {"stats.final": stats, "result": result, "finalized_at": finished_at}, "$currentDate": {"updated_at": True}},
+            {"$set": {"result": result}, "$currentDate": {"updated_at": True}},
         )
 
     # ----- blocking waits for collections follow-up -----
@@ -952,8 +922,9 @@ class Coordinator:
         *,
         task_id: str,
         status_consumer: AIOKafkaConsumer,
-        worker: str,                # "indexer" | "enricher"
-        timeout_sec: int
+        worker: str,
+        timeout_sec: int,
+        expected_batches: Optional[int] = None,
     ) -> None:
         last_progress = time.time()
         done_batches: set[int] = set()
@@ -966,16 +937,47 @@ class Coordinator:
             try:
                 if st.get("task_id") != task_id:
                     continue
-                await record_worker_event(task_id, worker, st)
+                ev_hash = await record_worker_event(task_id, worker, st)
                 ts = int(st.get("ts") or _now_ts())
                 await db.scraping_tasks.update_one(
                     {"id": task_id},
                     {"$max": {"last_event_ts": ts}, "$currentDate": {"updated_at": True}},
                 )
 
+                if st.get("status") == "ok":
+                    if await acquire_event_for_metrics(task_id, worker, ev_hash):
+                        bd = st.get("batch_data") or {}
+                        if worker == "indexer":
+                            ins = int(bd.get("inserted", 0))
+                            upd = int(bd.get("updated", 0))
+                            pgs = int(bd.get("pages", 0))
+                            await db.scraping_tasks.update_one(
+                                {"id": task_id},
+                                {"$inc": {
+                                    "stats.index.indexed": ins + upd,
+                                    "stats.index.inserted": ins,
+                                    "stats.index.updated": upd,
+                                    "stats.index.pages": pgs,
+                                }, "$currentDate": {"updated_at": True}},
+                            )
+                        elif worker == "enricher":
+                            inc = {
+                                "stats.enrich.processed": int(bd.get("processed", 0)),
+                                "stats.enrich.inserted": int(bd.get("inserted", 0)),
+                                "stats.enrich.updated": int(bd.get("updated", 0)),
+                            }
+                            if "reviews_saved" in bd:
+                                inc["stats.enrich.reviews_saved"] = int(bd.get("reviews_saved", 0))
+                            if "dlq" in bd:
+                                inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
+                            await db.scraping_tasks.update_one({"id": task_id}, {"$inc": inc, "$currentDate": {"updated_at": True}})
+
                 if st.get("status") == "ok" and st.get("batch_id"):
                     done_batches.add(int(st["batch_id"]))
                     last_progress = time.time()
+                    if expected_batches is not None and len(done_batches) >= expected_batches:
+                        break
+
                 if st.get("status") == "task_done" and st.get("done") is True:
                     break
             finally:
@@ -988,12 +990,20 @@ class Coordinator:
         await cons.start()
         prod = await new_producer()
         try:
+            batch_ids = []
             for b_id, batch in enumerate(batched(skus, batch_size), start=1):
                 await prod.send_and_wait(
                     TOPIC_INDEXER_CMD,
                     {"cmd": "add_collection_members", "task_id": task_id, "batch_id": b_id, "skus": batch, "trigger": "collections_followup"},
                 )
-            await self._wait_for_batches(task_id=task_id, status_consumer=cons, worker="indexer", timeout_sec=timeout_sec)
+                batch_ids.append(b_id)
+            await self._wait_for_batches(
+                task_id=task_id,
+                status_consumer=cons,
+                worker="indexer",
+                timeout_sec=timeout_sec,
+                expected_batches=len(batch_ids),
+            )
         finally:
             await cons.stop()
             await prod.stop()
@@ -1026,9 +1036,19 @@ class Coordinator:
                     TOPIC_ENRICHER_CMD,
                     {"cmd": "enrich_skus", "task_id": task_id, "batch_id": b_id, "skus": batch, "trigger": "collections_followup"},
                 )
+                await db.scraping_tasks.update_one(
+                    {"id": task_id},
+                    {"$inc": {"stats.forwarded.to_enricher": len(batch)}, "$currentDate": {"updated_at": True}},
+                )
                 batch_ids.append(b_id)
 
-            await self._wait_for_batches(task_id=task_id, status_consumer=cons, worker="enricher", timeout_sec=timeout_sec)
+            await self._wait_for_batches(
+                task_id=task_id,
+                status_consumer=cons,
+                worker="enricher",
+                timeout_sec=timeout_sec,
+                expected_batches=len(batch_ids),
+            )
         finally:
             await cons.stop()
             await prod.stop()
