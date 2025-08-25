@@ -794,11 +794,6 @@ class Coordinator:
             await self._send_enricher_and_wait(new_task_id, new_skus)
             await patch_task(new_task_id, {"workers.enricher.status": "task_done"})
 
-            await db.collections.update_many(
-                {"task_id": new_task_id, "status": "queued"},
-                {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
-            )
-
             finished_at = _now_dt()
             await patch_task(new_task_id, {"finished_at": finished_at})
             await push_status(new_task_id, TaskStatus.finished)
@@ -848,11 +843,6 @@ class Coordinator:
             asyncio.create_task(self._resume_collections_task(task_id))
             return
 
-        await db.collections.update_many(
-            {"task_id": task_id, "status": "queued"},
-            {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
-        )
-
         await patch_task(task_id, {
             "workers.indexer.status": "task_done",
             "workers.enricher.status": "task_done",
@@ -878,6 +868,7 @@ class Coordinator:
         timeout_sec: int,
         expected_batches: Optional[int] = None,
         collect_new_index_skus: bool = False,
+        update_collections_per_batch: bool = True,
     ) -> List[str]:
         """
         Waits for batches from a given worker. When 'collect_new_index_skus' is True and worker='indexer',
@@ -934,6 +925,25 @@ class Coordinator:
                             if "dlq" in bd:
                                 inc["stats.enrich.dlq"] = int(bd.get("dlq", 0))
                             await db.scraping_tasks.update_one({"id": task_id}, {"$inc": inc, "$currentDate": {"updated_at": True}})
+
+                    if worker == "enricher" and update_collections_per_batch:
+                        processed_skus = [str(s).strip() for s in (bd.get("skus") or []) if str(s).strip()]
+                        dlq_skus: List[str] = []
+                        b_id = st.get("batch_id")
+
+                        # DLQ берём из базы по связке (task_id, batch_id)
+                        if b_id is not None:
+                            dlq_docs = await db.enrich_dlq.find(
+                                {"task_id": task_id, "batch_id": int(b_id)},
+                                {"sku": 1, "_id": 0}
+                            ).to_list(None)
+                            dlq_skus = [str(d.get("sku")).strip() for d in dlq_docs if d.get("sku")]
+
+                        await self._update_collections_per_skus(
+                            task_id=task_id,
+                            processed_skus=processed_skus,
+                            dlq_skus=dlq_skus,
+                        )
 
                 if st.get("status") == "ok" and st.get("batch_id"):
                     done_batches.add(int(st["batch_id"]))
@@ -1028,6 +1038,39 @@ class Coordinator:
             await prod.stop()
 
     # ----- utils -----
+
+    async def _update_collections_per_skus(self, *, task_id: str, processed_skus: List[str], dlq_skus: List[str]) -> None:
+        """Atomically mark per-SKU statuses inside collections and finalize collections that have no queued items left."""
+        # Normalize & dedup
+        def _norm(xs: List[str]) -> List[str]:
+            return sorted({str(x).strip() for x in xs if str(x).strip()})
+
+        processed_skus = _norm(processed_skus)
+        dlq_skus = _norm(dlq_skus)
+
+        # Per-SKU status updates using arrayFilters (skip empty lists to avoid arrayFilters errors)
+        if processed_skus:
+            await db.collections.update_many(
+                {"task_id": task_id, "skus.sku": {"$in": processed_skus}},
+                {"$set": {"skus.$[e].status": "processed"}, "$currentDate": {"updated_at": True}},
+                array_filters=[{"e.sku": {"$in": processed_skus}}],
+            )
+        if dlq_skus:
+            await db.collections.update_many(
+                {"task_id": task_id, "skus.sku": {"$in": dlq_skus}},
+                {"$set": {"skus.$[e].status": "dlq"}, "$currentDate": {"updated_at": True}},
+                array_filters=[{"e.sku": {"$in": dlq_skus}}],
+            )
+
+        # Finalize only collections where no queued SKUs remain
+        await db.collections.update_many(
+            {
+                "task_id": task_id,
+                "status": {"$ne": "processed"},
+                "skus": {"$not": {"$elemMatch": {"status": "queued"}}},
+            },
+            {"$set": {"status": "processed"}, "$currentDate": {"updated_at": True}},
+        )
 
     def _stable_group(self, prefix: str, task_id: str) -> str:
         return f"{prefix}-monitor-{task_id}"
