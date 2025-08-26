@@ -392,17 +392,25 @@ export default function App() {
 
   const fetchFilterCharacteristics = useCallback(async () => {
     try {
+      // собираем общие параметры фасетов из текущего фильтра
+      const facetParams = new URLSearchParams();
+      if (currentFilter.q) facetParams.set("q", currentFilter.q);
+      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+        (vals || []).forEach(v => facetParams.append(`char_${cid}`, v));
+      });
       if (productsMode === "byTask" && productsTaskId) {
-        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?scope=${productsScope}`;
+        facetParams.set("scope", productsScope);
+        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?${facetParams.toString()}`;
         const res = await api.get(url);
         const arr = Array.isArray(res.data) ? res.data : [];
         setCharByTask(prev => ({ ...prev, [filterKey]: arr }));
       } else {
-        const res = await api.get("/products/characteristics");
+        const url = `/products/characteristics?${facetParams.toString()}`;
+        const res = await api.get(url);
         setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
       }
     } catch { /* noop */ }
-  }, [productsMode, productsTaskId, productsScope, filterKey]);
+  }, [productsMode, productsTaskId, productsScope, filterKey, currentFilter]);
 
   const handleFilterChange = React.useCallback((next) => {
     setPage(1);
@@ -444,7 +452,7 @@ export default function App() {
   useEffect(() => {
     fetchProducts().catch(() => {});
     fetchFilterCharacteristics().catch(() => {});
- }, [fetchProducts, fetchFilterCharacteristics]);
+  }, [fetchProducts, fetchFilterCharacteristics, currentFilter]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();

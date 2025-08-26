@@ -331,6 +331,7 @@ async def get_task_products(
 
 @router.get("/tasks/{task_id}/products/characteristics", response_model=List[CharacteristicItem])
 async def get_task_products_characteristics(
+    request: Request,
     task_id: str,
     scope: str = Query("task", pattern="^(task|pipeline)$"),
     limit_values_per_char: int = Query(500, ge=1, le=10_000),
@@ -360,8 +361,18 @@ async def get_task_products_characteristics(
     if not cand_ids:
         return []
 
+    # база под текущие фильтры/поиск
+    base_match: Dict[str, Any] = {"_id": {"$in": cand_ids}}
+    q = request.query_params.get("q")
+    search_q = _build_search_query(q)
+    if search_q:
+        base_match.update(search_q)
+    char_filters = _build_characteristics_filters(request.query_params)
+    if char_filters:
+        base_match.setdefault("$and", []).extend(char_filters)
+
     pipeline = [
-        {"$match": {"_id": {"$in": cand_ids}}},
+        {"$match": base_match},
         {"$unwind": {"path": "$characteristics.full", "preserveNullAndEmptyArrays": False}},
         {"$unwind": {"path": "$characteristics.full.values", "preserveNullAndEmptyArrays": False}},
         {"$group": {

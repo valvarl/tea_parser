@@ -181,13 +181,25 @@ async def get_tea_products(
 
 @router.get("/characteristics", response_model=List[CharacteristicItem])
 async def get_available_characteristics(
+    request: Request,
     limit_values_per_char: int = Query(500, ge=1, le=10_000, description="Ограничение на кол-во значений в одной характеристике")
 ):
     """
     Возвращает список доступных характеристик и уникальные значения по каждому id.
     Используется фронтендом для построения фильтров.
     """
+    # учитываем текущий поиск/фильтры
+    match: Dict[str, Any] = {}
+    q = request.query_params.get("q")
+    search_q = _build_search_query(q)
+    if search_q:
+        match.update(search_q)
+    char_filters = _build_characteristics_filters(request.query_params)
+    if char_filters:
+        match.setdefault("$and", []).extend(char_filters)
+
     pipeline = [
+        {"$match": match if match else {}},
         {"$unwind": {"path": "$characteristics.full", "preserveNullAndEmptyArrays": False}},
         {"$unwind": {"path": "$characteristics.full.values", "preserveNullAndEmptyArrays": False}},
         {"$group": {
