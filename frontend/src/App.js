@@ -56,12 +56,12 @@ function StatusBadge({ status }) {
     status === "finished"
       ? "bg-green-100 text-green-800"
       : status === "running"
-        ? "bg-blue-100 text-blue-800"
-        : status === "failed"
-          ? "bg-red-100 text-red-800"
-          : status === "pending"
-            ? "bg-yellow-100 text-yellow-800"
-            : "bg-gray-100 text-gray-800";
+      ? "bg-blue-100 text-blue-800"
+      : status === "failed"
+      ? "bg-red-100 text-red-800"
+      : status === "pending"
+      ? "bg-yellow-100 text-yellow-800"
+      : "bg-gray-100 text-gray-800";
   return (
     <span className={`px-2 py-1 rounded-full text-xs font-medium ${cls}`}>
       {status}
@@ -271,29 +271,116 @@ export default function App() {
   const [modalProduct, setModalProduct] = useState(null);
 
   // фильтр: раздельно для "all" и для "byTask" по ключу taskId::scope
-  const DEFAULT_FILTER = useMemo(() => ({
-    q: "",
-    sort_by: "updated_at",
-    sort_dir: "desc",
-    filters: {}, // Record<charId, string[]>
-  }), []);
+  const DEFAULT_FILTER = useMemo(
+    () => ({
+      q: "",
+      sort_by: "updated_at",
+      sort_dir: "desc",
+      filters: {}, // Record<charId, string[]>
+    }),
+    []
+  );
+
   const [filterAll, setFilterAll] = useState({ ...DEFAULT_FILTER });
   const [filterByTask, setFilterByTask] = useState({}); // { [key]: FilterValue }
+
   const filterKey = useMemo(
-    () => (productsMode === "byTask" ? `${productsTaskId || ""}::${productsScope}` : "all"),
+    () =>
+      productsMode === "byTask"
+        ? `${productsTaskId || ""}::${productsScope}`
+        : "all",
     [productsMode, productsTaskId, productsScope]
   );
+
   const currentFilter = useMemo(
-    () => (productsMode === "byTask" ? (filterByTask[filterKey] || DEFAULT_FILTER) : filterAll),
+    () =>
+      productsMode === "byTask"
+        ? filterByTask[filterKey] || DEFAULT_FILTER
+        : filterAll,
     [productsMode, filterByTask, filterKey, filterAll, DEFAULT_FILTER]
   );
+
   // характеристики для фильтра (кеш)
   const [charAll, setCharAll] = useState([]);
   const [charByTask, setCharByTask] = useState({}); // { [key]: Characteristic[] }
   const currentCharacteristics = useMemo(
-    () => (productsMode === "byTask" ? (charByTask[filterKey] || []) : charAll),
+    () => (productsMode === "byTask" ? charByTask[filterKey] || [] : charAll),
     [productsMode, charByTask, filterKey, charAll]
   );
+
+  // загрузка для скелетонов
+  const [loadingProducts, setLoadingProducts] = useState(false);
+  const [loadingFacets, setLoadingFacets] = useState(false);
+
+  // --- deep-linking: парсинг URL -> state
+  const parseUrlToState = useCallback(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const tab = sp.get("tab");
+    const mode = sp.get("mode");
+    const taskId = sp.get("taskId");
+    const scope = sp.get("scope");
+    const q = sp.get("q") || "";
+    const sort_by = sp.get("sort_by") || "updated_at";
+    const sort_dir = (sp.get("sort_dir") || "desc") === "asc" ? "asc" : "desc";
+    const pageQ = parseInt(sp.get("page") || "1", 10);
+    const limitQ = parseInt(sp.get("limit") || "24", 10);
+
+    // собрать char_* -> Record<string,string[]>
+    const filters = {};
+    for (const [k, v] of sp.entries()) {
+      if (k.startsWith("char_") && v) {
+        const cid = k.slice(5);
+        filters[cid] = filters[cid] || [];
+        filters[cid].push(v);
+      }
+    }
+
+    if (tab) setActiveTab(tab);
+    if (Number.isFinite(pageQ) && pageQ > 0) setPage(pageQ);
+    if (Number.isFinite(limitQ) && [12, 24, 48, 96].includes(limitQ))
+      setPageSize(limitQ);
+
+    const parsedFilter = { q, sort_by, sort_dir, filters };
+    if (mode === "byTask" && taskId) {
+      setProductsMode("byTask");
+      setProductsTaskId(taskId);
+      setProductsScope(scope === "pipeline" ? "pipeline" : "task");
+      const key = `${taskId}::${scope === "pipeline" ? "pipeline" : "task"}`;
+      setFilterByTask((prev) => ({ ...prev, [key]: parsedFilter }));
+    } else {
+      setProductsMode("all");
+      setFilterAll(parsedFilter);
+    }
+  }, []);
+
+  // --- deep-linking: state -> URL (replaceState)
+  const writeStateToUrl = useCallback(() => {
+    const sp = new URLSearchParams();
+    sp.set("tab", activeTab);
+    sp.set("mode", productsMode);
+    if (productsMode === "byTask" && productsTaskId) {
+      sp.set("taskId", productsTaskId);
+      sp.set("scope", productsScope);
+    }
+    sp.set("page", String(page));
+    sp.set("limit", String(pageSize));
+    if (currentFilter.q) sp.set("q", currentFilter.q);
+    sp.set("sort_by", currentFilter.sort_by || "updated_at");
+    sp.set("sort_dir", currentFilter.sort_dir || "desc");
+    Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+      (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
+    });
+    const url = `${window.location.pathname}?${sp.toString()}`;
+    window.history.replaceState(null, "", url);
+  }, [
+    activeTab,
+    productsMode,
+    productsTaskId,
+    productsScope,
+    page,
+    pageSize,
+    currentFilter,
+  ]);
 
   const openProductModal = useCallback(
     (prodOrSku) => {
@@ -355,76 +442,104 @@ export default function App() {
   }, []);
 
   const fetchProducts = useCallback(async () => {
-    // режим: товары одной задачи
-    if (productsMode === "byTask" && productsTaskId) {
+    setLoadingProducts(true);
+    try {
+      if (productsMode === "byTask" && productsTaskId) {
+        const params = new URLSearchParams();
+        params.set("limit", String(pageSize));
+        params.set("skip", String((page - 1) * pageSize));
+        params.set("scope", productsScope); // 'task' | 'pipeline'
+        // поиск/сорт/фильтры
+        if (currentFilter.q) params.set("q", currentFilter.q);
+        params.set("sort_by", currentFilter.sort_by || "updated_at");
+        params.set("sort_dir", currentFilter.sort_dir || "desc");
+        const filters = currentFilter.filters || {};
+        Object.entries(filters).forEach(([cid, vals]) => {
+          (vals || []).forEach((v) => params.append(`char_${cid}`, v));
+        });
+        const res = await api.get(
+          `/tasks/${encodeURIComponent(
+            productsTaskId
+          )}/products?${params.toString()}`
+        );
+        setProducts(res.data?.items || []);
+        setTotalProducts(res.data?.total || 0);
+        return;
+      }
+      // режим: общий список
       const params = new URLSearchParams();
       params.set("limit", String(pageSize));
       params.set("skip", String((page - 1) * pageSize));
-      params.set("scope", productsScope); // 'task' | 'pipeline'
-      // поиск/сорт/фильтры
       if (currentFilter.q) params.set("q", currentFilter.q);
       params.set("sort_by", currentFilter.sort_by || "updated_at");
       params.set("sort_dir", currentFilter.sort_dir || "desc");
       const filters = currentFilter.filters || {};
       Object.entries(filters).forEach(([cid, vals]) => {
-        (vals || []).forEach(v => params.append(`char_${cid}`, v));
+        (vals || []).forEach((v) => params.append(`char_${cid}`, v));
       });
-      const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`);
+      const res = await api.get(`/products?${params.toString()}`);
       setProducts(res.data?.items || []);
       setTotalProducts(res.data?.total || 0);
-      return;
+    } finally {
+      setLoadingProducts(false);
     }
-    // режим: общий список
-    const params = new URLSearchParams();
-    params.set("limit", String(pageSize));
-    params.set("skip", String((page - 1) * pageSize));
-    if (currentFilter.q) params.set("q", currentFilter.q);
-    params.set("sort_by", currentFilter.sort_by || "updated_at");
-    params.set("sort_dir", currentFilter.sort_dir || "desc");
-    const filters = currentFilter.filters || {};
-    Object.entries(filters).forEach(([cid, vals]) => {
-      (vals || []).forEach(v => params.append(`char_${cid}`, v));
-    });
-    const res = await api.get(`/products?${params.toString()}`);
-    setProducts(res.data?.items || []);
-    setTotalProducts(res.data?.total || 0);
-  }, [page, pageSize, productsMode, productsTaskId, productsScope, currentFilter]);
+  }, [
+    page,
+    pageSize,
+    productsMode,
+    productsTaskId,
+    productsScope,
+    currentFilter,
+  ]);
 
   const fetchFilterCharacteristics = useCallback(async () => {
     try {
       // собираем общие параметры фасетов из текущего фильтра
+      setLoadingFacets(true);
       const facetParams = new URLSearchParams();
       if (currentFilter.q) facetParams.set("q", currentFilter.q);
       Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
-        (vals || []).forEach(v => facetParams.append(`char_${cid}`, v));
+        (vals || []).forEach((v) => facetParams.append(`char_${cid}`, v));
       });
       if (productsMode === "byTask" && productsTaskId) {
         facetParams.set("scope", productsScope);
-        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?${facetParams.toString()}`;
+        const url = `/tasks/${encodeURIComponent(
+          productsTaskId
+        )}/products/characteristics?${facetParams.toString()}`;
         const res = await api.get(url);
         const arr = Array.isArray(res.data) ? res.data : [];
-        setCharByTask(prev => ({ ...prev, [filterKey]: arr }));
+        setCharByTask((prev) => ({ ...prev, [filterKey]: arr }));
       } else {
         const url = `/products/characteristics?${facetParams.toString()}`;
         const res = await api.get(url);
         setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
       }
-    } catch { /* noop */ }
+    } catch {
+      /* noop */
+    } finally {
+      setLoadingFacets(false);
+    }
   }, [productsMode, productsTaskId, productsScope, filterKey, currentFilter]);
 
-  const handleFilterChange = React.useCallback((next) => {
-    setPage(1);
-    if (productsMode === "byTask") {
-      setFilterByTask(prev => ({ ...prev, [filterKey]: next }));
-    } else {
-      setFilterAll(next);
-    }
-  }, [productsMode, filterKey]);
+  const handleFilterChange = React.useCallback(
+    (next) => {
+      setPage(1);
+      if (productsMode === "byTask") {
+        setFilterByTask((prev) => ({ ...prev, [filterKey]: next }));
+      } else {
+        setFilterAll(next);
+      }
+    },
+    [productsMode, filterKey]
+  );
 
   const handleFilterReset = React.useCallback(() => {
     setPage(1);
     if (productsMode === "byTask") {
-      setFilterByTask(prev => ({ ...prev, [filterKey]: { ...DEFAULT_FILTER } }));
+      setFilterByTask((prev) => ({
+        ...prev,
+        [filterKey]: { ...DEFAULT_FILTER },
+      }));
     } else {
       setFilterAll({ ...DEFAULT_FILTER });
     }
@@ -444,6 +559,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    writeStateToUrl();
+  }, [writeStateToUrl]);
+
+  useEffect(() => {
+    parseUrlToState();
     fetchStats().catch(() => {});
     fetchTasks().catch(() => {});
     fetchCategories().catch(() => {}); // (если ещё нужно для других мест)
@@ -748,7 +868,10 @@ export default function App() {
                   Products ({totalProducts})
                 </h3>
                 <button
-                  onClick={() => { setPage(1); fetchProducts().catch(() => {}); }}
+                  onClick={() => {
+                    setPage(1);
+                    fetchProducts().catch(() => {});
+                  }}
                   className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
                 >
                   🔄 Refresh
@@ -765,18 +888,35 @@ export default function App() {
                 value={currentFilter}
                 onChange={handleFilterChange}
                 onReset={handleFilterReset}
-                loading={loading}
+                loading={loadingProducts}
+                loadingFacets={loadingFacets}
               />
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {products.map((p) => (
-                  <TeaCard
-                    key={p.id}
-                    product={p}
-                    onDelete={deleteProduct}
-                    onOpen={() => openProductModal(p)}
-                  />
-                ))}
+                {loadingProducts &&
+                  Array.from({ length: Math.min(pageSize, 12) }).map((_, i) => (
+                    <div
+                      key={`sk-${i}`}
+                      className="bg-white rounded-lg shadow-md p-4"
+                    >
+                      <div className="h-5 w-3/4 skeleton shimmer mb-3"></div>
+                      <div className="w-full h-44 skeleton shimmer mb-3"></div>
+                      <div className="space-y-2">
+                        <div className="h-4 w-2/3 skeleton shimmer"></div>
+                        <div className="h-4 w-1/2 skeleton shimmer"></div>
+                        <div className="h-3 w-1/3 skeleton shimmer"></div>
+                      </div>
+                    </div>
+                  ))}
+                {!loadingProducts &&
+                  products.map((p) => (
+                    <TeaCard
+                      key={p.id}
+                      product={p}
+                      onDelete={deleteProduct}
+                      onOpen={() => openProductModal(p)}
+                    />
+                  ))}
               </div>
 
               {products.length === 0 && (
@@ -835,12 +975,12 @@ export default function App() {
             </div>
           </div>
         )}
-      <ProductModal
-        isOpen={isProductModalOpen}
-        product={modalProduct || {}}
-        onClose={closeProductModal}
-        onSelectSku={(sku) => openProductModal(sku)}
-      />
+        <ProductModal
+          isOpen={isProductModalOpen}
+          product={modalProduct || {}}
+          onClose={closeProductModal}
+          onSelectSku={(sku) => openProductModal(sku)}
+        />
       </main>
     </div>
   );
