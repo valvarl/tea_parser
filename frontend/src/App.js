@@ -4,6 +4,7 @@ import PropTypes from "prop-types";
 import "./App.css";
 import ProductModal from "./components/ProductModal";
 import TaskItem from "./components/TaskItem";
+import ProductsFilter from "./components/ProductsFilter";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
@@ -256,7 +257,7 @@ export default function App() {
   const [totalProducts, setTotalProducts] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(24);
-  const [selectedTeaType, setSelectedTeaType] = useState("");
+  // const [selectedTeaType, setSelectedTeaType] = useState("");
   const [tasks, setTasks] = useState([]);
   const [tasksParentFilter, setTasksParentFilter] = useState("");
   const [productsMode, setProductsMode] = useState("all"); // all | byTask
@@ -268,6 +269,31 @@ export default function App() {
   const [categories, setCategories] = useState([]);
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
   const [modalProduct, setModalProduct] = useState(null);
+
+  // фильтр: раздельно для "all" и для "byTask" по ключу taskId::scope
+  const DEFAULT_FILTER = useMemo(() => ({
+    q: "",
+    sort_by: "updated_at",
+    sort_dir: "desc",
+    filters: {}, // Record<charId, string[]>
+  }), []);
+  const [filterAll, setFilterAll] = useState({ ...DEFAULT_FILTER });
+  const [filterByTask, setFilterByTask] = useState({}); // { [key]: FilterValue }
+  const filterKey = useMemo(
+    () => (productsMode === "byTask" ? `${productsTaskId || ""}::${productsScope}` : "all"),
+    [productsMode, productsTaskId, productsScope]
+  );
+  const currentFilter = useMemo(
+    () => (productsMode === "byTask" ? (filterByTask[filterKey] || DEFAULT_FILTER) : filterAll),
+    [productsMode, filterByTask, filterKey, filterAll, DEFAULT_FILTER]
+  );
+  // характеристики для фильтра (кеш)
+  const [charAll, setCharAll] = useState([]);
+  const [charByTask, setCharByTask] = useState({}); // { [key]: Characteristic[] }
+  const currentCharacteristics = useMemo(
+    () => (productsMode === "byTask" ? (charByTask[filterKey] || []) : charAll),
+    [productsMode, charByTask, filterKey, charAll]
+  );
 
   const openProductModal = useCallback(
     (prodOrSku) => {
@@ -335,6 +361,14 @@ export default function App() {
       params.set("limit", String(pageSize));
       params.set("skip", String((page - 1) * pageSize));
       params.set("scope", productsScope); // 'task' | 'pipeline'
+      // поиск/сорт/фильтры
+      if (currentFilter.q) params.set("q", currentFilter.q);
+      params.set("sort_by", currentFilter.sort_by || "updated_at");
+      params.set("sort_dir", currentFilter.sort_dir || "desc");
+      const filters = currentFilter.filters || {};
+      Object.entries(filters).forEach(([cid, vals]) => {
+        (vals || []).forEach(v => params.append(`char_${cid}`, v));
+      });
       const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`);
       setProducts(res.data?.items || []);
       setTotalProducts(res.data?.total || 0);
@@ -344,11 +378,49 @@ export default function App() {
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("skip", String((page - 1) * pageSize));
-    if (selectedTeaType) params.set("tea_type", selectedTeaType);
+    if (currentFilter.q) params.set("q", currentFilter.q);
+    params.set("sort_by", currentFilter.sort_by || "updated_at");
+    params.set("sort_dir", currentFilter.sort_dir || "desc");
+    const filters = currentFilter.filters || {};
+    Object.entries(filters).forEach(([cid, vals]) => {
+      (vals || []).forEach(v => params.append(`char_${cid}`, v));
+    });
     const res = await api.get(`/products?${params.toString()}`);
     setProducts(res.data?.items || []);
     setTotalProducts(res.data?.total || 0);
-  }, [page, pageSize, selectedTeaType, productsMode, productsTaskId, productsScope]);
+  }, [page, pageSize, productsMode, productsTaskId, productsScope, currentFilter]);
+
+  const fetchFilterCharacteristics = useCallback(async () => {
+    try {
+      if (productsMode === "byTask" && productsTaskId) {
+        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?scope=${productsScope}`;
+        const res = await api.get(url);
+        const arr = Array.isArray(res.data) ? res.data : [];
+        setCharByTask(prev => ({ ...prev, [filterKey]: arr }));
+      } else {
+        const res = await api.get("/products/characteristics");
+        setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
+      }
+    } catch { /* noop */ }
+  }, [productsMode, productsTaskId, productsScope, filterKey]);
+
+  const handleFilterChange = React.useCallback((next) => {
+    setPage(1);
+    if (productsMode === "byTask") {
+      setFilterByTask(prev => ({ ...prev, [filterKey]: next }));
+    } else {
+      setFilterAll(next);
+    }
+  }, [productsMode, filterKey]);
+
+  const handleFilterReset = React.useCallback(() => {
+    setPage(1);
+    if (productsMode === "byTask") {
+      setFilterByTask(prev => ({ ...prev, [filterKey]: { ...DEFAULT_FILTER } }));
+    } else {
+      setFilterAll({ ...DEFAULT_FILTER });
+    }
+  }, [productsMode, filterKey, DEFAULT_FILTER]);
 
   const openProductsForTask = useCallback((taskId, scope = "task") => {
     setProductsMode("byTask");
@@ -366,12 +438,13 @@ export default function App() {
   useEffect(() => {
     fetchStats().catch(() => {});
     fetchTasks().catch(() => {});
-    fetchCategories().catch(() => {});
+    fetchCategories().catch(() => {}); // (если ещё нужно для других мест)
   }, [fetchStats, fetchTasks, fetchCategories]);
 
   useEffect(() => {
     fetchProducts().catch(() => {});
-  }, [fetchProducts]);
+    fetchFilterCharacteristics().catch(() => {});
+ }, [fetchProducts, fetchFilterCharacteristics]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();
@@ -666,33 +739,26 @@ export default function App() {
                 <h3 className="text-lg font-semibold">
                   Products ({totalProducts})
                 </h3>
-                <div className="flex items-center space-x-4">
-                  <select
-                    value={selectedTeaType}
-                    onChange={(e) => {
-                      setPage(1);
-                      setSelectedTeaType(e.target.value);
-                    }}
-                    className="px-3 py-2 border border-gray-300 rounded-lg"
-                  >
-                    <option value="">All types</option>
-                    {categories.map((c) => (
-                      <option key={c._id} value={c._id}>
-                        {c._id} ({c.count})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={() => {
-                      setPage(1);
-                      fetchProducts().catch(() => {});
-                    }}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                  >
-                    🔄 Refresh
-                  </button>
-                </div>
+                <button
+                  onClick={() => { setPage(1); fetchProducts().catch(() => {}); }}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  🔄 Refresh
+                </button>
               </div>
+
+              {/* ФИЛЬТР */}
+              <ProductsFilter
+                mode={productsMode}
+                taskId={productsTaskId}
+                scope={productsScope}
+                onScopeChange={(sc) => setProductsScope(sc)}
+                characteristics={currentCharacteristics}
+                value={currentFilter}
+                onChange={handleFilterChange}
+                onReset={handleFilterReset}
+                loading={loading}
+              />
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {products.map((p) => (
