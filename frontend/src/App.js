@@ -5,6 +5,7 @@ import "./App.css";
 import ProductModal from "./components/ProductModal";
 import TaskItem from "./components/TaskItem";
 import ProductsFilter from "./components/ProductsFilter";
+import { RxUpdate } from "react-icons/rx";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
@@ -920,9 +921,11 @@ export default function App() {
                     setPage(1);
                     fetchProducts().catch(() => {});
                   }}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+                  title="Refresh results"
                 >
-                  🔄 Refresh
+                  <RxUpdate className="w-5 h-5" />
+                  Refresh
                 </button>
               </div>
 
@@ -932,6 +935,13 @@ export default function App() {
                 taskId={productsTaskId}
                 scope={productsScope}
                 onScopeChange={(sc) => setProductsScope(sc)}
+                onClearTask={() => {
+                  setProductsMode("all");
+                  setProductsTaskId("");
+                  // при желании сбросить страницу и дернуть фетч:
+                  setPage(1);
+                  // fetchProducts() подтянется из эффекта/кнопки
+                }}
                 characteristics={currentCharacteristics}
                 value={currentFilter}
                 onChange={handleFilterChange}
