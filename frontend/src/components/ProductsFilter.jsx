@@ -97,6 +97,7 @@ export default function ProductsFilter({
   const [showCountByChar, setShowCountByChar] = useState({}); // { [charId]: number }
   const INITIAL_SHOW = 8;
   const SHOW_STEP = 12;
+  const [isComposing, setIsComposing] = useState(false); // IME/ввод по составлению
 
   useEffect(() => {
     setSearchLocal(value?.q || "");
@@ -111,15 +112,22 @@ export default function ProductsFilter({
     setShowCountByChar(next);
   }, [characteristics]);
 
-  // debounce поиска
+  // применить поиск — по Enter/кнопке или после паузы 1000мс (если не идёт composition)
   useEffect(() => {
+    if (isComposing) return; // пока идёт составление символов — не триггерим
     const t = setTimeout(() => {
       if ((value?.q || "") !== (searchLocal || "")) {
         onChange?.({ ...value, q: searchLocal || "" });
       }
-    }, 350);
+    }, 1000);
     return () => clearTimeout(t);
-  }, [searchLocal]);
+  }, [searchLocal, isComposing]);
+
+  const commitSearch = () => {
+    if ((value?.q || "") !== (searchLocal || "")) {
+      onChange?.({ ...value, q: searchLocal || "" });
+    }
+  };
 
   const currentSortKey = useMemo(
     () => keyForSort(value?.sort_by || "updated_at", value?.sort_dir || "desc"),
@@ -207,11 +215,26 @@ export default function ProductsFilter({
               type="text"
               value={searchLocal}
               onChange={(e) => setSearchLocal(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitSearch();
+              }}
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={() => {
+                setIsComposing(false);
+              }}
               placeholder="Search title, description, specs…"
               className="form-input pr-9"
               disabled={isDisabled}
               aria-label="Search products"
             />
+            <button
+              type="button"
+              onClick={commitSearch}
+              className="absolute right-9 top-1/2 -translate-y-1/2 text-sm px-2 py-1 rounded bg-blue-600 text-white hover:bg-blue-700"
+              title="Apply search"
+            >
+              Search
+            </button>
             {searchLocal ? (
               <button
                 type="button"

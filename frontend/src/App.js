@@ -270,6 +270,9 @@ export default function App() {
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
   const [modalProduct, setModalProduct] = useState(null);
 
+  const productsAbortRef = React.useRef(null);
+  const facetsAbortRef = React.useRef(null);
+
   // фильтр: раздельно для "all" и для "byTask" по ключу taskId::scope
   const DEFAULT_FILTER = useMemo(
     () => ({
@@ -311,6 +314,18 @@ export default function App() {
   // загрузка для скелетонов
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [loadingFacets, setLoadingFacets] = useState(false);
+
+  // URL init guard: не пишем в URL, пока не распарсили его
+  const [didInitFromUrl, setDidInitFromUrl] = useState(false);
+
+  // q с дебаунсом для записи в URL (не мешает набору)
+  const [qDebounced, setQDebounced] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setQDebounced(currentFilter.q || "");
+    }, 400);
+    return () => clearTimeout(t);
+  }, [currentFilter.q]);
 
   // --- deep-linking: парсинг URL -> state
   const parseUrlToState = useCallback(() => {
@@ -355,30 +370,42 @@ export default function App() {
 
   // --- deep-linking: state -> URL (replaceState)
   const writeStateToUrl = useCallback(() => {
+    if (!didInitFromUrl) return; // не затираем URL до инициализации
+
     const sp = new URLSearchParams();
     sp.set("tab", activeTab);
-    sp.set("mode", productsMode);
-    if (productsMode === "byTask" && productsTaskId) {
-      sp.set("taskId", productsTaskId);
-      sp.set("scope", productsScope);
+
+    if (activeTab === "products") {
+      sp.set("mode", productsMode);
+      if (productsMode === "byTask" && productsTaskId) {
+        sp.set("taskId", productsTaskId);
+        sp.set("scope", productsScope);
+      }
+      sp.set("page", String(page));
+      sp.set("limit", String(pageSize));
+      if (qDebounced) sp.set("q", qDebounced);
+      sp.set("sort_by", currentFilter.sort_by || "updated_at");
+      sp.set("sort_dir", currentFilter.sort_dir || "desc");
+      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+        (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
+      });
     }
-    sp.set("page", String(page));
-    sp.set("limit", String(pageSize));
-    if (currentFilter.q) sp.set("q", currentFilter.q);
-    sp.set("sort_by", currentFilter.sort_by || "updated_at");
-    sp.set("sort_dir", currentFilter.sort_dir || "desc");
-    Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
-      (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
-    });
-    const url = `${window.location.pathname}?${sp.toString()}`;
-    window.history.replaceState(null, "", url);
+    // для других вкладок намеренно НЕ пишем продуктовые параметры:
+    // оставляем только tab (и то, что реально нужно той вкладке — сейчас ничего)
+
+    const nextUrl = `${window.location.pathname}?${sp.toString()}`;
+    if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+      window.history.replaceState(null, "", nextUrl);
+    }
   }, [
+    didInitFromUrl,
     activeTab,
     productsMode,
     productsTaskId,
     productsScope,
     page,
     pageSize,
+    qDebounced,
     currentFilter,
   ]);
 
@@ -444,6 +471,10 @@ export default function App() {
   const fetchProducts = useCallback(async () => {
     setLoadingProducts(true);
     try {
+      // отменяем предыдущий запрос
+      if (productsAbortRef.current) productsAbortRef.current.abort();
+      productsAbortRef.current = new AbortController();
+
       if (productsMode === "byTask" && productsTaskId) {
         const params = new URLSearchParams();
         params.set("limit", String(pageSize));
@@ -460,7 +491,8 @@ export default function App() {
         const res = await api.get(
           `/tasks/${encodeURIComponent(
             productsTaskId
-          )}/products?${params.toString()}`
+          )}/products?${params.toString()}`,
+          { signal: productsAbortRef.current.signal }
         );
         setProducts(res.data?.items || []);
         setTotalProducts(res.data?.total || 0);
@@ -477,7 +509,9 @@ export default function App() {
       Object.entries(filters).forEach(([cid, vals]) => {
         (vals || []).forEach((v) => params.append(`char_${cid}`, v));
       });
-      const res = await api.get(`/products?${params.toString()}`);
+      const res = await api.get(`/products?${params.toString()}`, {
+        signal: productsAbortRef.current.signal,
+      });
       setProducts(res.data?.items || []);
       setTotalProducts(res.data?.total || 0);
     } finally {
@@ -496,6 +530,9 @@ export default function App() {
     try {
       // собираем общие параметры фасетов из текущего фильтра
       setLoadingFacets(true);
+      if (facetsAbortRef.current) facetsAbortRef.current.abort();
+      facetsAbortRef.current = new AbortController();
+
       const facetParams = new URLSearchParams();
       if (currentFilter.q) facetParams.set("q", currentFilter.q);
       Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
@@ -506,12 +543,16 @@ export default function App() {
         const url = `/tasks/${encodeURIComponent(
           productsTaskId
         )}/products/characteristics?${facetParams.toString()}`;
-        const res = await api.get(url);
+        const res = await api.get(url, {
+          signal: facetsAbortRef.current.signal,
+        });
         const arr = Array.isArray(res.data) ? res.data : [];
         setCharByTask((prev) => ({ ...prev, [filterKey]: arr }));
       } else {
         const url = `/products/characteristics?${facetParams.toString()}`;
-        const res = await api.get(url);
+        const res = await api.get(url, {
+          signal: facetsAbortRef.current.signal,
+        });
         setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
       }
     } catch {
@@ -560,19 +601,26 @@ export default function App() {
 
   useEffect(() => {
     writeStateToUrl();
-  }, [writeStateToUrl]);
+  }, [writeStateToUrl, didInitFromUrl]);
 
   useEffect(() => {
     parseUrlToState();
+    setDidInitFromUrl(true); // теперь можно писать в URL
     fetchStats().catch(() => {});
     fetchTasks().catch(() => {});
     fetchCategories().catch(() => {}); // (если ещё нужно для других мест)
-  }, [fetchStats, fetchTasks, fetchCategories]);
+  }, [fetchStats, fetchTasks, fetchCategories, parseUrlToState]);
 
   useEffect(() => {
+    if (!didInitFromUrl) return;
     fetchProducts().catch(() => {});
     fetchFilterCharacteristics().catch(() => {});
-  }, [fetchProducts, fetchFilterCharacteristics, currentFilter]);
+  }, [
+    didInitFromUrl,
+    fetchProducts,
+    fetchFilterCharacteristics,
+    currentFilter,
+  ]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();
