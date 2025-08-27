@@ -88,6 +88,49 @@ def _build_task_result(stats_doc: Dict[str, Any], finished_at: datetime) -> Dict
         "finished_at": finished_at,
     }
 
+async def _skus_present_in_index(skus: list[str]) -> set[str]:
+    """Вернёт множество SKU, которые уже есть в db.index (по факту наличия документа)."""
+    if not skus:
+        return set()
+    # нормализуем и убираем дубликаты
+    uniq = {str(s).strip() for s in skus if str(s).strip()}
+    if not uniq:
+        return set()
+
+    present: set[str] = set()
+    cur = db.index.find({"sku": {"$in": sorted(uniq)}}, {"sku": 1, "_id": 0})
+    async for d in cur:
+        s = str(d.get("sku") or "").strip()
+        if s:
+            present.add(s)
+    return present
+
+def _collect_all_skus(grouped: Dict[str, List[Dict[str, Any]]]) -> list[str]:
+    out: list[str] = []
+    for bucket in ("collections", "aspects", "other_offers"):
+        for item in grouped.get(bucket, []) or []:
+            out.extend([str(s).strip() for s in (item.get("skus") or []) if str(s).strip()])
+    # порядок нам не важен, но для детерминизма отсортируем как раньше
+    return _normalize_skus(out)
+
+def _filter_grouped_by_missing(
+    grouped: Dict[str, List[Dict[str, Any]]],
+    present: set[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Вернёт новый grouped, где у каждого item оставлены только отсутствующие в index SKU.
+    Полностью покрытые коллекции будут удалены."""
+    out = {"collections": [], "aspects": [], "other_offers": []}
+    for bucket in ("collections", "aspects", "other_offers"):
+        for item in grouped.get(bucket, []) or []:
+            missing = [s for s in (item.get("skus") or []) if s not in present]
+            if not missing:
+                # все SKU уже в index — пропускаем создание коллекции
+                continue
+            new_item = dict(item)
+            new_item["skus"] = _normalize_skus(missing)
+            out[bucket].append(new_item)
+    return out
+
 # ========= generic helpers =========
 
 def chunked(seq: Iterable[Any], size: int) -> Iterable[List[Any]]:
@@ -237,65 +280,122 @@ def build_processing_order(grouped: Dict[str, List[Dict[str, Any]]]) -> List[str
     return ordered
 
 async def _insert_collection_members(task_id: str, collection_hash: str, skus: List[str]) -> None:
-    """Idempotent upsert of members (queued by default)."""
+    """
+    Идемпотентно добавляет membership по новой схеме:
+    - один документ на sku
+    - внутри tasks[] под нужным task_id добавляет/обновляет collections[{hash, status}]
+    - при повторном вызове НЕ создаёт дубль по тому же hash (независимо от статуса)
+    """
     now = _now_dt()
-    ops = []
     for raw in skus:
-        s = str(raw).strip()
-        if not s:
+        sku = str(raw).strip()
+        if not sku:
             continue
-        ops.append(
-            UpdateOne(
-                {"task_id": task_id, "collection_hash": collection_hash, "sku": s},
-                {"$setOnInsert": {"task_id": task_id, "collection_hash": collection_hash, "sku": s,
-                                  "status": "queued", "created_at": now}, "$set": {"updated_at": now}},
-                upsert=True,
-            )
+
+        # 1) гарантируем наличие документа sku
+        await db.collection_members.update_one(
+            {"sku": sku},
+            {"$setOnInsert": {"sku": sku, "created_at": now}, "$set": {"updated_at": now}},
+            upsert=True,
         )
-    if ops:
-        try:
-            await db.collection_members.bulk_write(ops, ordered=False)
-        except pme.BulkWriteError as e:
-            logger.warning("collection_members bulk upsert partial", extra={"event": "bulk_members_partial", "error": str(e)})
+
+        # 2) гарантируем наличие task-вставки
+        upd = await db.collection_members.update_one(
+            {"sku": sku, "tasks.task_id": task_id},
+            {"$set": {"tasks.$.updated_at": now, "updated_at": now}},
+        )
+        if upd.matched_count == 0:
+            await db.collection_members.update_one(
+                {"sku": sku},
+                {"$push": {"tasks": {
+                    "task_id": task_id,
+                    "collections": [],
+                    "created_at": now,
+                    "updated_at": now
+                }},
+                 "$set": {"updated_at": now}},
+            )
+
+        # 3) если membership уже существует (по hash) — просто убедимся, что он есть, статус не меняем
+        exist_try = await db.collection_members.update_one(
+            {"sku": sku},
+            {
+                "$set": {
+                    "tasks.$[t].collections.$[c].status": "queued",  # если был, но без статуса/для унификации
+                    "tasks.$[t].updated_at": now,
+                    "updated_at": now,
+                }
+            },
+            array_filters=[{"t.task_id": task_id}, {"c.hash": collection_hash}],
+        )
+
+        if exist_try.matched_count == 0:
+            # 4) не было такого hash — добавляем
+            await db.collection_members.update_one(
+                {"sku": sku, "tasks.task_id": task_id},
+                {
+                    "$addToSet": {"tasks.$.collections": {"hash": collection_hash, "status": "queued"}},
+                    "$set": {"tasks.$.updated_at": now, "updated_at": now},
+                },
+            )
 
 async def _sync_collection_counts(task_id: str, hashes: List[str]) -> None:
-    """Recalculate counts from collection_members and finalize collections if queued==0."""
+    """
+    Считает total/queued/processed/dlq для каждой коллекции из новой схемы:
+    collection_members (по sku) → tasks[] → collections[{hash, status}]
+    """
     if not hashes:
         return
+
     pipeline = [
-        {"$match": {"task_id": task_id, "collection_hash": {"$in": hashes}}},
+        {"$match": {"tasks": {"$elemMatch": {"task_id": task_id}}}},
+        {"$unwind": "$tasks"},
+        {"$match": {"tasks.task_id": task_id}},
+        {"$unwind": "$tasks.collections"},
+        {"$match": {"tasks.collections.hash": {"$in": hashes}}},
         {"$group": {
-            "_id": "$collection_hash",
+            "_id": "$tasks.collections.hash",
             "total": {"$sum": 1},
-            "queued": {"$sum": {"$cond": [{"$eq": ["$status", "queued"]}, 1, 0]}},
-            "processed": {"$sum": {"$cond": [{"$eq": ["$status", "processed"]}, 1, 0]}},
-            "dlq": {"$sum": {"$cond": [{"$eq": ["$status", "dlq"]}, 1, 0]}},
+            "queued": {"$sum": {"$cond": [{"$eq": ["$tasks.collections.status", "queued"]}, 1, 0]}},
+            "processed": {"$sum": {"$cond": [{"$eq": ["$tasks.collections.status", "processed"]}, 1, 0]}},
+            "dlq": {"$sum": {"$cond": [{"$eq": ["$tasks.collections.status", "dlq"]}, 1, 0]}},
         }},
     ]
+
     async for g in db.collection_members.aggregate(pipeline):
         ch = g["_id"]
-        queued = int(g.get("queued", 0))
         patch = {
             "counts.total": int(g.get("total", 0)),
-            "counts.queued": queued,
+            "counts.queued": int(g.get("queued", 0)),
             "counts.processed": int(g.get("processed", 0)),
             "counts.dlq": int(g.get("dlq", 0)),
             "updated_at": _now_dt(),
         }
-        if queued == 0:
+        if patch["counts.queued"] == 0:
             patch["status"] = "processed"
         await db.collections.update_one({"task_id": task_id, "collection_hash": ch}, {"$set": patch})
 
 async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str, Any]]]) -> Tuple[int, List[str]]:
-    """Create/extend collections and populate collection_members (queued)."""
-    created_count = 0
+    """
+    Создаёт/расширяет коллекции и membership ТОЛЬКО по недостающим SKU.
+    Если у коллекции все SKU уже присутствуют в db.index — такая коллекция НЕ создаётся.
+    Возвращает (количество созданных коллекций, processing_order по недостающим SKU).
+    """
     now = _now_dt()
+    created_count = 0
     touched_hashes: set[str] = set()
 
-    # Upsert collection documents (no embedded SKUs)
+    # 1) узнаём, какие SKU уже есть в индексе
+    all_skus = _collect_all_skus(grouped)
+    present = await _skus_present_in_index(all_skus)
+
+    # 2) оставляем в коллекциях только отсутствующие SKU; полностью покрытые — отбрасываем
+    grouped_missing = _filter_grouped_by_missing(grouped, present)
+
+    # 3) апсерты коллекций и их участников (только по missing)
     for bucket in ("collections", "aspects", "other_offers"):
-        for item in grouped.get(bucket, []):
-            doc = to_collection_doc(item, task_id)
+        for item in grouped_missing.get(bucket, []) or []:
+            doc = to_collection_doc(item, task_id)  # counts.total уже = len(missing)
             filt = {"task_id": task_id, "collection_hash": doc["collection_hash"]}
             on_insert = {k: v for k, v in doc.items() if k != "updated_at"}
             res = await db.collections.update_one(
@@ -306,12 +406,15 @@ async def insert_new_collections(task_id: str, grouped: Dict[str, List[Dict[str,
             if res.upserted_id is not None:
                 created_count += 1
             touched_hashes.add(doc["collection_hash"])
-            # Upsert members for this collection
+
+            # участники коллекции — тоже только недостающие SKU
             await _insert_collection_members(task_id, doc["collection_hash"], item["skus"])
 
-    # Recalculate counts from collection_members and finalize if applicable
-    await _sync_collection_counts(task_id, list(touched_hashes))
-    processing_order = build_processing_order(grouped)
+    # 4) пересчёт счётчиков и формирование порядка обработки по missing
+    if touched_hashes:
+        await _sync_collection_counts(task_id, list(touched_hashes))
+
+    processing_order = build_processing_order(grouped_missing)
     return created_count, processing_order
 
 
@@ -1205,42 +1308,73 @@ class Coordinator:
     # ----- utils -----
 
     async def _update_collections_per_skus(self, *, task_id: str, processed_skus: List[str], dlq_skus: List[str]) -> None:
-        """Mark members by SKU and refresh collections' counters; finalize when queued==0."""
-        processed_skus = [s for s in {str(x).strip() for x in processed_skus} if s]
-        dlq_skus = [s for s in {str(x).strip() for x in dlq_skus} if s]
-
+        """
+        Массово помечает membership: processed/dlq для всех коллекций конкретного task_id.
+        """
         now = _now_dt()
+
         if processed_skus:
             await db.collection_members.update_many(
-                {"task_id": task_id, "sku": {"$in": processed_skus}, "status": "queued"},
-                {"$set": {"status": "processed", "updated_at": now}},
-            )
-        if dlq_skus:
-            await db.collection_members.update_many(
-                {"task_id": task_id, "sku": {"$in": dlq_skus}, "status": "queued"},
-                {"$set": {"status": "dlq", "updated_at": now}},
+                {"sku": {"$in": [s for s in processed_skus if s]}},
+                {
+                    "$set": {
+                        "tasks.$[t].collections.$[c].status": "processed",
+                        "tasks.$[t].updated_at": now,
+                        "updated_at": now,
+                    }
+                },
+                array_filters=[{"t.task_id": task_id}, {"c.status": "queued"}],
             )
 
-        affected = set()
-        if processed_skus:
-            ch1 = await db.collection_members.distinct(
-                "collection_hash", {"task_id": task_id, "sku": {"$in": processed_skus}}
-            )
-            affected.update(ch1)
         if dlq_skus:
-            ch2 = await db.collection_members.distinct(
-                "collection_hash", {"task_id": task_id, "sku": {"$in": dlq_skus}}
+            await db.collection_members.update_many(
+                {"sku": {"$in": [s for s in dlq_skus if s]}},
+                {
+                    "$set": {
+                        "tasks.$[t].collections.$[c].status": "dlq",
+                        "tasks.$[t].updated_at": now,
+                        "updated_at": now,
+                    }
+                },
+                array_filters=[{"t.task_id": task_id}, {"c.status": "queued"}],
             )
-            affected.update(ch2)
+
+        # освежим счётчики только затронутых коллекций
+        affected: set[str] = set()
+        if processed_skus:
+            cur1 = db.collection_members.aggregate([
+                {"$match": {"sku": {"$in": processed_skus}, "tasks": {"$elemMatch": {"task_id": task_id}}}},
+                {"$unwind": "$tasks"},
+                {"$match": {"tasks.task_id": task_id}},
+                {"$unwind": "$tasks.collections"},
+                {"$group": {"_id": None, "hashes": {"$addToSet": "$tasks.collections.hash"}}},
+            ])
+            async for d in cur1:
+                affected.update(d.get("hashes", []))
+
+        if dlq_skus:
+            cur2 = db.collection_members.aggregate([
+                {"$match": {"sku": {"$in": dlq_skus}, "tasks": {"$elemMatch": {"task_id": task_id}}}},
+                {"$unwind": "$tasks"},
+                {"$match": {"tasks.task_id": task_id}},
+                {"$unwind": "$tasks.collections"},
+                {"$group": {"_id": None, "hashes": {"$addToSet": "$tasks.collections.hash"}}},
+            ])
+            async for d in cur2:
+                affected.update(d.get("hashes", []))
 
         if affected:
-            await _sync_collection_counts(task_id, [str(h) for h in affected])
+            await _sync_collection_counts(task_id, sorted(affected))
 
     def _stable_group(self, prefix: str, task_id: str) -> str:
         return f"{prefix}-monitor-{task_id}"
 
     async def _ensure_indexes(self) -> None:
         try:
+            try:
+                await db.index.create_index([("sku", 1)], unique=True, name="uniq_index_sku")
+            except Exception:
+                pass
             await db.worker_events.create_index(
                 [("task_id", 1), ("worker", 1), ("event_hash", 1)],
                 unique=True,
@@ -1256,21 +1390,16 @@ class Coordinator:
             await db.worker_progress.create_index([("ts", 1)], expireAfterSeconds=60 * 24 * 3600, name="ttl_worker_progress")
 
             # collections: no embedded skus; unique per task
-            await db.collections.create_index(
-                [("task_id", 1), ("collection_hash", 1)],
-                unique=True,
-                name="uniq_collection_per_task",
-            )
-            await db.collections.create_index([("status", 1), ("updated_at", 1)], name="ix_collection_status_updated")
-
-            # collection_members: unique per (task, collection, sku); also lookup helpers
+            await db.collection_members.create_index([("sku", 1)], unique=True, name="uniq_member_sku")
+            await db.collection_members.create_index([("tasks.task_id", 1)], name="ix_member_task")
             await db.collection_members.create_index(
-                [("task_id", 1), ("collection_hash", 1), ("sku", 1)],
-                unique=True,
-                name="uniq_member",
+                [("tasks.task_id", 1), ("tasks.collections.hash", 1)],
+                name="ix_member_task_hash",
             )
-            await db.collection_members.create_index([("task_id", 1), ("sku", 1)], name="ix_member_task_sku")
-            await db.collection_members.create_index([("task_id", 1), ("collection_hash", 1), ("status", 1)], name="ix_member_task_hash_status")
+            await db.collection_members.create_index(
+                [("tasks.task_id", 1), ("tasks.collections.hash", 1), ("tasks.collections.status", 1)],
+                name="ix_member_task_hash_status",
+            )
             await db.collection_members.create_index([("updated_at", 1)], name="ix_member_updated_at")
 
             await db.enrich_batches.create_index(
