@@ -3,43 +3,15 @@ import axios from "axios";
 import PropTypes from "prop-types";
 import "./App.css";
 import ProductModal from "./components/ProductModal";
+import ProductCard from "./components/ProductCard";
 import TaskItem from "./components/TaskItem";
 import ProductsFilter from "./components/ProductsFilter";
+import Pagination from "./components/Pagination";
 import { RxUpdate } from "react-icons/rx";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
 const api = axios.create({ baseURL: API });
-
-const DateLike = PropTypes.oneOfType([PropTypes.string, PropTypes.number, PropTypes.instanceOf(Date)]);
-
-const ProductPropType = PropTypes.shape({
-  id: PropTypes.string.isRequired,
-  title: PropTypes.string,
-  name: PropTypes.string,
-  sku: PropTypes.string,
-  created_at: DateLike,
-  updated_at: DateLike,
-  scraped_at: DateLike,
-  cover_image: PropTypes.string,
-  description: PropTypes.shape({
-    content_blocks: PropTypes.arrayOf(
-      PropTypes.shape({
-        img: PropTypes.shape({ alt: PropTypes.string, src: PropTypes.string }),
-      }),
-    ),
-  }),
-  gallery: PropTypes.object,
-  characteristics: PropTypes.shape({
-    full: PropTypes.arrayOf(
-      PropTypes.shape({
-        id: PropTypes.string,
-        title: PropTypes.string,
-        values: PropTypes.arrayOf(PropTypes.string),
-      }),
-    ),
-  }),
-});
 
 function formatDate(input) {
   if (!input) return "N/A";
@@ -90,133 +62,6 @@ StatCard.propTypes = {
   value: PropTypes.oneOfType([PropTypes.string, PropTypes.number]).isRequired,
   subtitle: PropTypes.string,
   tone: PropTypes.oneOf(["blue", "red", "green", "purple", "yellow"]),
-};
-
-function pickCover(product) {
-  if (product?.cover_image) return product.cover_image;
-  const blocks = product?.description?.content_blocks || [];
-  for (const b of blocks) {
-    if (b?.img?.src) return b.img.src;
-  }
-  const g = product?.gallery;
-  if (g?.images?.length) return g.images[0];
-  return null;
-}
-
-function extractSpecs(product) {
-  const list = product?.characteristics?.full || [];
-  const byId = Object.fromEntries(list.map((x) => [x.id, x]));
-  const byTitle = Object.fromEntries(list.map((x) => [String(x.title || "").toLowerCase(), x]));
-  const pick = (keyId, keyTitle) => {
-    const item = byId[keyId] || byTitle[keyTitle];
-    return item?.values?.filter(Boolean)?.join(", ");
-  };
-  return [
-    { label: "Type", val: pick("TeaType", "вид чая") },
-    { label: "Weight, g", val: pick("Weight", "вес товара, г") },
-    { label: "Taste", val: pick("TeaTaste", "вкус") },
-    { label: "Country", val: pick("Country", "страна-изготовитель") },
-    {
-      label: "Form",
-      val: pick("VarietyTeaShape", "форма чая") || pick("Type", "тип"),
-    },
-  ].filter((x) => x.val);
-}
-
-function TeaCard({ product, onDelete, onOpen }) {
-  const img = pickCover(product);
-  const title = product.title || product.name || product.sku || "Untitled";
-  const specs = extractSpecs(product);
-  const ts = product.updated_at || product.created_at || product.scraped_at;
-
-  return (
-    <div
-      className="bg-white rounded-lg shadow-md p-4 hover:shadow-lg transition-shadow cursor-pointer relative" // cursor + relative
-      onClick={onOpen} // Открытие модалки при клике на карточку
-    >
-      {/* Крестик удаления: закрепляем сверху, выше клика по карточке */}
-      <button
-        onClick={(e) => {
-          e.stopPropagation(); // НЕ открывать модалку
-          onDelete(product.id);
-        }}
-        className="absolute top-2 right-2 z-10 text-red-500 hover:text-red-700 text-sm bg-white/90 rounded-full px-2 py-1 shadow"
-        title="Delete"
-        aria-label="Delete">
-        ❌
-      </button>
-
-      <div className="flex justify-between items-start mb-3 pr-8">
-        <h3 className="text-base font-semibold text-gray-900 line-clamp-2">{title}</h3>
-      </div>
-
-      {img ? (
-        <img src={img} alt={title} className="w-full h-44 object-cover rounded-lg mb-3" />
-      ) : (
-        <div className="w-full h-44 rounded-lg mb-3 bg-gray-100 flex items-center justify-center text-4xl">🍵</div>
-      )}
-
-      <div className="space-y-1 text-sm">
-        {specs.map((s) => (
-          <div key={s.label} className="flex justify-between">
-            <span className="text-gray-600">{s.label}:</span>
-            <span className="font-medium text-gray-900 text-right">{s.val}</span>
-          </div>
-        ))}
-        <div className="flex justify-between text-xs pt-1 text-gray-500">
-          <span>Updated:</span>
-          <span>{formatDate(ts)}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-TeaCard.propTypes = {
-  product: ProductPropType.isRequired,
-  onDelete: PropTypes.func.isRequired,
-  onOpen: PropTypes.func.isRequired, // добавили
-};
-
-function Pagination({ page, totalPages, pageSize, onPageChange, onPageSizeChange }) {
-  return (
-    <div className="flex items-center justify-between mt-6">
-      <div className="flex items-center space-x-2">
-        <button
-          onClick={() => onPageChange(Math.max(1, page - 1))}
-          disabled={page === 1}
-          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50">
-          ← Prev
-        </button>
-        <span className="text-sm text-gray-600">
-          Page <strong>{page}</strong> of <strong>{totalPages}</strong>
-        </span>
-        <button
-          onClick={() => onPageChange(Math.min(totalPages, page + 1))}
-          disabled={page >= totalPages}
-          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50">
-          Next →
-        </button>
-      </div>
-
-      <div className="flex items-center space-x-2">
-        <span className="text-sm text-gray-600">Per page:</span>
-        <select value={pageSize} onChange={(e) => onPageSizeChange(parseInt(e.target.value, 10))} className="px-2 py-1 border rounded-lg">
-          {[12, 24, 48, 96].map((sz) => (
-            <option key={sz} value={sz}>
-              {sz}
-            </option>
-          ))}
-        </select>
-      </div>
-    </div>
-  );
-}
-Pagination.propTypes = {
-  page: PropTypes.number.isRequired,
-  totalPages: PropTypes.number.isRequired,
-  pageSize: PropTypes.number.isRequired,
-  onPageChange: PropTypes.func.isRequired,
-  onPageSizeChange: PropTypes.func.isRequired,
 };
 
 export default function App() {
@@ -817,7 +662,7 @@ export default function App() {
                 )}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {products.map((p) => (
-                    <TeaCard key={p.id} product={p} onDelete={deleteProduct} onOpen={() => openProductModal(p)} />
+                    <ProductCard key={p.id} product={p} onDelete={deleteProduct} onOpen={() => openProductModal(p)} />
                   ))}
                 </div>
               </div>
