@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import PropTypes from "prop-types";
 import "./App.css";
-import TaskItem from "./components/TaskItem";
+import TasksPage from "./components/TasksPage";
 import ProductsPage from "./components/ProductsPage";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
@@ -64,84 +64,67 @@ StatCard.propTypes = {
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [tasks, setTasks] = useState([]);
-  const [tasksParentFilter, setTasksParentFilter] = useState("");
   const [stats, setStats] = useState({});
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("puer");
   const [categories, setCategories] = useState([]);
 
-  // guard: пишем в URL только после первичной инициализации
+  // Храним последний набор фильтров Products (переживает переключение вкладок)
+  const [lastProductsQuery, setLastProductsQuery] = useState(null);
+
+  // Пишем в URL только после первичной инициализации
   const [didInitFromUrl, setDidInitFromUrl] = useState(false);
 
-  // ---- URL -> state (только tab)
-  const parseUrlToState = useCallback(() => {
+  // ---- URL -> state (читаем только tab)
+  useEffect(() => {
     const sp = new URLSearchParams(window.location.search);
-    const tab = sp.get("tab");
-    if (tab) setActiveTab(tab);
+    const tab = sp.get("tab") || "dashboard";
+    setActiveTab(tab);
+    setDidInitFromUrl(true);
   }, []);
 
-  // ---- state -> URL: сохраняем существующие query-параметры (включая фильтры products),
-  // просто обновляем tab. Это и обеспечивает сохранность фильтров при уходе/возврате.
-  const writeStateToUrl = useCallback(() => {
+  // ---- state -> URL
+  // Для вкладки products: оставляем product-параметры нетронутыми (ими управляет ProductsPage), но гарантируем tab=products.
+  // Для остальных вкладок: в URL только ?tab=...
+  useEffect(() => {
     if (!didInitFromUrl) return;
-    const sp = new URLSearchParams(window.location.search); // <— сохраняем всё
-    sp.set("tab", activeTab);
-    const nextUrl = `${window.location.pathname}?${sp.toString()}`;
-    if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
-      window.history.replaceState(null, "", nextUrl);
+    const cur = `${window.location.pathname}${window.location.search}`;
+    let next = cur;
+
+    if (activeTab === "products") {
+      const sp = new URLSearchParams(window.location.search);
+      sp.set("tab", "products");
+      next = `${window.location.pathname}?${sp.toString()}`;
+    } else {
+      const sp = new URLSearchParams();
+      sp.set("tab", activeTab);
+      next = `${window.location.pathname}?${sp.toString()}`;
     }
+
+    if (next !== cur) window.history.replaceState(null, "", next);
   }, [activeTab, didInitFromUrl]);
 
-  // --- API (не связанные с ProductsPage) ---
-  const fetchStats = useCallback(async () => {
-    const res = await api.get("/stats");
-    setStats(res.data || {});
+  // Данные для дашборда/истории задач
+  useEffect(() => {
+    api.get("/stats").then((r) => setStats(r.data || {})).catch(() => {});
+    api
+      .get(`/tasks?limit=200`)
+      .then((r) => setTasks(r.data?.items || r.data || []))
+      .catch(() => {});
+    api.get("/categories").then((r) => setCategories(r.data?.categories || [])).catch(() => {});
   }, []);
 
-  const fetchTasks = useCallback(async () => {
-    const params = new URLSearchParams();
-    if (tasksParentFilter) params.set("parent_task_id", tasksParentFilter);
-    params.set("limit", "200");
-    const res = await api.get(`/tasks?${params.toString()}`);
-    const items = res.data?.items || res.data || [];
-    setTasks(items);
-  }, [tasksParentFilter]);
-
-  const fetchCategories = useCallback(async () => {
-    const res = await api.get("/categories");
-    setCategories(res.data?.categories || []);
-  }, []);
-
-  // Открыть продукты по задаче: кладём продукты-параметры в URL
+  // Переход из задач во вкладку products с предустановкой фильтров
   const openProductsForTask = useCallback((taskId, scope = "task") => {
-    const sp = new URLSearchParams(window.location.search);
-    sp.set("tab", "products");
-    sp.set("mode", "byTask");
-    sp.set("taskId", taskId);
-    sp.set("scope", scope === "pipeline" ? "pipeline" : "task");
-    sp.set("page", "1");
-    window.history.replaceState(null, "", `${window.location.pathname}?${sp.toString()}`);
+    setLastProductsQuery((prev) => ({
+      ...(prev || {}),
+      mode: "byTask",
+      taskId,
+      scope: scope === "pipeline" ? "pipeline" : "task",
+      page: 1,
+    }));
     setActiveTab("products");
   }, []);
-
-  const openChildrenTasks = useCallback((taskId) => {
-    setTasksParentFilter(taskId);
-    setActiveTab("tasks");
-  }, []);
-
-  // писать tab в URL при каждом изменении активной вкладки
-  useEffect(() => {
-    writeStateToUrl();
-  }, [writeStateToUrl]);
-
-  // первичная загрузка
-  useEffect(() => {
-    parseUrlToState();
-    setDidInitFromUrl(true);
-    fetchStats().catch(() => {});
-    fetchTasks().catch(() => {});
-    fetchCategories().catch(() => {});
-  }, [fetchStats, fetchTasks, fetchCategories, parseUrlToState]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();
@@ -150,14 +133,14 @@ export default function App() {
     try {
       const res = await api.post(`/scrape/start?search_term=${encodeURIComponent(term)}`);
       window.alert(`Scraping started. Task ID: ${res.data?.task_id || "N/A"}`);
-      fetchTasks().catch(() => {});
-      fetchStats().catch(() => {});
+      api.get(`/tasks?limit=200`).then((r) => setTasks(r.data?.items || r.data || [])).catch(() => {});
+      api.get("/stats").then((r) => setStats(r.data || {})).catch(() => {});
     } catch {
       window.alert("Failed to start scraping.");
     } finally {
       setLoading(false);
     }
-  }, [searchTerm, fetchStats, fetchTasks]);
+  }, [searchTerm]);
 
   const exportCSV = useCallback(async () => {
     const res = await api.get("/export/csv");
@@ -347,35 +330,17 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === "products" && <ProductsPage api={api} />}
-
-        {activeTab === "tasks" && (
-          <div className="space-y-6">
-            <div className="bg-white rounded-lg shadow-md p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold">Task history</h3>
-                <button
-                  onClick={() => fetchTasks().catch(() => {})}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                >
-                  🔄 Refresh
-                </button>
-              </div>
-
-              <div className="space-y-3">
-                {tasks.map((t) => (
-                  <TaskItem key={t.id} task={t} onOpenProducts={openProductsForTask} onOpenChildren={openChildrenTasks} />
-                ))}
-                {tasks.length === 0 && (
-                  <div className="text-center py-12">
-                    <div className="text-6xl mb-4">⚙️</div>
-                    <p className="text-gray-500">No tasks found</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+        {activeTab === "products" && (
+          <ProductsPage
+            api={api}
+            // сюда придут сохранённые фильтры при повторном заходе
+            initialQuery={lastProductsQuery || undefined}
+            // ProductsPage будет вызывать это при любом изменении фильтров/страницы/сортировки
+            onPersist={setLastProductsQuery}
+          />
         )}
+
+        {activeTab === "tasks" && <TasksPage api={api} onOpenProducts={openProductsForTask} />}
       </main>
     </div>
   );

@@ -1,5 +1,5 @@
 // components/ProductsPage.jsx
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import PropTypes from "prop-types";
 import { RxUpdate } from "react-icons/rx";
 import ProductsFilter from "./ProductsFilter";
@@ -14,20 +14,91 @@ const DEFAULT_FILTER = {
   filters: {}, // Record<charId, string[]>
 };
 
-export default function ProductsPage({ api }) {
+const DEFAULT_QUERY = {
+  mode: "all",        // "all" | "byTask"
+  taskId: "",
+  scope: "task",      // "task" | "pipeline"
+  page: 1,
+  limit: 24,          // 12|24|48|96
+  ...DEFAULT_FILTER,
+};
+
+// --- helpers: URL <-> query ---
+function hasProductsParamsInUrl(search) {
+  const sp = new URLSearchParams(search);
+  const baseKeys = ["mode", "taskId", "scope", "q", "sort_by", "sort_dir", "page", "limit"];
+  if (baseKeys.some((k) => sp.has(k))) return true;
+  for (const k of sp.keys()) if (k.startsWith("char_")) return true;
+  return false;
+}
+
+function readQueryFromUrl(search) {
+  const sp = new URLSearchParams(search);
+  const filters = {};
+  for (const [k, v] of sp.entries()) {
+    if (k.startsWith("char_")) {
+      const cid = k.slice(5);
+      (filters[cid] ??= []).push(v);
+    }
+  }
+  const allowedLimits = [12, 24, 48, 96];
+  const limitNum = parseInt(sp.get("limit") || `${DEFAULT_QUERY.limit}`, 10);
+  const pageNum = parseInt(sp.get("page") || `${DEFAULT_QUERY.page}`, 10);
+
+  return {
+    mode: sp.get("mode") === "byTask" ? "byTask" : "all",
+    taskId: sp.get("taskId") || "",
+    scope: sp.get("scope") === "pipeline" ? "pipeline" : "task",
+    page: Number.isFinite(pageNum) && pageNum > 0 ? pageNum : DEFAULT_QUERY.page,
+    limit: allowedLimits.includes(limitNum) ? limitNum : DEFAULT_QUERY.limit,
+    q: sp.get("q") || "",
+    sort_by: sp.get("sort_by") || DEFAULT_QUERY.sort_by,
+    sort_dir: sp.get("sort_dir") === "asc" ? "asc" : "desc",
+    filters,
+  };
+}
+
+function writeQueryToUrl(query) {
+  const sp = new URLSearchParams(window.location.search);
+  // tab оставляем как есть (им управляет App)
+  ["mode", "taskId", "scope", "q", "sort_by", "sort_dir", "page", "limit"].forEach((k) => sp.delete(k));
+  [...sp.keys()].forEach((k) => k.startsWith("char_") && sp.delete(k));
+
+  sp.set("mode", query.mode);
+  if (query.mode === "byTask" && query.taskId) {
+    sp.set("taskId", query.taskId);
+    sp.set("scope", query.scope || "task");
+  }
+  sp.set("page", String(query.page || 1));
+  sp.set("limit", String(query.limit || 24));
+  if (query.q) sp.set("q", query.q);
+  sp.set("sort_by", query.sort_by || "updated_at");
+  sp.set("sort_dir", query.sort_dir || "desc");
+
+  Object.entries(query.filters || {}).forEach(([cid, vals]) => {
+    (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
+  });
+
+  const next = `${window.location.pathname}?${sp.toString()}`;
+  const cur = `${window.location.pathname}${window.location.search}`;
+  if (next !== cur) window.history.replaceState(null, "", next);
+}
+
+export default function ProductsPage({ api, initialQuery, onPersist }) {
   // ----- state -----
   const [products, setProducts] = useState([]);
   const [totalProducts, setTotalProducts] = useState(0);
 
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(24);
+  const [page, setPage] = useState(DEFAULT_QUERY.page);
+  const [pageSize, setPageSize] = useState(DEFAULT_QUERY.limit);
 
-  const [productsMode, setProductsMode] = useState("all"); // "all" | "byTask"
-  const [productsTaskId, setProductsTaskId] = useState("");
-  const [productsScope, setProductsScope] = useState("task"); // "task" | "pipeline"
+  const [productsMode, setProductsMode] = useState(DEFAULT_QUERY.mode);
+  const [productsTaskId, setProductsTaskId] = useState(DEFAULT_QUERY.taskId);
+  const [productsScope, setProductsScope] = useState(DEFAULT_QUERY.scope);
 
   const [filterAll, setFilterAll] = useState({ ...DEFAULT_FILTER });
-  const [filterByTask, setFilterByTask] = useState({}); // {[key]: FilterValue}
+  const [filterByTask, setFilterByTask] = useState({}); // { [key]: FilterValue }
+
   const filterKey = useMemo(
     () => (productsMode === "byTask" ? `${productsTaskId || ""}::${productsScope}` : "all"),
     [productsMode, productsTaskId, productsScope],
@@ -47,12 +118,10 @@ export default function ProductsPage({ api }) {
   const [isFetching, setIsFetching] = useState(false);
   const [loadingFacets, setLoadingFacets] = useState(false);
 
-  // URL sync helpers
-  const [didInitFromUrl, setDidInitFromUrl] = useState(false);
+  // URL sync flags
+  const [didInit, setDidInit] = useState(false);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
   const [qLive, setQLive] = useState("");
-  const [qDebounced, setQDebounced] = useState("");
-  useEffect(() => setQDebounced(currentFilter.q || ""), [currentFilter.q]);
 
   // modal
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
@@ -62,99 +131,94 @@ export default function ProductsPage({ api }) {
   const productsAbortRef = useRef(null);
   const facetsAbortRef = useRef(null);
 
-  const totalPages = useMemo(() => Math.max(1, Math.ceil(Number(totalProducts || 0) / Number(pageSize || 1))), [totalProducts, pageSize]);
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(Number(totalProducts || 0) / Number(pageSize || 1))),
+    [totalProducts, pageSize],
+  );
 
-  // ----- URL <-> state -----
-  const parseUrlToState = useCallback(() => {
-    const sp = new URLSearchParams(window.location.search);
-    const mode = sp.get("mode");
-    const taskId = sp.get("taskId");
-    const scope = sp.get("scope");
-    const q = sp.get("q") || "";
-    const sort_by = sp.get("sort_by") || "updated_at";
-    const sort_dir = (sp.get("sort_dir") || "desc") === "asc" ? "asc" : "desc";
-    const pageQ = parseInt(sp.get("page") || "1", 10);
-    const limitQ = parseInt(sp.get("limit") || "24", 10);
+  // --- apply a full query object into component state
+  const applyQuery = useCallback((q) => {
+    const normalized = { ...DEFAULT_QUERY, ...(q || {}) };
 
-    // собрать char_* -> Record<string,string[]>
-    const filters = {};
-    for (const [k, v] of sp.entries()) {
-      if (k.startsWith("char_") && v) {
-        const cid = k.slice(5);
-        (filters[cid] ??= []).push(v);
-      }
-    }
+    setProductsMode(normalized.mode);
+    setProductsTaskId(normalized.taskId || "");
+    setProductsScope(normalized.scope || "task");
+    setPage(Number(normalized.page) || 1);
+    setPageSize([12, 24, 48, 96].includes(Number(normalized.limit)) ? Number(normalized.limit) : 24);
 
-    if (Number.isFinite(pageQ) && pageQ > 0) setPage(pageQ);
-    if (Number.isFinite(limitQ) && [12, 24, 48, 96].includes(limitQ)) setPageSize(limitQ);
+    const parsedFilter = {
+      q: normalized.q || "",
+      sort_by: normalized.sort_by || "updated_at",
+      sort_dir: normalized.sort_dir === "asc" ? "asc" : "desc",
+      filters: normalized.filters || {},
+    };
 
-    const parsedFilter = { q, sort_by, sort_dir, filters };
-    if (mode === "byTask" && taskId) {
-      setProductsMode("byTask");
-      setProductsTaskId(taskId);
-      setProductsScope(scope === "pipeline" ? "pipeline" : "task");
-      const key = `${taskId}::${scope === "pipeline" ? "pipeline" : "task"}`;
+    if (normalized.mode === "byTask" && normalized.taskId) {
+      const key = `${normalized.taskId}::${normalized.scope === "pipeline" ? "pipeline" : "task"}`;
       setFilterByTask((prev) => ({ ...prev, [key]: parsedFilter }));
     } else {
-      setProductsMode("all");
       setFilterAll(parsedFilter);
     }
   }, []);
 
-  const writeStateToUrl = useCallback(() => {
-    if (!didInitFromUrl) return;
-    const sp = new URLSearchParams(window.location.search);
+  // --- compose current query object from state (for URL/persist)
+  const buildCurrentQuery = useCallback(() => {
+    const f = currentFilter || DEFAULT_FILTER;
+    return {
+      mode: productsMode,
+      taskId: productsTaskId,
+      scope: productsScope,
+      page,
+      limit: pageSize,
+      q: f.q || "",
+      sort_by: f.sort_by || "updated_at",
+      sort_dir: f.sort_dir || "desc",
+      filters: f.filters || {},
+    };
+  }, [productsMode, productsTaskId, productsScope, page, pageSize, currentFilter]);
 
-    // NB: tab управляется App; здесь трогаем только product-параметры
-    sp.set("mode", productsMode);
-    if (productsMode === "byTask" && productsTaskId) {
-      sp.set("taskId", productsTaskId);
-      sp.set("scope", productsScope);
-    } else {
-      sp.delete("taskId");
-      sp.delete("scope");
-    }
+  // ----- initialization (sync to avoid гонки) -----
+  useLayoutEffect(() => {
+    const urlHas = hasProductsParamsInUrl(window.location.search);
+    const snap = urlHas ? readQueryFromUrl(window.location.search) : (initialQuery || DEFAULT_QUERY);
+    applyQuery(snap);
+    // стандартизируем URL под выбранный снапшот
+    writeQueryToUrl(snap);
+    setDidInit(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // один раз на маунт
 
-    sp.set("page", String(page));
-    sp.set("limit", String(pageSize));
-    const qParam = isSearchFocused ? qLive : currentFilter.q || "";
-    if (qParam) sp.set("q", qParam);
-    else sp.delete("q");
-
-    sp.set("sort_by", currentFilter.sort_by || "updated_at");
-    sp.set("sort_dir", currentFilter.sort_dir || "desc");
-
-    // сбросить старые char_*, затем записать заново
-    [...sp.keys()].forEach((k) => k.startsWith("char_") && sp.delete(k));
-    Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
-      (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
-    });
-
-    const nextUrl = `${window.location.pathname}?${sp.toString()}`;
-    if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
-      window.history.replaceState(null, "", nextUrl);
-    }
-  }, [didInitFromUrl, productsMode, productsTaskId, productsScope, page, pageSize, isSearchFocused, qLive, currentFilter]);
+  // ----- sync URL + persist to parent when state changes -----
+  useEffect(() => {
+    if (!didInit) return;
+    const query = buildCurrentQuery();
+    // во время набора показываем «черновик» q в URL, чтобы линк копировался корректно
+    writeQueryToUrl(isSearchFocused ? { ...query, q: qLive } : query);
+    if (onPersist) onPersist(query);
+  }, [didInit, buildCurrentQuery, isSearchFocused, qLive, onPersist]);
 
   // ----- data fetching -----
   const fetchProducts = useCallback(async () => {
+    // гард: не ходим в /tasks//products
+    if (productsMode === "byTask" && !productsTaskId) return;
+
     setIsFetching(true);
     try {
       if (productsAbortRef.current) productsAbortRef.current.abort();
       productsAbortRef.current = new AbortController();
 
-      // build common params
+      const f = currentFilter || DEFAULT_FILTER;
       const params = new URLSearchParams();
       params.set("limit", String(pageSize));
       params.set("skip", String((page - 1) * pageSize));
-      if (currentFilter.q) params.set("q", currentFilter.q);
-      params.set("sort_by", currentFilter.sort_by || "updated_at");
-      params.set("sort_dir", currentFilter.sort_dir || "desc");
-      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+      if (f.q) params.set("q", f.q);
+      params.set("sort_by", f.sort_by || "updated_at");
+      params.set("sort_dir", f.sort_dir || "desc");
+      Object.entries(f.filters || {}).forEach(([cid, vals]) => {
         (vals || []).forEach((v) => params.append(`char_${cid}`, v));
       });
 
-      if (productsMode === "byTask" && productsTaskId) {
+      if (productsMode === "byTask") {
         params.set("scope", productsScope);
         const url = `/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`;
         const res = await api.get(url, { signal: productsAbortRef.current.signal });
@@ -172,18 +236,22 @@ export default function ProductsPage({ api }) {
   }, [api, page, pageSize, productsMode, productsTaskId, productsScope, currentFilter]);
 
   const fetchFilterCharacteristics = useCallback(async () => {
+    // гард: ждём taskId
+    if (productsMode === "byTask" && !productsTaskId) return;
+
     try {
       setLoadingFacets(true);
       if (facetsAbortRef.current) facetsAbortRef.current.abort();
       facetsAbortRef.current = new AbortController();
 
+      const f = currentFilter || DEFAULT_FILTER;
       const facetParams = new URLSearchParams();
-      if (currentFilter.q) facetParams.set("q", currentFilter.q);
-      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+      if (f.q) facetParams.set("q", f.q);
+      Object.entries(f.filters || {}).forEach(([cid, vals]) => {
         (vals || []).forEach((v) => facetParams.append(`char_${cid}`, v));
       });
 
-      if (productsMode === "byTask" && productsTaskId) {
+      if (productsMode === "byTask") {
         facetParams.set("scope", productsScope);
         const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?${facetParams.toString()}`;
         const res = await api.get(url, { signal: facetsAbortRef.current.signal });
@@ -201,6 +269,22 @@ export default function ProductsPage({ api }) {
     }
   }, [api, productsMode, productsTaskId, productsScope, filterKey, currentFilter]);
 
+  useEffect(() => {
+    if (!didInit) return;
+    fetchProducts().catch(() => {});
+    fetchFilterCharacteristics().catch(() => {});
+  }, [
+    didInit,
+    fetchProducts,
+    fetchFilterCharacteristics,
+    currentFilter,
+    page,
+    pageSize,
+    productsMode,
+    productsTaskId,
+    productsScope,
+  ]);
+
   // ----- modal helpers -----
   const openProductModal = useCallback(
     (prodOrSku) => {
@@ -210,14 +294,12 @@ export default function ProductsPage({ api }) {
         setIsProductModalOpen(true);
         return;
       }
-      // try find on page
       const found = products.find((p) => String(p.sku) === String(prodOrSku));
       if (found) {
         setModalProduct(found);
         setIsProductModalOpen(true);
         return;
       }
-      // fallback: fetch by SKU
       api
         .get(`/products/sku/${encodeURIComponent(String(prodOrSku))}`)
         .then((res) => {
@@ -235,7 +317,7 @@ export default function ProductsPage({ api }) {
     setModalProduct(null);
   }, []);
 
-  // ----- handlers passed to children -----
+  // ----- filter handlers (для ProductsFilter) -----
   const handleFilterChange = useCallback(
     (next) => {
       setPage(1);
@@ -263,41 +345,6 @@ export default function ProductsPage({ api }) {
     setPage(1);
   }, []);
 
-  const deleteProduct = useCallback(
-    async (productId) => {
-      if (!window.confirm("Delete this product?")) return;
-      await api.delete(`/products/${productId}`);
-      fetchProducts().catch(() => {});
-    },
-    [api, fetchProducts],
-  );
-
-  // ----- lifecycle -----
-  useEffect(() => {
-    parseUrlToState();
-    setDidInitFromUrl(true);
-  }, [parseUrlToState]);
-
-  useEffect(() => {
-    writeStateToUrl();
-  }, [writeStateToUrl]);
-
-  useEffect(() => {
-    if (!didInitFromUrl) return;
-    fetchProducts().catch(() => {});
-    fetchFilterCharacteristics().catch(() => {});
-  }, [
-    didInitFromUrl,
-    fetchProducts,
-    fetchFilterCharacteristics,
-    currentFilter,
-    page,
-    pageSize,
-    productsMode,
-    productsTaskId,
-    productsScope,
-  ]);
-
   // ----- render -----
   return (
     <div className="space-y-6">
@@ -310,7 +357,8 @@ export default function ProductsPage({ api }) {
               fetchProducts().catch(() => {});
             }}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
-            title="Refresh results">
+            title="Refresh results"
+          >
             <RxUpdate className="w-5 h-5" />
             Refresh
           </button>
@@ -328,7 +376,10 @@ export default function ProductsPage({ api }) {
           onReset={handleFilterReset}
           loadingFacets={loadingFacets}
           onSearchFocusChange={setIsSearchFocused}
-          onSearchCommit={writeStateToUrl}
+          onSearchCommit={() => {
+            const q = buildCurrentQuery();
+            writeQueryToUrl(q);
+          }}
           onSearchTyping={setQLive}
         />
 
@@ -341,7 +392,16 @@ export default function ProductsPage({ api }) {
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {products.map((p) => (
-              <ProductCard key={p.id} product={p} onDelete={deleteProduct} onOpen={() => openProductModal(p)} />
+              <ProductCard
+                key={p.id}
+                product={p}
+                onDelete={async (id) => {
+                  if (!window.confirm("Delete this product?")) return;
+                  await api.delete(`/products/${id}`);
+                  fetchProducts().catch(() => {});
+                }}
+                onOpen={() => openProductModal(p)}
+              />
             ))}
           </div>
         </div>
@@ -377,5 +437,22 @@ export default function ProductsPage({ api }) {
 }
 
 ProductsPage.propTypes = {
-  api: PropTypes.object.isRequired, // axios instance
+  api: PropTypes.object.isRequired,          // axios instance
+  initialQuery: PropTypes.shape({
+    mode: PropTypes.oneOf(["all", "byTask"]),
+    taskId: PropTypes.string,
+    scope: PropTypes.oneOf(["task", "pipeline"]),
+    page: PropTypes.number,
+    limit: PropTypes.oneOf([12, 24, 48, 96]),
+    q: PropTypes.string,
+    sort_by: PropTypes.string,
+    sort_dir: PropTypes.oneOf(["asc", "desc"]),
+    filters: PropTypes.object, // Record<string, string[]>
+  }),
+  onPersist: PropTypes.func,                 // (queryObj) => void
+};
+
+ProductsPage.defaultProps = {
+  initialQuery: DEFAULT_QUERY,
+  onPersist: undefined,
 };
