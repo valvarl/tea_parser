@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from aiokafka import AIOKafkaProducer
 from pydantic import BaseModel, Field
 from bson import ObjectId
 
 from app.db.mongo import db
 from app.models.task import BaseTask, TaskStatus
-from app.models.product import Product
+from app.models.product import Product, CharacteristicItem
 
 router = APIRouter(prefix="/v1", tags=["tasks"])
 
@@ -87,6 +88,59 @@ def _task_public_view(tdoc: Dict[str, Any]) -> Dict[str, Any]:
 async def _pipeline_task_ids(pipeline_id: str) -> List[str]:
     cursor = db.scraping_tasks.find({"pipeline_id": pipeline_id}, {"id": 1})
     return [doc["id"] for doc in await cursor.to_list(length=10000)]
+
+
+# ----- search/sort helpers -----
+
+SORTABLE_FIELDS = {
+    "updated_at": "updated_at",
+    "created_at": "created_at",
+    "title": "title",
+    "sku": "sku",
+    "rating": "seo.aggregateRating.ratingValue",  # строка
+    "price": "seo.offers.price",                  # строка
+}
+NUMERIC_CAST_REQUIRED = {"price", "rating"}
+
+def _parse_sort(sort_by: str | None, sort_dir: str | None):
+    key = (sort_by or "updated_at").strip()
+    field = SORTABLE_FIELDS.get(key, "updated_at")
+    direction = -1 if (sort_dir or "desc").lower() in ("desc", "down", "-1", "-") else 1
+    needs_cast = key in NUMERIC_CAST_REQUIRED
+    return field, direction, needs_cast
+
+def _build_search_query(q: str | None):
+    if not q:
+        return None
+    rx = {"$regex": re.escape(q), "$options": "i"}
+    return {"$or": [
+        {"title": rx},
+        {"seo.description": rx},
+        {"characteristics.full.values": rx},
+        {"sku": rx},
+    ]}
+
+def _build_characteristics_filters(params) -> list[dict]:
+    """
+    ?char_TeaType=пуэр&char_TeaType=черный&char_TeaGrade=шу%20пуэр
+    """
+    items = []
+    for key in params.keys():
+        if not key.startswith("char_"):
+            continue
+        cid = key[5:]
+        vals = [v for v in params.getlist(key) if v]
+        if not vals:
+            continue
+        items.append({
+            "characteristics.full": {
+                "$elemMatch": {
+                    "id": cid,
+                    "values": {"$in": vals}
+                }
+            }
+        })
+    return items
 
 
 # ───────── tasks: list / details / children
@@ -173,36 +227,38 @@ async def get_children_tasks(task_id: str, limit: int = Query(100, ge=1, le=500)
 
 @router.get("/tasks/{task_id}/products")
 async def get_task_products(
+    request: Request,
     task_id: str,
     scope: str = Query("task", pattern="^(task|pipeline)$"),
     status: Optional[str] = Query(None, description="Фильтр по status в index: pending_review/indexed_auto/..."),
+    # новое:
+    q: Optional[str] = Query(None, description="Поиск по слову"),
+    sort_by: Optional[str] = Query("updated_at", description=f"Поле: {', '.join(SORTABLE_FIELDS.keys())}"),
+    sort_dir: Optional[str] = Query("desc", description="asc|desc"),
     limit: int = Query(24, ge=1, le=200),
     skip: int = Query(0, ge=0),
 ):
     """
-    Возвращает список продуктов из candidates, отфильтрованных по задачам (через index).
-    Формат ответа совпадает с /v1/products: items (List[Product]), total, skip, limit.
+    Возвращает продукты из candidates, привязанные к задаче (через index),
+    с поддержкой поиска (?q=), фильтров по характеристикам (?char_*), сортировки (?sort_by, ?sort_dir).
     """
-    # 1) Находим задачу и набор task_id для фильтрации в index
+    # 1) получаем ids задач для scope
     t = await db.scraping_tasks.find_one({"id": task_id})
     if not t:
         raise HTTPException(status_code=404, detail="Task not found")
 
     if scope == "pipeline" and t.get("pipeline_id"):
-        task_ids = await _pipeline_task_ids(t["pipeline_id"])
-        if not task_ids:
-            task_ids = [task_id]
+        task_ids = await _pipeline_task_ids(t["pipeline_id"]) or [task_id]
     else:
         task_ids = [task_id]
 
-    # 2) Собираем фильтр по index
-    match: Dict[str, Any] = {"task_id": {"$in": task_ids}}
+    # 2) match по index
+    idx_match: Dict[str, Any] = {"task_id": {"$in": task_ids}}
     if status:
-        match["status"] = status
+        idx_match["status"] = status
 
-    # 3) Получаем уникальные candidate_id из index
-    cand_ids_raw = await db[INDEX_COLLECTION].distinct("candidate_id", match)
-    # отфильтруем None и приведём к ObjectId, если нужно
+    # 3) список candidate _id
+    cand_ids_raw = await db[INDEX_COLLECTION].distinct("candidate_id", idx_match)
     cand_ids: List[ObjectId] = []
     for v in cand_ids_raw:
         if v is None:
@@ -213,34 +269,126 @@ async def get_task_products(
             try:
                 cand_ids.append(ObjectId(str(v)))
             except Exception:
-                # если id не ObjectId, пропустим (в candidates _id — ObjectId)
                 continue
 
-    total = len(cand_ids)
+    if not cand_ids:
+        return {"items": [], "total": 0, "skip": skip, "limit": limit}
+
+    # 4) соберём фильтр по candidates
+    base_match: Dict[str, Any] = {"_id": {"$in": cand_ids}}
+
+    search_q = _build_search_query(q)
+    if search_q:
+        base_match.update(search_q)
+
+    char_filters = _build_characteristics_filters(request.query_params)
+    if char_filters:
+        base_match.setdefault("$and", []).extend(char_filters)
+
+    # 5) total ПОСЛЕ фильтров
+    total = await db[CANDIDATES_COLLECTION].count_documents(base_match)
+
     if total == 0:
         return {"items": [], "total": 0, "skip": skip, "limit": limit}
 
-    # 4) Выбираем продукты из candidates, сортировка как в products.py
-    cur = (
-        db[CANDIDATES_COLLECTION]
-        .find({"_id": {"$in": cand_ids}})
-        .sort([("updated_at", -1), ("created_at", -1)])
-        .skip(int(skip))
-        .limit(int(limit))
-    )
-    products = await cur.to_list(length=limit)
+    # 6) сортировка
+    sort_field, sort_dir_int, needs_cast = _parse_sort(sort_by, sort_dir)
 
-    for p in products:
-        p.pop("_id", None)
+    # 7) выдача
+    if needs_cast:
+        pipeline = [
+            {"$match": base_match},
+            {"$addFields": {
+                "__sort_key": {
+                    "$convert": {"input": f"${sort_field}", "to": "double", "onError": None, "onNull": None}
+                }
+            }},
+            {"$sort": {"__sort_key": sort_dir_int, "_id": 1}},
+            {"$skip": int(skip)},
+            {"$limit": int(limit)},
+            {"$project": {"__sort_key": 0}},
+        ]
+        docs = await db[CANDIDATES_COLLECTION].aggregate(pipeline).to_list(length=limit)
+    else:
+        cursor = (
+            db[CANDIDATES_COLLECTION]
+            .find(base_match)
+            .sort([(sort_field, sort_dir_int), ("updated_at", -1)])
+            .skip(int(skip))
+            .limit(int(limit))
+        )
+        docs = await cursor.to_list(length=limit)
 
-    items = [Product.model_validate(p) for p in products]
+    for d in docs:
+        d.pop("_id", None)
 
     return {
-        "items": items,
+        "items": [Product.model_validate(d) for d in docs],
         "total": total,
         "skip": skip,
         "limit": limit,
     }
+
+@router.get("/tasks/{task_id}/products/characteristics", response_model=List[CharacteristicItem])
+async def get_task_products_characteristics(
+    request: Request,
+    task_id: str,
+    scope: str = Query("task", pattern="^(task|pipeline)$"),
+    limit_values_per_char: int = Query(500, ge=1, le=10_000),
+):
+    t = await db.scraping_tasks.find_one({"id": task_id})
+    if not t:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if scope == "pipeline" and t.get("pipeline_id"):
+        task_ids = await _pipeline_task_ids(t["pipeline_id"]) or [task_id]
+    else:
+        task_ids = [task_id]
+
+    idx_match = {"task_id": {"$in": task_ids}}
+    cand_ids_raw = await db[INDEX_COLLECTION].distinct("candidate_id", idx_match)
+
+    cand_ids: List[ObjectId] = []
+    for v in cand_ids_raw:
+        if isinstance(v, ObjectId):
+            cand_ids.append(v)
+        else:
+            try:
+                cand_ids.append(ObjectId(str(v)))
+            except Exception:
+                continue
+
+    if not cand_ids:
+        return []
+
+    # база под текущие фильтры/поиск
+    base_match: Dict[str, Any] = {"_id": {"$in": cand_ids}}
+    q = request.query_params.get("q")
+    search_q = _build_search_query(q)
+    if search_q:
+        base_match.update(search_q)
+    char_filters = _build_characteristics_filters(request.query_params)
+    if char_filters:
+        base_match.setdefault("$and", []).extend(char_filters)
+
+    pipeline = [
+        {"$match": base_match},
+        {"$unwind": {"path": "$characteristics.full", "preserveNullAndEmptyArrays": False}},
+        {"$unwind": {"path": "$characteristics.full.values", "preserveNullAndEmptyArrays": False}},
+        {"$group": {
+            "_id": {"id": "$characteristics.full.id", "title": "$characteristics.full.title"},
+            "values": {"$addToSet": "$characteristics.full.values"},
+        }},
+        {"$project": {
+            "_id": 0,
+            "id": "$_id.id",
+            "title": "$_id.title",
+            "values": {"$slice": ["$values", limit_values_per_char]},
+        }},
+        {"$sort": {"title": 1}},
+    ]
+    rows = await db[CANDIDATES_COLLECTION].aggregate(pipeline).to_list(length=10_000)
+    return [CharacteristicItem.model_validate(r) for r in rows]
 
 # ───────── fix errors
 

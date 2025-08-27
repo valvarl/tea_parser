@@ -4,16 +4,14 @@ import PropTypes from "prop-types";
 import "./App.css";
 import ProductModal from "./components/ProductModal";
 import TaskItem from "./components/TaskItem";
+import ProductsFilter from "./components/ProductsFilter";
+import { RxUpdate } from "react-icons/rx";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 const API = `${BACKEND_URL}/api/v1`;
 const api = axios.create({ baseURL: API });
 
-const DateLike = PropTypes.oneOfType([
-  PropTypes.string,
-  PropTypes.number,
-  PropTypes.instanceOf(Date),
-]);
+const DateLike = PropTypes.oneOfType([PropTypes.string, PropTypes.number, PropTypes.instanceOf(Date)]);
 
 const ProductPropType = PropTypes.shape({
   id: PropTypes.string.isRequired,
@@ -28,7 +26,7 @@ const ProductPropType = PropTypes.shape({
     content_blocks: PropTypes.arrayOf(
       PropTypes.shape({
         img: PropTypes.shape({ alt: PropTypes.string, src: PropTypes.string }),
-      })
+      }),
     ),
   }),
   gallery: PropTypes.object,
@@ -38,7 +36,7 @@ const ProductPropType = PropTypes.shape({
         id: PropTypes.string,
         title: PropTypes.string,
         values: PropTypes.arrayOf(PropTypes.string),
-      })
+      }),
     ),
   }),
 });
@@ -55,17 +53,13 @@ function StatusBadge({ status }) {
     status === "finished"
       ? "bg-green-100 text-green-800"
       : status === "running"
-        ? "bg-blue-100 text-blue-800"
-        : status === "failed"
-          ? "bg-red-100 text-red-800"
-          : status === "pending"
-            ? "bg-yellow-100 text-yellow-800"
-            : "bg-gray-100 text-gray-800";
-  return (
-    <span className={`px-2 py-1 rounded-full text-xs font-medium ${cls}`}>
-      {status}
-    </span>
-  );
+      ? "bg-blue-100 text-blue-800"
+      : status === "failed"
+      ? "bg-red-100 text-red-800"
+      : status === "pending"
+      ? "bg-yellow-100 text-yellow-800"
+      : "bg-gray-100 text-gray-800";
+  return <span className={`px-2 py-1 rounded-full text-xs font-medium ${cls}`}>{status}</span>;
 }
 StatusBadge.propTypes = { status: PropTypes.string };
 
@@ -112,9 +106,7 @@ function pickCover(product) {
 function extractSpecs(product) {
   const list = product?.characteristics?.full || [];
   const byId = Object.fromEntries(list.map((x) => [x.id, x]));
-  const byTitle = Object.fromEntries(
-    list.map((x) => [String(x.title || "").toLowerCase(), x])
-  );
+  const byTitle = Object.fromEntries(list.map((x) => [String(x.title || "").toLowerCase(), x]));
   const pick = (keyId, keyTitle) => {
     const item = byId[keyId] || byTitle[keyTitle];
     return item?.values?.filter(Boolean)?.join(", ");
@@ -150,36 +142,25 @@ function TeaCard({ product, onDelete, onOpen }) {
         }}
         className="absolute top-2 right-2 z-10 text-red-500 hover:text-red-700 text-sm bg-white/90 rounded-full px-2 py-1 shadow"
         title="Delete"
-        aria-label="Delete"
-      >
+        aria-label="Delete">
         ❌
       </button>
 
       <div className="flex justify-between items-start mb-3 pr-8">
-        <h3 className="text-base font-semibold text-gray-900 line-clamp-2">
-          {title}
-        </h3>
+        <h3 className="text-base font-semibold text-gray-900 line-clamp-2">{title}</h3>
       </div>
 
       {img ? (
-        <img
-          src={img}
-          alt={title}
-          className="w-full h-44 object-cover rounded-lg mb-3"
-        />
+        <img src={img} alt={title} className="w-full h-44 object-cover rounded-lg mb-3" />
       ) : (
-        <div className="w-full h-44 rounded-lg mb-3 bg-gray-100 flex items-center justify-center text-4xl">
-          🍵
-        </div>
+        <div className="w-full h-44 rounded-lg mb-3 bg-gray-100 flex items-center justify-center text-4xl">🍵</div>
       )}
 
       <div className="space-y-1 text-sm">
         {specs.map((s) => (
           <div key={s.label} className="flex justify-between">
             <span className="text-gray-600">{s.label}:</span>
-            <span className="font-medium text-gray-900 text-right">
-              {s.val}
-            </span>
+            <span className="font-medium text-gray-900 text-right">{s.val}</span>
           </div>
         ))}
         <div className="flex justify-between text-xs pt-1 text-gray-500">
@@ -196,21 +177,14 @@ TeaCard.propTypes = {
   onOpen: PropTypes.func.isRequired, // добавили
 };
 
-function Pagination({
-  page,
-  totalPages,
-  pageSize,
-  onPageChange,
-  onPageSizeChange,
-}) {
+function Pagination({ page, totalPages, pageSize, onPageChange, onPageSizeChange }) {
   return (
     <div className="flex items-center justify-between mt-6">
       <div className="flex items-center space-x-2">
         <button
           onClick={() => onPageChange(Math.max(1, page - 1))}
           disabled={page === 1}
-          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50"
-        >
+          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50">
           ← Prev
         </button>
         <span className="text-sm text-gray-600">
@@ -219,19 +193,14 @@ function Pagination({
         <button
           onClick={() => onPageChange(Math.min(totalPages, page + 1))}
           disabled={page >= totalPages}
-          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50"
-        >
+          className="px-3 py-1 bg-white border rounded-lg disabled:opacity-50">
           Next →
         </button>
       </div>
 
       <div className="flex items-center space-x-2">
         <span className="text-sm text-gray-600">Per page:</span>
-        <select
-          value={pageSize}
-          onChange={(e) => onPageSizeChange(parseInt(e.target.value, 10))}
-          className="px-2 py-1 border rounded-lg"
-        >
+        <select value={pageSize} onChange={(e) => onPageSizeChange(parseInt(e.target.value, 10))} className="px-2 py-1 border rounded-lg">
           {[12, 24, 48, 96].map((sz) => (
             <option key={sz} value={sz}>
               {sz}
@@ -256,7 +225,7 @@ export default function App() {
   const [totalProducts, setTotalProducts] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(24);
-  const [selectedTeaType, setSelectedTeaType] = useState("");
+  // const [selectedTeaType, setSelectedTeaType] = useState("");
   const [tasks, setTasks] = useState([]);
   const [tasksParentFilter, setTasksParentFilter] = useState("");
   const [productsMode, setProductsMode] = useState("all"); // all | byTask
@@ -268,6 +237,129 @@ export default function App() {
   const [categories, setCategories] = useState([]);
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
   const [modalProduct, setModalProduct] = useState(null);
+  const [isSearchFocused, setIsSearchFocused] = useState(false); // NEW
+  const [qLive, setQLive] = useState(""); // текст в инпуте во время набора
+
+  const productsAbortRef = React.useRef(null);
+  const facetsAbortRef = React.useRef(null);
+
+  // фильтр: раздельно для "all" и для "byTask" по ключу taskId::scope
+  const DEFAULT_FILTER = useMemo(
+    () => ({
+      q: "",
+      sort_by: "updated_at",
+      sort_dir: "desc",
+      filters: {}, // Record<charId, string[]>
+    }),
+    [],
+  );
+
+  const [filterAll, setFilterAll] = useState({ ...DEFAULT_FILTER });
+  const [filterByTask, setFilterByTask] = useState({}); // { [key]: FilterValue }
+
+  const filterKey = useMemo(
+    () => (productsMode === "byTask" ? `${productsTaskId || ""}::${productsScope}` : "all"),
+    [productsMode, productsTaskId, productsScope],
+  );
+
+  const currentFilter = useMemo(
+    () => (productsMode === "byTask" ? filterByTask[filterKey] || DEFAULT_FILTER : filterAll),
+    [productsMode, filterByTask, filterKey, filterAll, DEFAULT_FILTER],
+  );
+
+  // характеристики для фильтра (кеш)
+  const [charAll, setCharAll] = useState([]);
+  const [charByTask, setCharByTask] = useState({}); // { [key]: Characteristic[] }
+  const currentCharacteristics = useMemo(
+    () => (productsMode === "byTask" ? charByTask[filterKey] || [] : charAll),
+    [productsMode, charByTask, filterKey, charAll],
+  );
+
+  // загрузка для скелетонов
+  const [isFetching, setIsFetching] = useState(false);
+  const [loadingFacets, setLoadingFacets] = useState(false);
+
+  // URL init guard: не пишем в URL, пока не распарсили его
+  const [didInitFromUrl, setDidInitFromUrl] = useState(false);
+
+  // q с дебаунсом для записи в URL (не мешает набору)
+  const [qDebounced, setQDebounced] = useState("");
+  useEffect(() => {
+    // q уже задебаунсено внутри ProductsFilter (400 мс)
+    setQDebounced(currentFilter.q || "");
+  }, [currentFilter.q]);
+
+  // --- deep-linking: парсинг URL -> state
+  const parseUrlToState = useCallback(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const tab = sp.get("tab");
+    const mode = sp.get("mode");
+    const taskId = sp.get("taskId");
+    const scope = sp.get("scope");
+    const q = sp.get("q") || "";
+    const sort_by = sp.get("sort_by") || "updated_at";
+    const sort_dir = (sp.get("sort_dir") || "desc") === "asc" ? "asc" : "desc";
+    const pageQ = parseInt(sp.get("page") || "1", 10);
+    const limitQ = parseInt(sp.get("limit") || "24", 10);
+
+    // собрать char_* -> Record<string,string[]>
+    const filters = {};
+    for (const [k, v] of sp.entries()) {
+      if (k.startsWith("char_") && v) {
+        const cid = k.slice(5);
+        filters[cid] = filters[cid] || [];
+        filters[cid].push(v);
+      }
+    }
+
+    if (tab) setActiveTab(tab);
+    if (Number.isFinite(pageQ) && pageQ > 0) setPage(pageQ);
+    if (Number.isFinite(limitQ) && [12, 24, 48, 96].includes(limitQ)) setPageSize(limitQ);
+
+    const parsedFilter = { q, sort_by, sort_dir, filters };
+    if (mode === "byTask" && taskId) {
+      setProductsMode("byTask");
+      setProductsTaskId(taskId);
+      setProductsScope(scope === "pipeline" ? "pipeline" : "task");
+      const key = `${taskId}::${scope === "pipeline" ? "pipeline" : "task"}`;
+      setFilterByTask((prev) => ({ ...prev, [key]: parsedFilter }));
+    } else {
+      setProductsMode("all");
+      setFilterAll(parsedFilter);
+    }
+  }, []);
+
+  // --- deep-linking: state -> URL (replaceState)
+  const writeStateToUrl = useCallback(() => {
+    if (!didInitFromUrl) return;
+
+    const sp = new URLSearchParams();
+    sp.set("tab", activeTab);
+
+    if (activeTab === "products") {
+      sp.set("mode", productsMode);
+      if (productsMode === "byTask" && productsTaskId) {
+        sp.set("taskId", productsTaskId);
+        sp.set("scope", productsScope);
+      }
+      sp.set("page", String(page));
+      sp.set("limit", String(pageSize));
+      const qParam = isSearchFocused ? qLive : currentFilter.q || "";
+      if (qParam) sp.set("q", qParam);
+      sp.set("sort_by", currentFilter.sort_by || "updated_at");
+      sp.set("sort_dir", currentFilter.sort_dir || "desc");
+      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+        (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
+      });
+    }
+    // для других вкладок намеренно НЕ пишем продуктовые параметры:
+    // оставляем только tab (и то, что реально нужно той вкладке — сейчас ничего)
+
+    const nextUrl = `${window.location.pathname}?${sp.toString()}`;
+    if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+      window.history.replaceState(null, "", nextUrl);
+    }
+  }, [didInitFromUrl, isSearchFocused, qLive, activeTab, productsMode, productsTaskId, productsScope, page, pageSize, currentFilter]);
 
   const openProductModal = useCallback(
     (prodOrSku) => {
@@ -296,7 +388,7 @@ export default function App() {
         })
         .catch(() => {});
     },
-    [products]
+    [products],
   );
 
   const closeProductModal = useCallback(() => {
@@ -304,10 +396,7 @@ export default function App() {
     setModalProduct(null);
   }, []);
 
-  const totalPages = useMemo(
-    () => Math.max(1, Math.ceil(totalProducts / pageSize)),
-    [totalProducts, pageSize]
-  );
+  const totalPages = useMemo(() => Math.max(1, Math.ceil(totalProducts / pageSize)), [totalProducts, pageSize]);
 
   const fetchStats = useCallback(async () => {
     const res = await api.get("/stats");
@@ -329,26 +418,110 @@ export default function App() {
   }, []);
 
   const fetchProducts = useCallback(async () => {
-    // режим: товары одной задачи
-    if (productsMode === "byTask" && productsTaskId) {
+    setIsFetching(true);
+    try {
+      // отменяем предыдущий запрос
+      if (productsAbortRef.current) productsAbortRef.current.abort();
+      productsAbortRef.current = new AbortController();
+
+      if (productsMode === "byTask" && productsTaskId) {
+        const params = new URLSearchParams();
+        params.set("limit", String(pageSize));
+        params.set("skip", String((page - 1) * pageSize));
+        params.set("scope", productsScope); // 'task' | 'pipeline'
+        // поиск/сорт/фильтры
+        if (currentFilter.q) params.set("q", currentFilter.q);
+        params.set("sort_by", currentFilter.sort_by || "updated_at");
+        params.set("sort_dir", currentFilter.sort_dir || "desc");
+        const filters = currentFilter.filters || {};
+        Object.entries(filters).forEach(([cid, vals]) => {
+          (vals || []).forEach((v) => params.append(`char_${cid}`, v));
+        });
+        const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`, {
+          signal: productsAbortRef.current.signal,
+        });
+        setProducts(res.data?.items || []);
+        setTotalProducts(res.data?.total || 0);
+        return;
+      }
+      // режим: общий список
       const params = new URLSearchParams();
       params.set("limit", String(pageSize));
       params.set("skip", String((page - 1) * pageSize));
-      params.set("scope", productsScope); // 'task' | 'pipeline'
-      const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`);
+      if (currentFilter.q) params.set("q", currentFilter.q);
+      params.set("sort_by", currentFilter.sort_by || "updated_at");
+      params.set("sort_dir", currentFilter.sort_dir || "desc");
+      const filters = currentFilter.filters || {};
+      Object.entries(filters).forEach(([cid, vals]) => {
+        (vals || []).forEach((v) => params.append(`char_${cid}`, v));
+      });
+      const res = await api.get(`/products?${params.toString()}`, {
+        signal: productsAbortRef.current.signal,
+      });
       setProducts(res.data?.items || []);
       setTotalProducts(res.data?.total || 0);
-      return;
+    } finally {
+      setIsFetching(false);
     }
-    // режим: общий список
-    const params = new URLSearchParams();
-    params.set("limit", String(pageSize));
-    params.set("skip", String((page - 1) * pageSize));
-    if (selectedTeaType) params.set("tea_type", selectedTeaType);
-    const res = await api.get(`/products?${params.toString()}`);
-    setProducts(res.data?.items || []);
-    setTotalProducts(res.data?.total || 0);
-  }, [page, pageSize, selectedTeaType, productsMode, productsTaskId, productsScope]);
+  }, [page, pageSize, productsMode, productsTaskId, productsScope, currentFilter]);
+
+  const fetchFilterCharacteristics = useCallback(async () => {
+    try {
+      // собираем общие параметры фасетов из текущего фильтра
+      setLoadingFacets(true);
+      if (facetsAbortRef.current) facetsAbortRef.current.abort();
+      facetsAbortRef.current = new AbortController();
+
+      const facetParams = new URLSearchParams();
+      if (currentFilter.q) facetParams.set("q", currentFilter.q);
+      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
+        (vals || []).forEach((v) => facetParams.append(`char_${cid}`, v));
+      });
+      if (productsMode === "byTask" && productsTaskId) {
+        facetParams.set("scope", productsScope);
+        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?${facetParams.toString()}`;
+        const res = await api.get(url, {
+          signal: facetsAbortRef.current.signal,
+        });
+        const arr = Array.isArray(res.data) ? res.data : [];
+        setCharByTask((prev) => ({ ...prev, [filterKey]: arr }));
+      } else {
+        const url = `/products/characteristics?${facetParams.toString()}`;
+        const res = await api.get(url, {
+          signal: facetsAbortRef.current.signal,
+        });
+        setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
+      }
+    } catch {
+      /* noop */
+    } finally {
+      setLoadingFacets(false);
+    }
+  }, [productsMode, productsTaskId, productsScope, filterKey, currentFilter]);
+
+  const handleFilterChange = React.useCallback(
+    (next) => {
+      setPage(1);
+      if (productsMode === "byTask") {
+        setFilterByTask((prev) => ({ ...prev, [filterKey]: next }));
+      } else {
+        setFilterAll(next);
+      }
+    },
+    [productsMode, filterKey],
+  );
+
+  const handleFilterReset = React.useCallback(() => {
+    setPage(1);
+    if (productsMode === "byTask") {
+      setFilterByTask((prev) => ({
+        ...prev,
+        [filterKey]: { ...DEFAULT_FILTER },
+      }));
+    } else {
+      setFilterAll({ ...DEFAULT_FILTER });
+    }
+  }, [productsMode, filterKey, DEFAULT_FILTER]);
 
   const openProductsForTask = useCallback((taskId, scope = "task") => {
     setProductsMode("byTask");
@@ -364,23 +537,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchStats().catch(() => {});
-    fetchTasks().catch(() => {});
-    fetchCategories().catch(() => {});
-  }, [fetchStats, fetchTasks, fetchCategories]);
+    writeStateToUrl();
+  }, [writeStateToUrl, didInitFromUrl]);
 
   useEffect(() => {
+    parseUrlToState();
+    setDidInitFromUrl(true); // теперь можно писать в URL
+    fetchStats().catch(() => {});
+    fetchTasks().catch(() => {});
+    fetchCategories().catch(() => {}); // (если ещё нужно для других мест)
+  }, [fetchStats, fetchTasks, fetchCategories, parseUrlToState]);
+
+  useEffect(() => {
+    if (!didInitFromUrl) return;
     fetchProducts().catch(() => {});
-  }, [fetchProducts]);
+    fetchFilterCharacteristics().catch(() => {});
+  }, [didInitFromUrl, fetchProducts, fetchFilterCharacteristics, currentFilter]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();
     if (!term) return;
     setLoading(true);
     try {
-      const res = await api.post(
-        `/scrape/start?search_term=${encodeURIComponent(term)}`
-      );
+      const res = await api.post(`/scrape/start?search_term=${encodeURIComponent(term)}`);
       window.alert(`Scraping started. Task ID: ${res.data?.task_id || "N/A"}`);
       fetchTasks().catch(() => {});
       fetchStats().catch(() => {});
@@ -398,7 +577,7 @@ export default function App() {
       fetchProducts().catch(() => {});
       fetchStats().catch(() => {});
     },
-    [fetchProducts, fetchStats]
+    [fetchProducts, fetchStats],
   );
 
   const exportCSV = useCallback(async () => {
@@ -418,7 +597,7 @@ export default function App() {
           r.scraped_at ?? "",
         ]
           .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-          .join(",")
+          .join(","),
       )
       .join("\n");
     const blob = new Blob([`${header}\n${csvBody}`], {
@@ -442,19 +621,12 @@ export default function App() {
             <div className="flex items-center space-x-3">
               <div className="text-2xl">🍃</div>
               <div>
-                <h1 className="text-xl font-bold text-gray-900">
-                  Chinese Tea Parser
-                </h1>
-                <p className="text-sm text-gray-600">
-                  Ozon.ru • Data collection
-                </p>
+                <h1 className="text-xl font-bold text-gray-900">Chinese Tea Parser</h1>
+                <p className="text-sm text-gray-600">Ozon.ru • Data collection</p>
               </div>
             </div>
             <div className="flex items-center space-x-4">
-              <button
-                onClick={exportCSV}
-                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
-              >
+              <button onClick={exportCSV} className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors">
                 📥 Export CSV
               </button>
             </div>
@@ -478,8 +650,7 @@ export default function App() {
                   activeTab === tab.id
                     ? "border-blue-500 text-blue-600"
                     : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                }`}
-              >
+                }`}>
                 <span>{tab.icon}</span>
                 <span>{tab.label}</span>
               </button>
@@ -492,27 +663,10 @@ export default function App() {
         {activeTab === "dashboard" && (
           <div className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              <StatCard
-                title="Products total"
-                value={stats.total_products || 0}
-                subtitle="In database"
-              />
-              <StatCard
-                title="Active tasks"
-                value={stats.running_tasks || 0}
-                subtitle="In progress"
-              />
-              <StatCard
-                title="Finished tasks"
-                value={stats.finished_tasks || 0}
-                subtitle="Succeeded"
-              />
-              <StatCard
-                title="Error rate"
-                value={`${Number(stats.error_rate || 0).toFixed(1)}%`}
-                subtitle="All time"
-                tone="red"
-              />
+              <StatCard title="Products total" value={stats.total_products || 0} subtitle="In database" />
+              <StatCard title="Active tasks" value={stats.running_tasks || 0} subtitle="In progress" />
+              <StatCard title="Finished tasks" value={stats.finished_tasks || 0} subtitle="Succeeded" />
+              <StatCard title="Error rate" value={`${Number(stats.error_rate || 0).toFixed(1)}%`} subtitle="All time" tone="red" />
             </div>
 
             {stats.total_products === 0 && (stats.total_tasks || 0) > 0 && (
@@ -520,13 +674,8 @@ export default function App() {
                 <div className="flex items-start">
                   <div className="text-yellow-600 text-2xl mr-4">⚠️</div>
                   <div>
-                    <h3 className="text-lg font-semibold text-yellow-800 mb-2">
-                      Potential geo-blocking
-                    </h3>
-                    <p className="text-yellow-700 mb-4">
-                      All scraping tasks finish with 0 products. Possible
-                      reasons:
-                    </p>
+                    <h3 className="text-lg font-semibold text-yellow-800 mb-2">Potential geo-blocking</h3>
+                    <p className="text-yellow-700 mb-4">All scraping tasks finish with 0 products. Possible reasons:</p>
                     <ul className="text-yellow-700 space-y-1 mb-4 list-disc list-inside">
                       <li>Geo restrictions for non-Russian IPs</li>
                       <li>Missing tokens or region configuration</li>
@@ -544,25 +693,14 @@ export default function App() {
               <h3 className="text-lg font-semibold mb-4">Recent tasks</h3>
               <div className="space-y-3">
                 {(tasks || []).slice(0, 5).map((task) => (
-                  <div
-                    key={task.id}
-                    className="flex items-center justify-between p-3 bg-gray-50 rounded-lg"
-                  >
+                  <div key={task.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
                     <div>
                       <p className="font-medium">{task.search_term}</p>
-                      <p className="text-sm text-gray-500">
-                        {formatDate(task.created_at)}
-                      </p>
-                      {task.error_message && (
-                        <p className="text-sm text-red-600 mt-1">
-                          {task.error_message}
-                        </p>
-                      )}
+                      <p className="text-sm text-gray-500">{formatDate(task.created_at)}</p>
+                      {task.error_message && <p className="text-sm text-red-600 mt-1">{task.error_message}</p>}
                     </div>
                     <div className="flex items-center space-x-3">
-                      <span className="text-sm text-gray-600">
-                        {task.scraped_products || 0} items
-                      </span>
+                      <span className="text-sm text-gray-600">{task.scraped_products || 0} items</span>
                       <StatusBadge status={task.status} />
                     </div>
                   </div>
@@ -587,30 +725,19 @@ export default function App() {
                 <button
                   onClick={startScraping}
                   disabled={loading}
-                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
-                >
+                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 transition-colors">
                   {loading ? "🔄 Starting..." : "🚀 Start"}
                 </button>
               </div>
 
               <div className="mt-4 p-4 bg-blue-50 rounded-lg">
-                <h4 className="font-medium text-blue-900 mb-2">
-                  Suggested queries
-                </h4>
+                <h4 className="font-medium text-blue-900 mb-2">Suggested queries</h4>
                 <div className="flex flex-wrap gap-2">
-                  {[
-                    "puer",
-                    "sheng puer",
-                    "shu puer",
-                    "oolong",
-                    "chinese tea",
-                    "green tea",
-                  ].map((term) => (
+                  {["puer", "sheng puer", "shu puer", "oolong", "chinese tea", "green tea"].map((term) => (
                     <button
                       key={term}
                       onClick={() => setSearchTerm(term)}
-                      className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm hover:bg-blue-200 transition-colors"
-                    >
+                      className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm hover:bg-blue-200 transition-colors">
                       {term}
                     </button>
                   ))}
@@ -619,39 +746,20 @@ export default function App() {
             </div>
 
             <div className="bg-white rounded-lg shadow-md p-6">
-              <h3 className="text-lg font-semibold mb-4">
-                Scraping statistics
-              </h3>
+              <h3 className="text-lg font-semibold mb-4">Scraping statistics</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="p-4 bg-green-50 rounded-lg">
-                  <div className="text-green-600 text-sm font-medium">
-                    Captchas solved
-                  </div>
-                  <div className="text-2xl font-bold text-green-900">
-                    {stats.captcha_solves || 0}
-                  </div>
+                  <div className="text-green-600 text-sm font-medium">Captchas solved</div>
+                  <div className="text-2xl font-bold text-green-900">{stats.captcha_solves || 0}</div>
                 </div>
                 <div className="p-4 bg-blue-50 rounded-lg">
-                  <div className="text-blue-600 text-sm font-medium">
-                    Total tasks
-                  </div>
-                  <div className="text-2xl font-bold text-blue-900">
-                    {stats.total_tasks || 0}
-                  </div>
+                  <div className="text-blue-600 text-sm font-medium">Total tasks</div>
+                  <div className="text-2xl font-bold text-blue-900">{stats.total_tasks || 0}</div>
                 </div>
                 <div className="p-4 bg-purple-50 rounded-lg">
-                  <div className="text-purple-600 text-sm font-medium">
-                    Success rate
-                  </div>
+                  <div className="text-purple-600 text-sm font-medium">Success rate</div>
                   <div className="text-2xl font-bold text-purple-900">
-                    {stats.total_tasks > 0
-                      ? (
-                          (Number(stats.finished_tasks || 0) /
-                            Number(stats.total_tasks || 1)) *
-                          100
-                        ).toFixed(1)
-                      : 0}
-                    %
+                    {stats.total_tasks > 0 ? ((Number(stats.finished_tasks || 0) / Number(stats.total_tasks || 1)) * 100).toFixed(1) : 0}%
                   </div>
                 </div>
               </div>
@@ -663,55 +771,62 @@ export default function App() {
           <div className="space-y-6">
             <div className="bg-white rounded-lg shadow-md p-6">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold">
-                  Products ({totalProducts})
-                </h3>
-                <div className="flex items-center space-x-4">
-                  <select
-                    value={selectedTeaType}
-                    onChange={(e) => {
-                      setPage(1);
-                      setSelectedTeaType(e.target.value);
-                    }}
-                    className="px-3 py-2 border border-gray-300 rounded-lg"
-                  >
-                    <option value="">All types</option>
-                    {categories.map((c) => (
-                      <option key={c._id} value={c._id}>
-                        {c._id} ({c.count})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={() => {
-                      setPage(1);
-                      fetchProducts().catch(() => {});
-                    }}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                  >
-                    🔄 Refresh
-                  </button>
+                <h3 className="text-lg font-semibold">Products ({totalProducts})</h3>
+                <button
+                  onClick={() => {
+                    setPage(1);
+                    fetchProducts().catch(() => {});
+                  }}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+                  title="Refresh results">
+                  <RxUpdate className="w-5 h-5" />
+                  Refresh
+                </button>
+              </div>
+
+              {/* ФИЛЬТР */}
+              <ProductsFilter
+                mode={productsMode}
+                taskId={productsTaskId}
+                scope={productsScope}
+                onScopeChange={(sc) => setProductsScope(sc)}
+                onClearTask={() => {
+                  setProductsMode("all");
+                  setProductsTaskId("");
+                  // при желании сбросить страницу и дернуть фетч:
+                  setPage(1);
+                  // fetchProducts() подтянется из эффекта/кнопки
+                }}
+                characteristics={currentCharacteristics}
+                value={currentFilter}
+                onChange={handleFilterChange}
+                onReset={handleFilterReset}
+                // loading={isFetching}
+                loadingFacets={loadingFacets}
+                onSearchFocusChange={setIsSearchFocused} // NEW
+                onSearchCommit={writeStateToUrl} // NEW: Enter -> сразу обновим URL
+                onSearchTyping={setQLive}
+              />
+
+              <div className="relative">
+                {/* Оверлей загрузки — НЕ меняет layout и НЕ крадёт фокус */}
+                {isFetching && (
+                  <div className="absolute inset-0 z-10 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
+                    <div className="loading-spinner" aria-label="Loading" />
+                  </div>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {products.map((p) => (
+                    <TeaCard key={p.id} product={p} onDelete={deleteProduct} onOpen={() => openProductModal(p)} />
+                  ))}
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {products.map((p) => (
-                  <TeaCard
-                    key={p.id}
-                    product={p}
-                    onDelete={deleteProduct}
-                    onOpen={() => openProductModal(p)}
-                  />
-                ))}
-              </div>
-
-              {products.length === 0 && (
+              {products.length === 0 && !isFetching && (
                 <div className="text-center py-12">
                   <div className="text-6xl mb-4">🍃</div>
                   <p className="text-gray-500">No products found</p>
-                  <p className="text-sm text-gray-400 mt-2">
-                    Start scraping to populate the list
-                  </p>
+                  <p className="text-sm text-gray-400 mt-2">Start scraping to populate the list</p>
                 </div>
               )}
 
@@ -736,20 +851,14 @@ export default function App() {
                 <h3 className="text-lg font-semibold">Task history</h3>
                 <button
                   onClick={() => fetchTasks().catch(() => {})}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                >
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
                   🔄 Refresh
                 </button>
               </div>
 
               <div className="space-y-3">
                 {tasks.map((t) => (
-                  <TaskItem
-                    key={t.id}
-                    task={t}
-                    onOpenProducts={openProductsForTask}
-                    onOpenChildren={openChildrenTasks}
-                  />
+                  <TaskItem key={t.id} task={t} onOpenProducts={openProductsForTask} onOpenChildren={openChildrenTasks} />
                 ))}
                 {tasks.length === 0 && (
                   <div className="text-center py-12">
@@ -761,12 +870,12 @@ export default function App() {
             </div>
           </div>
         )}
-      <ProductModal
-        isOpen={isProductModalOpen}
-        product={modalProduct || {}}
-        onClose={closeProductModal}
-        onSelectSku={(sku) => openProductModal(sku)}
-      />
+        <ProductModal
+          isOpen={isProductModalOpen}
+          product={modalProduct || {}}
+          onClose={closeProductModal}
+          onSelectSku={(sku) => openProductModal(sku)}
+        />
       </main>
     </div>
   );
