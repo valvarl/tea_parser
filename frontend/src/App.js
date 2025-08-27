@@ -70,27 +70,29 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState("puer");
   const [categories, setCategories] = useState([]);
 
-  // URL init guard: не пишем в URL, пока не распарсили его
+  // guard: пишем в URL только после первичной инициализации
   const [didInitFromUrl, setDidInitFromUrl] = useState(false);
 
-  // --- deep-linking: парсинг URL -> state (только tab)
+  // ---- URL -> state (только tab)
   const parseUrlToState = useCallback(() => {
     const sp = new URLSearchParams(window.location.search);
     const tab = sp.get("tab");
     if (tab) setActiveTab(tab);
   }, []);
 
-  // --- deep-linking: state -> URL (только tab)
+  // ---- state -> URL: сохраняем существующие query-параметры (включая фильтры products),
+  // просто обновляем tab. Это и обеспечивает сохранность фильтров при уходе/возврате.
   const writeStateToUrl = useCallback(() => {
-    const sp = new URLSearchParams(window.location.search);
+    if (!didInitFromUrl) return;
+    const sp = new URLSearchParams(window.location.search); // <— сохраняем всё
     sp.set("tab", activeTab);
     const nextUrl = `${window.location.pathname}?${sp.toString()}`;
     if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
       window.history.replaceState(null, "", nextUrl);
     }
-  }, [activeTab]);
+  }, [activeTab, didInitFromUrl]);
 
-  // --- API calls unrelated to ProductsPage ---
+  // --- API (не связанные с ProductsPage) ---
   const fetchStats = useCallback(async () => {
     const res = await api.get("/stats");
     setStats(res.data || {});
@@ -107,9 +109,10 @@ export default function App() {
 
   const fetchCategories = useCallback(async () => {
     const res = await api.get("/categories");
-    setCategories(res.data?.categories || []); // на будущее
+    setCategories(res.data?.categories || []);
   }, []);
 
+  // Открыть продукты по задаче: кладём продукты-параметры в URL
   const openProductsForTask = useCallback((taskId, scope = "task") => {
     const sp = new URLSearchParams(window.location.search);
     sp.set("tab", "products");
@@ -126,12 +129,12 @@ export default function App() {
     setActiveTab("tasks");
   }, []);
 
-  // Писать в URL только после инициализации из URL
+  // писать tab в URL при каждом изменении активной вкладки
   useEffect(() => {
-    if (didInitFromUrl) writeStateToUrl();
-  }, [writeStateToUrl, didInitFromUrl]);
+    writeStateToUrl();
+  }, [writeStateToUrl]);
 
-  // Initial load
+  // первичная загрузка
   useEffect(() => {
     parseUrlToState();
     setDidInitFromUrl(true);
@@ -224,7 +227,8 @@ export default function App() {
                   activeTab === tab.id
                     ? "border-blue-500 text-blue-600"
                     : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                }`}>
+                }`}
+              >
                 <span>{tab.icon}</span>
                 <span>{tab.label}</span>
               </button>
@@ -299,7 +303,8 @@ export default function App() {
                 <button
                   onClick={startScraping}
                   disabled={loading}
-                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 transition-colors">
+                  className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
+                >
                   {loading ? "🔄 Starting..." : "🚀 Start"}
                 </button>
               </div>
@@ -311,7 +316,8 @@ export default function App() {
                     <button
                       key={term}
                       onClick={() => setSearchTerm(term)}
-                      className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm hover:bg-blue-200 transition-colors">
+                      className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm hover:bg-blue-200 transition-colors"
+                    >
                       {term}
                     </button>
                   ))}
@@ -350,7 +356,8 @@ export default function App() {
                 <h3 className="text-lg font-semibold">Task history</h3>
                 <button
                   onClick={() => fetchTasks().catch(() => {})}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                >
                   🔄 Refresh
                 </button>
               </div>
