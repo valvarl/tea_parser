@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/prettierrc",
+  "printWidth": 140,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": true,
+  "singleQuote": false,
+  "jsxSingleQuote": false,
+  "trailingComma": "all",
+  "bracketSpacing": true,
+  "bracketSameLine": true,
+  "arrowParens": "always",
+  "proseWrap": "preserve",
+  "endOfLine": "lf",
+  "singleAttributePerLine": false,
+  "overrides": [
+    {
+      "files": ["*.md", "*.mdx"],
+      "options": { "proseWrap": "preserve" }
+    }
+  ]
+}
