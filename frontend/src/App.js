@@ -1,8 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+// App.js
+import React, { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import PropTypes from "prop-types";
 import "./App.css";
-import ProductModal from "./components/ProductModal";
 import TaskItem from "./components/TaskItem";
 import ProductsPage from "./components/ProductsPage";
 
@@ -63,183 +63,34 @@ StatCard.propTypes = {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
-  const [products, setProducts] = useState([]);
-  const [totalProducts, setTotalProducts] = useState(0);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(24);
-  // const [selectedTeaType, setSelectedTeaType] = useState("");
   const [tasks, setTasks] = useState([]);
   const [tasksParentFilter, setTasksParentFilter] = useState("");
-  const [productsMode, setProductsMode] = useState("all"); // all | byTask
-  const [productsTaskId, setProductsTaskId] = useState("");
-  const [productsScope, setProductsScope] = useState("task"); // task | pipeline
   const [stats, setStats] = useState({});
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("puer");
   const [categories, setCategories] = useState([]);
-  const [isProductModalOpen, setIsProductModalOpen] = useState(false);
-  const [modalProduct, setModalProduct] = useState(null);
-  const [isSearchFocused, setIsSearchFocused] = useState(false); // NEW
-  const [qLive, setQLive] = useState(""); // текст в инпуте во время набора
-
-  const productsAbortRef = React.useRef(null);
-  const facetsAbortRef = React.useRef(null);
-
-  // фильтр: раздельно для "all" и для "byTask" по ключу taskId::scope
-  const DEFAULT_FILTER = useMemo(
-    () => ({
-      q: "",
-      sort_by: "updated_at",
-      sort_dir: "desc",
-      filters: {}, // Record<charId, string[]>
-    }),
-    [],
-  );
-
-  const [filterAll, setFilterAll] = useState({ ...DEFAULT_FILTER });
-  const [filterByTask, setFilterByTask] = useState({}); // { [key]: FilterValue }
-
-  const filterKey = useMemo(
-    () => (productsMode === "byTask" ? `${productsTaskId || ""}::${productsScope}` : "all"),
-    [productsMode, productsTaskId, productsScope],
-  );
-
-  const currentFilter = useMemo(
-    () => (productsMode === "byTask" ? filterByTask[filterKey] || DEFAULT_FILTER : filterAll),
-    [productsMode, filterByTask, filterKey, filterAll, DEFAULT_FILTER],
-  );
-
-  // характеристики для фильтра (кеш)
-  const [charAll, setCharAll] = useState([]);
-  const [charByTask, setCharByTask] = useState({}); // { [key]: Characteristic[] }
-  const currentCharacteristics = useMemo(
-    () => (productsMode === "byTask" ? charByTask[filterKey] || [] : charAll),
-    [productsMode, charByTask, filterKey, charAll],
-  );
-
-  // загрузка для скелетонов
-  const [isFetching, setIsFetching] = useState(false);
-  const [loadingFacets, setLoadingFacets] = useState(false);
 
   // URL init guard: не пишем в URL, пока не распарсили его
   const [didInitFromUrl, setDidInitFromUrl] = useState(false);
 
-  // q с дебаунсом для записи в URL (не мешает набору)
-  const [qDebounced, setQDebounced] = useState("");
-  useEffect(() => {
-    // q уже задебаунсено внутри ProductsFilter (400 мс)
-    setQDebounced(currentFilter.q || "");
-  }, [currentFilter.q]);
-
-  // --- deep-linking: парсинг URL -> state
+  // --- deep-linking: парсинг URL -> state (только tab)
   const parseUrlToState = useCallback(() => {
     const sp = new URLSearchParams(window.location.search);
     const tab = sp.get("tab");
-    const mode = sp.get("mode");
-    const taskId = sp.get("taskId");
-    const scope = sp.get("scope");
-    const q = sp.get("q") || "";
-    const sort_by = sp.get("sort_by") || "updated_at";
-    const sort_dir = (sp.get("sort_dir") || "desc") === "asc" ? "asc" : "desc";
-    const pageQ = parseInt(sp.get("page") || "1", 10);
-    const limitQ = parseInt(sp.get("limit") || "24", 10);
-
-    // собрать char_* -> Record<string,string[]>
-    const filters = {};
-    for (const [k, v] of sp.entries()) {
-      if (k.startsWith("char_") && v) {
-        const cid = k.slice(5);
-        filters[cid] = filters[cid] || [];
-        filters[cid].push(v);
-      }
-    }
-
     if (tab) setActiveTab(tab);
-    if (Number.isFinite(pageQ) && pageQ > 0) setPage(pageQ);
-    if (Number.isFinite(limitQ) && [12, 24, 48, 96].includes(limitQ)) setPageSize(limitQ);
-
-    const parsedFilter = { q, sort_by, sort_dir, filters };
-    if (mode === "byTask" && taskId) {
-      setProductsMode("byTask");
-      setProductsTaskId(taskId);
-      setProductsScope(scope === "pipeline" ? "pipeline" : "task");
-      const key = `${taskId}::${scope === "pipeline" ? "pipeline" : "task"}`;
-      setFilterByTask((prev) => ({ ...prev, [key]: parsedFilter }));
-    } else {
-      setProductsMode("all");
-      setFilterAll(parsedFilter);
-    }
   }, []);
 
-  // --- deep-linking: state -> URL (replaceState)
+  // --- deep-linking: state -> URL (только tab)
   const writeStateToUrl = useCallback(() => {
-    if (!didInitFromUrl) return;
-
-    const sp = new URLSearchParams();
+    const sp = new URLSearchParams(window.location.search);
     sp.set("tab", activeTab);
-
-    if (activeTab === "products") {
-      sp.set("mode", productsMode);
-      if (productsMode === "byTask" && productsTaskId) {
-        sp.set("taskId", productsTaskId);
-        sp.set("scope", productsScope);
-      }
-      sp.set("page", String(page));
-      sp.set("limit", String(pageSize));
-      const qParam = isSearchFocused ? qLive : currentFilter.q || "";
-      if (qParam) sp.set("q", qParam);
-      sp.set("sort_by", currentFilter.sort_by || "updated_at");
-      sp.set("sort_dir", currentFilter.sort_dir || "desc");
-      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
-        (vals || []).forEach((v) => sp.append(`char_${cid}`, v));
-      });
-    }
-    // для других вкладок намеренно НЕ пишем продуктовые параметры:
-    // оставляем только tab (и то, что реально нужно той вкладке — сейчас ничего)
-
     const nextUrl = `${window.location.pathname}?${sp.toString()}`;
     if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
       window.history.replaceState(null, "", nextUrl);
     }
-  }, [didInitFromUrl, isSearchFocused, qLive, activeTab, productsMode, productsTaskId, productsScope, page, pageSize, currentFilter]);
+  }, [activeTab]);
 
-  const openProductModal = useCallback(
-    (prodOrSku) => {
-      if (!prodOrSku) return;
-      // Если пришёл объект — открываем сразу
-      if (typeof prodOrSku === "object") {
-        setModalProduct(prodOrSku);
-        setIsProductModalOpen(true);
-        return;
-      }
-      // Если пришёл sku — попробуем найти в текущей странице
-      const found = products.find((p) => String(p.sku) === String(prodOrSku));
-      if (found) {
-        setModalProduct(found);
-        setIsProductModalOpen(true);
-        return;
-      }
-      // Фоллбек: получить по SKU с бэка (если эндпоинт есть)
-      api
-        .get(`/products/sku/${encodeURIComponent(String(prodOrSku))}`)
-        .then((res) => {
-          if (res?.data) {
-            setModalProduct(res.data);
-            setIsProductModalOpen(true);
-          }
-        })
-        .catch(() => {});
-    },
-    [products],
-  );
-
-  const closeProductModal = useCallback(() => {
-    setIsProductModalOpen(false);
-    setModalProduct(null);
-  }, []);
-
-  const totalPages = useMemo(() => Math.max(1, Math.ceil(totalProducts / pageSize)), [totalProducts, pageSize]);
-
+  // --- API calls unrelated to ProductsPage ---
   const fetchStats = useCallback(async () => {
     const res = await api.get("/stats");
     setStats(res.data || {});
@@ -256,97 +107,18 @@ export default function App() {
 
   const fetchCategories = useCallback(async () => {
     const res = await api.get("/categories");
-    setCategories(res.data?.categories || []);
+    setCategories(res.data?.categories || []); // на будущее
   }, []);
 
-  const fetchProducts = useCallback(async () => {
-    setIsFetching(true);
-    try {
-      // отменяем предыдущий запрос
-      if (productsAbortRef.current) productsAbortRef.current.abort();
-      productsAbortRef.current = new AbortController();
-
-      if (productsMode === "byTask" && productsTaskId) {
-        const params = new URLSearchParams();
-        params.set("limit", String(pageSize));
-        params.set("skip", String((page - 1) * pageSize));
-        params.set("scope", productsScope); // 'task' | 'pipeline'
-        // поиск/сорт/фильтры
-        if (currentFilter.q) params.set("q", currentFilter.q);
-        params.set("sort_by", currentFilter.sort_by || "updated_at");
-        params.set("sort_dir", currentFilter.sort_dir || "desc");
-        const filters = currentFilter.filters || {};
-        Object.entries(filters).forEach(([cid, vals]) => {
-          (vals || []).forEach((v) => params.append(`char_${cid}`, v));
-        });
-        const res = await api.get(`/tasks/${encodeURIComponent(productsTaskId)}/products?${params.toString()}`, {
-          signal: productsAbortRef.current.signal,
-        });
-        setProducts(res.data?.items || []);
-        setTotalProducts(res.data?.total || 0);
-        return;
-      }
-      // режим: общий список
-      const params = new URLSearchParams();
-      params.set("limit", String(pageSize));
-      params.set("skip", String((page - 1) * pageSize));
-      if (currentFilter.q) params.set("q", currentFilter.q);
-      params.set("sort_by", currentFilter.sort_by || "updated_at");
-      params.set("sort_dir", currentFilter.sort_dir || "desc");
-      const filters = currentFilter.filters || {};
-      Object.entries(filters).forEach(([cid, vals]) => {
-        (vals || []).forEach((v) => params.append(`char_${cid}`, v));
-      });
-      const res = await api.get(`/products?${params.toString()}`, {
-        signal: productsAbortRef.current.signal,
-      });
-      setProducts(res.data?.items || []);
-      setTotalProducts(res.data?.total || 0);
-    } finally {
-      setIsFetching(false);
-    }
-  }, [page, pageSize, productsMode, productsTaskId, productsScope, currentFilter]);
-
-  const fetchFilterCharacteristics = useCallback(async () => {
-    try {
-      // собираем общие параметры фасетов из текущего фильтра
-      setLoadingFacets(true);
-      if (facetsAbortRef.current) facetsAbortRef.current.abort();
-      facetsAbortRef.current = new AbortController();
-
-      const facetParams = new URLSearchParams();
-      if (currentFilter.q) facetParams.set("q", currentFilter.q);
-      Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {
-        (vals || []).forEach((v) => facetParams.append(`char_${cid}`, v));
-      });
-      if (productsMode === "byTask" && productsTaskId) {
-        facetParams.set("scope", productsScope);
-        const url = `/tasks/${encodeURIComponent(productsTaskId)}/products/characteristics?${facetParams.toString()}`;
-        const res = await api.get(url, {
-          signal: facetsAbortRef.current.signal,
-        });
-        const arr = Array.isArray(res.data) ? res.data : [];
-        setCharByTask((prev) => ({ ...prev, [filterKey]: arr }));
-      } else {
-        const url = `/products/characteristics?${facetParams.toString()}`;
-        const res = await api.get(url, {
-          signal: facetsAbortRef.current.signal,
-        });
-        setCharAll(Array.isArray(res.data) ? res.data : res.data?.items || []);
-      }
-    } catch {
-      /* noop */
-    } finally {
-      setLoadingFacets(false);
-    }
-  }, [productsMode, productsTaskId, productsScope, filterKey, currentFilter]);
-
   const openProductsForTask = useCallback((taskId, scope = "task") => {
-    setProductsMode("byTask");
-    setProductsTaskId(taskId);
-    setProductsScope(scope);
+    const sp = new URLSearchParams(window.location.search);
+    sp.set("tab", "products");
+    sp.set("mode", "byTask");
+    sp.set("taskId", taskId);
+    sp.set("scope", scope === "pipeline" ? "pipeline" : "task");
+    sp.set("page", "1");
+    window.history.replaceState(null, "", `${window.location.pathname}?${sp.toString()}`);
     setActiveTab("products");
-    setPage(1);
   }, []);
 
   const openChildrenTasks = useCallback((taskId) => {
@@ -354,23 +126,19 @@ export default function App() {
     setActiveTab("tasks");
   }, []);
 
+  // Писать в URL только после инициализации из URL
   useEffect(() => {
-    writeStateToUrl();
+    if (didInitFromUrl) writeStateToUrl();
   }, [writeStateToUrl, didInitFromUrl]);
 
+  // Initial load
   useEffect(() => {
     parseUrlToState();
-    setDidInitFromUrl(true); // теперь можно писать в URL
+    setDidInitFromUrl(true);
     fetchStats().catch(() => {});
     fetchTasks().catch(() => {});
-    fetchCategories().catch(() => {}); // (если ещё нужно для других мест)
+    fetchCategories().catch(() => {});
   }, [fetchStats, fetchTasks, fetchCategories, parseUrlToState]);
-
-  useEffect(() => {
-    if (!didInitFromUrl) return;
-    fetchProducts().catch(() => {});
-    fetchFilterCharacteristics().catch(() => {});
-  }, [didInitFromUrl, fetchProducts, fetchFilterCharacteristics, currentFilter]);
 
   const startScraping = useCallback(async () => {
     const term = String(searchTerm || "").trim();
@@ -387,16 +155,6 @@ export default function App() {
       setLoading(false);
     }
   }, [searchTerm, fetchStats, fetchTasks]);
-
-  const deleteProduct = useCallback(
-    async (productId) => {
-      if (!window.confirm("Delete this product?")) return;
-      await api.delete(`/products/${productId}`);
-      fetchProducts().catch(() => {});
-      fetchStats().catch(() => {});
-    },
-    [fetchProducts, fetchStats],
-  );
 
   const exportCSV = useCallback(async () => {
     const res = await api.get("/export/csv");
@@ -418,9 +176,7 @@ export default function App() {
           .join(","),
       )
       .join("\n");
-    const blob = new Blob([`${header}\n${csvBody}`], {
-      type: "text/csv;charset=utf-8",
-    });
+    const blob = new Blob([`${header}\n${csvBody}`], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -585,58 +341,7 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === "products" && (
-          <ProductsPage
-            totalProducts={totalProducts}
-            products={products}
-            isFetching={isFetching}
-            productsMode={productsMode}
-            productsTaskId={productsTaskId}
-            productsScope={productsScope}
-            onScopeChange={(sc) => setProductsScope(sc)}
-            onClearTask={() => {
-              setProductsMode("all");
-              setProductsTaskId("");
-              setPage(1);
-            }}
-            currentCharacteristics={currentCharacteristics}
-            currentFilter={currentFilter}
-            onFilterChange={(next) => {
-              setPage(1);
-              if (productsMode === "byTask") {
-                setFilterByTask((prev) => ({ ...prev, [filterKey]: next }));
-              } else {
-                setFilterAll(next);
-              }
-            }}
-            onFilterReset={() => {
-              setPage(1);
-              if (productsMode === "byTask") {
-                setFilterByTask((prev) => ({ ...prev, [filterKey]: { ...DEFAULT_FILTER } }));
-              } else {
-                setFilterAll({ ...DEFAULT_FILTER });
-              }
-            }}
-            loadingFacets={loadingFacets}
-            onSearchFocusChange={setIsSearchFocused}
-            onSearchCommit={writeStateToUrl}
-            onSearchTyping={setQLive}
-            onRefresh={() => {
-              setPage(1);
-              fetchProducts().catch(() => {});
-            }}
-            onDeleteProduct={deleteProduct}
-            onOpenProduct={(p) => openProductModal(p)}
-            page={page}
-            totalPages={totalPages}
-            pageSize={pageSize}
-            onPageChange={(p) => setPage(p)}
-            onPageSizeChange={(sz) => {
-              setPage(1);
-              setPageSize(sz);
-            }}
-          />
-        )}
+        {activeTab === "products" && <ProductsPage api={api} />}
 
         {activeTab === "tasks" && (
           <div className="space-y-6">
@@ -664,12 +369,6 @@ export default function App() {
             </div>
           </div>
         )}
-        <ProductModal
-          isOpen={isProductModalOpen}
-          product={modalProduct || {}}
-          onClose={closeProductModal}
-          onSelectSku={(sku) => openProductModal(sku)}
-        />
       </main>
     </div>
   );
