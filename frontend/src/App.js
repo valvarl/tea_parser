@@ -345,7 +345,7 @@ export default function App() {
       sp.set("page", String(page));
       sp.set("limit", String(pageSize));
       const qParam = isSearchFocused ? qLive : currentFilter.q || "";
-      if (qParam) sp.set("q", qParam); // при пустом q просто не пишем параметр
+      if (qParam) sp.set("q", qParam);
       sp.set("sort_by", currentFilter.sort_by || "updated_at");
       sp.set("sort_dir", currentFilter.sort_dir || "desc");
       Object.entries(currentFilter.filters || {}).forEach(([cid, vals]) => {

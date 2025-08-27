@@ -154,6 +154,7 @@ export default function ProductsFilter({
     if (chip.type === "q") {
       setSearchLocal("");
       onChange?.({ ...value, q: "" });
+      onSearchTyping?.("");
       return;
     }
     toggleFilterValue(chip.cid, chip.v);
@@ -162,6 +163,7 @@ export default function ProductsFilter({
   const clearAll = () => {
     onReset?.();
     setSearchLocal("");
+    onSearchTyping?.("");
   };
 
   const isDisabled = disabled || loading;
@@ -236,6 +238,7 @@ export default function ProductsFilter({
                 onFocus={() => {
                   setIsFocused(true);
                   onSearchFocusChange?.(true);
+                  onSearchTyping?.(searchLocal);
                 }}
                 onBlur={() => {
                   setIsFocused(false);
@@ -251,7 +254,10 @@ export default function ProductsFilter({
               {searchLocal ? (
                 <button
                   type="button"
-                  onClick={() => setSearchLocal("")}
+                  onClick={() => {
+                    setSearchLocal("");
+                    onSearchTyping?.(""); // <<< важно
+                  }}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
                   aria-label="Clear search"
                   title="Clear">
