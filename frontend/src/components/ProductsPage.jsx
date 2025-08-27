@@ -15,11 +15,11 @@ const DEFAULT_FILTER = {
 };
 
 const DEFAULT_QUERY = {
-  mode: "all",        // "all" | "byTask"
+  mode: "all", // "all" | "byTask"
   taskId: "",
-  scope: "task",      // "task" | "pipeline"
+  scope: "task", // "task" | "pipeline"
   page: 1,
-  limit: 24,          // 12|24|48|96
+  limit: 24, // 12|24|48|96
   ...DEFAULT_FILTER,
 };
 
@@ -131,10 +131,7 @@ export default function ProductsPage({ api, initialQuery, onPersist }) {
   const productsAbortRef = useRef(null);
   const facetsAbortRef = useRef(null);
 
-  const totalPages = useMemo(
-    () => Math.max(1, Math.ceil(Number(totalProducts || 0) / Number(pageSize || 1))),
-    [totalProducts, pageSize],
-  );
+  const totalPages = useMemo(() => Math.max(1, Math.ceil(Number(totalProducts || 0) / Number(pageSize || 1))), [totalProducts, pageSize]);
 
   // --- apply a full query object into component state
   const applyQuery = useCallback((q) => {
@@ -180,7 +177,7 @@ export default function ProductsPage({ api, initialQuery, onPersist }) {
   // ----- initialization (sync to avoid гонки) -----
   useLayoutEffect(() => {
     const urlHas = hasProductsParamsInUrl(window.location.search);
-    const snap = urlHas ? readQueryFromUrl(window.location.search) : (initialQuery || DEFAULT_QUERY);
+    const snap = urlHas ? readQueryFromUrl(window.location.search) : initialQuery || DEFAULT_QUERY;
     applyQuery(snap);
     // стандартизируем URL под выбранный снапшот
     writeQueryToUrl(snap);
@@ -273,17 +270,7 @@ export default function ProductsPage({ api, initialQuery, onPersist }) {
     if (!didInit) return;
     fetchProducts().catch(() => {});
     fetchFilterCharacteristics().catch(() => {});
-  }, [
-    didInit,
-    fetchProducts,
-    fetchFilterCharacteristics,
-    currentFilter,
-    page,
-    pageSize,
-    productsMode,
-    productsTaskId,
-    productsScope,
-  ]);
+  }, [didInit, fetchProducts, fetchFilterCharacteristics, currentFilter, page, pageSize, productsMode, productsTaskId, productsScope]);
 
   // ----- modal helpers -----
   const openProductModal = useCallback(
@@ -347,97 +334,97 @@ export default function ProductsPage({ api, initialQuery, onPersist }) {
 
   // ----- render -----
   return (
-    <div className="space-y-6">
-      <div className="bg-white rounded-lg shadow-md p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold">Products ({totalProducts})</h3>
-          <button
-            onClick={() => {
-              setPage(1);
-              fetchProducts().catch(() => {});
+    <>
+      <div className="space-y-6">
+        <div className="bg-white rounded-lg shadow-md p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold">Products ({totalProducts})</h3>
+            <button
+              onClick={() => {
+                setPage(1);
+                fetchProducts().catch(() => {});
+              }}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+              title="Refresh results">
+              <RxUpdate className="w-5 h-5" />
+              Refresh
+            </button>
+          </div>
+
+          <ProductsFilter
+            mode={productsMode}
+            taskId={productsTaskId}
+            scope={productsScope}
+            onScopeChange={setProductsScope}
+            onClearTask={handleClearTask}
+            characteristics={currentCharacteristics}
+            value={currentFilter}
+            onChange={handleFilterChange}
+            onReset={handleFilterReset}
+            loadingFacets={loadingFacets}
+            onSearchFocusChange={setIsSearchFocused}
+            onSearchCommit={() => {
+              const q = buildCurrentQuery();
+              writeQueryToUrl(q);
             }}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
-            title="Refresh results"
-          >
-            <RxUpdate className="w-5 h-5" />
-            Refresh
-          </button>
-        </div>
+            onSearchTyping={setQLive}
+          />
 
-        <ProductsFilter
-          mode={productsMode}
-          taskId={productsTaskId}
-          scope={productsScope}
-          onScopeChange={setProductsScope}
-          onClearTask={handleClearTask}
-          characteristics={currentCharacteristics}
-          value={currentFilter}
-          onChange={handleFilterChange}
-          onReset={handleFilterReset}
-          loadingFacets={loadingFacets}
-          onSearchFocusChange={setIsSearchFocused}
-          onSearchCommit={() => {
-            const q = buildCurrentQuery();
-            writeQueryToUrl(q);
-          }}
-          onSearchTyping={setQLive}
-        />
+          <div className="relative">
+            {isFetching && (
+              <div className="absolute inset-0 z-10 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
+                <div className="loading-spinner" aria-label="Loading" />
+              </div>
+            )}
 
-        <div className="relative">
-          {isFetching && (
-            <div className="absolute inset-0 z-10 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
-              <div className="loading-spinner" aria-label="Loading" />
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {products.map((p) => (
+                <ProductCard
+                  key={p.id}
+                  product={p}
+                  onDelete={async (id) => {
+                    if (!window.confirm("Delete this product?")) return;
+                    await api.delete(`/products/${id}`);
+                    fetchProducts().catch(() => {});
+                  }}
+                  onOpen={() => openProductModal(p)}
+                />
+              ))}
+            </div>
+          </div>
+
+          {products.length === 0 && !isFetching && (
+            <div className="text-center py-12">
+              <div className="text-6xl mb-4">🍃</div>
+              <p className="text-gray-500">No products found</p>
+              <p className="text-sm text-gray-400 mt-2">Start scraping to populate the list</p>
             </div>
           )}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {products.map((p) => (
-              <ProductCard
-                key={p.id}
-                product={p}
-                onDelete={async (id) => {
-                  if (!window.confirm("Delete this product?")) return;
-                  await api.delete(`/products/${id}`);
-                  fetchProducts().catch(() => {});
-                }}
-                onOpen={() => openProductModal(p)}
-              />
-            ))}
-          </div>
+          <Pagination
+            page={page}
+            totalPages={totalPages}
+            pageSize={pageSize}
+            onPageChange={(p) => setPage(p)}
+            onPageSizeChange={(sz) => {
+              setPage(1);
+              setPageSize(sz);
+            }}
+          />
         </div>
-
-        {products.length === 0 && !isFetching && (
-          <div className="text-center py-12">
-            <div className="text-6xl mb-4">🍃</div>
-            <p className="text-gray-500">No products found</p>
-            <p className="text-sm text-gray-400 mt-2">Start scraping to populate the list</p>
-          </div>
-        )}
-
-        <Pagination
-          page={page}
-          totalPages={totalPages}
-          pageSize={pageSize}
-          onPageChange={(p) => setPage(p)}
-          onPageSizeChange={(sz) => {
-            setPage(1);
-            setPageSize(sz);
-          }}
-        />
       </div>
-
       <ProductModal
         isOpen={isProductModalOpen}
         product={modalProduct || {}}
         onClose={closeProductModal}
         onSelectSku={(sku) => openProductModal(sku)}
       />
-    </div>
+    </>
   );
 }
 
 ProductsPage.propTypes = {
-  api: PropTypes.object.isRequired,          // axios instance
+  api: PropTypes.object.isRequired, // axios instance
   initialQuery: PropTypes.shape({
     mode: PropTypes.oneOf(["all", "byTask"]),
     taskId: PropTypes.string,
@@ -449,7 +436,7 @@ ProductsPage.propTypes = {
     sort_dir: PropTypes.oneOf(["asc", "desc"]),
     filters: PropTypes.object, // Record<string, string[]>
   }),
-  onPersist: PropTypes.func,                 // (queryObj) => void
+  onPersist: PropTypes.func, // (queryObj) => void
 };
 
 ProductsPage.defaultProps = {
