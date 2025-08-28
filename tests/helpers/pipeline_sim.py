@@ -1,8 +1,10 @@
 # tests/helpers/pipeline_sim.py
 import asyncio
+import random
 import sys
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 
@@ -117,14 +119,72 @@ class InMemKafkaBroker:
         return self.rev.get(id(q), "?")
 
     async def produce(self, topic: str, value: Any):
+        # chaos: delay + drop + duplicate
+        await self.chaos.broker_jitter()
         payload = value
         msg_type = payload.get("msg_type")
         kind = (payload.get("payload") or {}).get("kind") or (payload.get("payload") or {}).get("reply")
         dbg("KAFKA.PRODUCE", topic=topic, msg_type=msg_type, kind=kind)
-        for q in self.topics.setdefault(topic, {}).values():
-            await q.put(_Rec(value, topic))
+
+        if self.chaos.should_drop(topic):
+            dbg("KAFKA.DROP", topic=topic)
+            return
+
+        deliver_times = 2 if self.chaos.should_duplicate(topic) else 1
+        for _ in range(deliver_times):
+            for q in self.topics.setdefault(topic, {}).values():
+                await q.put(_Rec(value, topic))
+            if deliver_times == 2:
+                dbg("KAFKA.DUP", topic=topic)
 
 BROKER = InMemKafkaBroker()
+
+class AIOKafkaProducerMockChaos:
+    def __init__(self, *_, **__): pass
+    async def start(self): dbg("PRODUCER.START")
+    async def stop(self): dbg("PRODUCER.STOP")
+    async def send_and_wait(self, topic: str, value: Any, key: bytes | None = None):
+        assert BROKER is not None, "BROKER not initialized"
+        await BROKER.produce(topic, value)
+
+class AIOKafkaConsumerMockChaos:
+    def __init__(self, *topics, bootstrap_servers=None, group_id=None, value_deserializer=None,
+                 enable_auto_commit=False, auto_offset_reset="latest"):
+        self._topics = list(topics)
+        self._group = group_id or "default"
+        self._deser = value_deserializer
+        self._queues: List[asyncio.Queue] = []
+        self._paused = False
+
+    async def start(self):
+        assert BROKER is not None, "BROKER not initialized"
+        self._queues = [BROKER.ensure_queue(t, self._group) for t in self._topics]
+        dbg("CONSUMER.START", group_id=self._group, topics=self._topics)
+
+    async def stop(self): dbg("CONSUMER.STOP", group_id=self._group)
+
+    async def getone(self):
+        assert BROKER is not None
+        while True:
+            if self._paused:
+                await asyncio.sleep(0.01); continue
+            for q in self._queues:
+                try:
+                    rec = q.get_nowait()
+                    val = rec.value
+                    msg_type = val.get("msg_type")
+                    kind = (val.get("payload") or {}).get("kind") or (val.get("payload") or {}).get("reply")
+                    dbg("CONSUMER.GET", group_id=self._group, topic=BROKER.topic_of(q), msg_type=msg_type, kind=kind)
+                    await BROKER.chaos.consumer_poll_jitter()
+                    return rec
+                except asyncio.QueueEmpty:
+                    continue
+            await asyncio.sleep(0.003)
+
+    async def commit(self): pass
+    def pause(self, *parts): self._paused = True;  dbg("CONSUMER.PAUSE", group_id=self._group)
+    def resume(self, *parts): self._paused = False; dbg("CONSUMER.RESUME", group_id=self._group)
+    def assignment(self): return {("t",0)}
 
 class AIOKafkaProducerMock:
     def __init__(self, *_, **__): pass
@@ -194,20 +254,44 @@ class InMemCollection:
         return cur
 
     def _match(self, doc, flt):
+        # normalize enums to raw values for fair comparison
+        from enum import Enum
+        def _norm(x):
+            return x.value if isinstance(x, Enum) else x
+
         for k, v in (flt or {}).items():
             val = self._get_path(doc, k)
+            val = _norm(val)
+
             if isinstance(v, dict):
-                if "$in" in v and val not in v["$in"]: return False
-                if "$lte" in v and not (val is not None and val <= v["$lte"]): return False
-                if "$lt"  in v and not (val is not None and val <  v["$lt"]):  return False
-                if "$gte" in v and not (val is not None and val >= v["$gte"]): return False
-                if "$gt"  in v and not (val is not None and val >  v["$gt"]):  return False
+                if "$in" in v:
+                    in_list = [ _norm(x) for x in v["$in"] ]
+                    if val not in in_list:
+                        return False
+                if "$lte" in v:
+                    if not (val is not None and val <= _norm(v["$lte"])):
+                        return False
+                if "$lt" in v:
+                    if not (val is not None and val < _norm(v["$lt"])):
+                        return False
+                if "$gte" in v:
+                    if not (val is not None and val >= _norm(v["$gte"])):
+                        return False
+                if "$gt" in v:
+                    if not (val is not None and val > _norm(v["$gt"])):
+                        return False
                 continue
+
+            # спец-случай для проверки наличия node_id в списке узлов графа
             if k == "graph.nodes.node_id":
                 nodes = (((doc.get("graph") or {}).get("nodes")) or [])
-                if not any(n.get("node_id") == v for n in nodes): return False
+                if not any((n.get("node_id") == v) for n in nodes):
+                    return False
                 continue
-            if val != v: return False
+
+            if _norm(v) != val:
+                return False
+
         return True
 
     async def insert_one(self, doc):
@@ -226,9 +310,9 @@ class InMemCollection:
     def find(self, flt, proj=None):
         rows = [d for d in self.rows if self._match(d, flt)]
         class _Cur:
-            def __init__(self, rows): self._rows=rows
+            def __init__(self, rows): self._rows = rows
             def sort(self, *_): return self
-            def limit(self, n): self._rows=self._rows[:n]; return self
+            def limit(self, n): self._rows = self._rows[:n]; return self
             async def __aiter__(self):
                 for r in list(self._rows): yield r
         return _Cur(rows)
@@ -292,22 +376,59 @@ class InMemCollection:
                 set_path(doc, k, v)
 
         if "$inc" in upd:
-            cur = doc
             for k, v in upd["$inc"].items():
                 parts = k.split(".")
+                cur = doc
                 for i, p in enumerate(parts):
-                    if p == "$": p = str(node_idx)
-                    if i == len(parts) - 1: cur[p] = int(cur.get(p, 0)) + int(v)
-                    else: cur = cur.setdefault(p, {})
+                    if p == "$":  # подставляем индекс найденного узла
+                        p = str(node_idx)
+                    last = (i == len(parts) - 1)
+
+                    if isinstance(cur, list) and p.isdigit():
+                        idx = int(p)
+                        while len(cur) <= idx:
+                            cur.append({})
+                        if last:
+                            cur[idx] = int((cur[idx] or 0)) + int(v) if isinstance(cur[idx], (int, float)) else int(v)
+                        else:
+                            if not isinstance(cur[idx], (dict, list)):
+                                # заранее создаём нужный контейнер
+                                cur[idx] = [] if (i + 1 < len(parts) and parts[i + 1].isdigit()) else {}
+                            cur = cur[idx]
+                    else:
+                        if last:
+                            cur[p] = int((cur.get(p, 0) or 0)) + int(v)
+                        else:
+                            if p not in cur or not isinstance(cur[p], (dict, list)):
+                                cur[p] = [] if (i + 1 < len(parts) and parts[i + 1].isdigit()) else {}
+                            cur = cur[p]
 
         if "$max" in upd:
-            cur = doc
             for k, v in upd["$max"].items():
                 parts = k.split(".")
+                cur = doc
                 for i, p in enumerate(parts):
-                    if p == "$": p = str(node_idx)
-                    if i == len(parts) - 1: cur[p] = max(int(cur.get(p, 0) or 0), int(v))
-                    else: cur = cur.setdefault(p, {})
+                    if p == "$":
+                        p = str(node_idx)
+                    last = (i == len(parts) - 1)
+
+                    if isinstance(cur, list) and p.isdigit():
+                        idx = int(p)
+                        while len(cur) <= idx:
+                            cur.append({})
+                        if last:
+                            cur[idx] = max(int(cur[idx] or 0), int(v)) if isinstance(cur[idx], (int, float)) else int(v)
+                        else:
+                            if not isinstance(cur[idx], (dict, list)):
+                                cur[idx] = [] if (i + 1 < len(parts) and parts[i + 1].isdigit()) else {}
+                            cur = cur[idx]
+                    else:
+                        if last:
+                            cur[p] = max(int(cur.get(p, 0) or 0), int(v))
+                        else:
+                            if p not in cur or not isinstance(cur[p], (dict, list)):
+                                cur[p] = [] if (i + 1 < len(parts) and parts[i + 1].isdigit()) else {}
+                            cur = cur[p]
 
         if "$currentDate" in upd:
             for k, _ in upd["$currentDate"].items():
@@ -418,7 +539,11 @@ def build_graph(total_skus=12, batch_size=5, mini_batch=2) -> Dict[str, Any]:
 
 def prime_graph(cd, graph: Dict[str, Any]) -> Dict[str, Any]:
     for n in graph.get("nodes", []):
-        n.setdefault("status", cd.RunState.queued)
+        st = n.get("status")
+        # если нет или None/пустая строка — приводим к queued
+        if st is None or (isinstance(st, str) and not st.strip()):
+            n["status"] = cd.RunState.queued
+        # остальное оставляем
         n.setdefault("attempt_epoch", 0)
         n.setdefault("stats", {})
         n.setdefault("lease", {})
@@ -464,37 +589,57 @@ def make_test_handlers(wu) -> Dict[str, Any]:
                 shard += 1
         async def process_batch(self, batch, ctx):
             dbg("HNDL.indexer.proc", shard=batch.shard_id)
-            # кладём список в meta через ArtifactsWriter (worker сделает upsert_partial)
-            return wu.BatchResult(success=True, metrics={"skus": batch.payload["skus"], "count": len(batch.payload["skus"])})
+            # ⬇️ NEW: чуть-чуть «реализма», чтобы тест 2 не ломался
+            delay = float(os.getenv("TEST_IDX_PROCESS_SLEEP_SEC", "0.5"))
+            await asyncio.sleep(delay)
+            return wu.BatchResult(
+                success=True,
+                metrics={"skus": batch.payload["skus"], "count": len(batch.payload["skus"])}
+            )
 
     class _PullFromArtifactsMixin:
         async def _emit_from_artifacts(self, *, from_nodes: List[str], size: int, meta_key: str, poll: float, shard_prefix: str):
-            seen = set()
+            # ключ -> множество уже отданных элементов
+            if not hasattr(self, "_emitted_items"):
+                self._emitted_items = {}  # {(node, shard): set(items)}
+
             completed = set()
             while True:
                 progressed = False
+
                 for doc in list(wu.db.artifacts.rows):
-                    if doc.get("node_id") not in from_nodes:
+                    node_id = doc.get("node_id")
+                    if node_id not in from_nodes:
                         continue
-                    shard_id = doc.get("shard_id")
-                    key = (doc.get("node_id"), shard_id)
-                    if shard_id and key in seen:
-                        continue
-                    meta = doc.get("meta") or {}
+
+                    shard_id = doc.get("shard_id") or ""
+                    key = (node_id, shard_id)
+
+                    meta  = doc.get("meta") or {}
                     items = list(meta.get(meta_key) or [])
-                    for i in range(0, len(items), size):
-                        chunk = items[i:i+size]
-                        dbg("HNDL.emit", src=doc.get("node_id"), shard=shard_id, chunk=len(chunk), role=shard_prefix)
-                        yield wu.Batch(shard_id=f"{doc.get('node_id')}:{shard_id}:{i//size}", payload={"items": chunk})
-                        progressed = True
-                    seen.add(key)
+
+                    seen = self._emitted_items.get(key, set())
+                    new_items = [x for x in items if x not in seen]
+                    if new_items:
+                        for i in range(0, len(new_items), size):
+                            chunk = new_items[i:i+size]
+                            dbg("HNDL.emit", src=node_id, shard=shard_id, chunk=len(chunk), role=shard_prefix)
+                            yield wu.Batch(
+                                shard_id=f"{node_id}:{shard_id}:{i//size}",
+                                payload={"items": chunk},
+                            )
+                            progressed = True
+                        seen.update(new_items)
+                        self._emitted_items[key] = seen
+
                     if doc.get("status") == "complete":
-                        completed.add(doc.get("node_id"))
+                        completed.add(node_id)
+
                 if all(n in completed for n in from_nodes):
                     break
                 if not progressed:
                     await asyncio.sleep(poll)
-
+    
     class EnricherHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "enricher"
         async def load_input(self, ref, inline):
@@ -542,21 +687,37 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             dbg("HNDL.ocr.proc", count=len(ocrd))
             return wu.BatchResult(success=True, metrics={"ocr": ocrd, "count": len(ocrd)})
 
-    class AnalyzerHandler(wu.RoleHandler):
+    class AnalyzerHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "analyzer"
         async def load_input(self, ref, inline):
             dbg("HNDL.analyzer.load_input", inline=inline)
-            return {"input_inline": inline or {}}
+            # ВАЖНО: вернуть сам inline, без дополнительной обёртки,
+            # чтобы воркер увидел input_adapter и включил стриминг.
+            return (inline or {})
         async def iter_batches(self, loaded):
-            # Аналайзер тоже может читать через pull.from_artifacts, но тут
-            # мы позволяем координатору “собрать” и запустить нас обычным способом.
-            dbg("HNDL.analyzer.bootstrap")
-            yield wu.Batch(shard_id=None, payload={"bootstrap": True})
+            dbg("HNDL.analyzer.iter_batches", inline=loaded)
+            # Читаем поток артефактов как enricher/ocr.
+            args = (loaded or {}).get("input_args", {}) or {}
+            from_nodes = list(args.get("from_nodes") or [])
+            # По умолчанию у индексера ключ обычно 'items'
+            meta_key = args.get("meta_list_key") or "skus"
+            size = int(args.get("size") or 3)
+            poll = float(args.get("poll_ms", 25) or 25) / 1000.0
+            async for b in self._emit_from_artifacts(
+                from_nodes=from_nodes,
+                size=size,
+                meta_key=meta_key,
+                poll=poll,
+                shard_prefix="analyzer",
+            ):
+                yield b
         async def process_batch(self, batch, ctx):
-            items = batch.payload.get("items")
-            if items:
-                dbg("HNDL.analyzer.proc", count=len(items))
-                return wu.BatchResult(success=True, metrics={"sinked": len(items), "count": len(items)})
+            payload = batch.payload or {}
+            items = payload.get("items") or payload.get("skus") or []
+            n = len(items)
+            if n:
+                dbg("HNDL.analyzer.proc", count=n)
+                return wu.BatchResult(success=True, metrics={"count": n, "sinked": n})
             dbg("HNDL.analyzer.proc.noop")
             return wu.BatchResult(success=True, metrics={"noop": 1})
 

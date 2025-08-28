@@ -582,9 +582,9 @@ class Coordinator:
                         await self._on_task_failed(env)
                     elif kind == EventKind.CANCELLED:
                         await self._on_cancelled(env)
-                except Exception:
+                except Exception as e:
                     # Любая ошибка в обработчике — не падаем, продолжаем поток сообщений
-                    pass
+                    raise e
                 finally:
                     try:
                         await c.commit()
@@ -650,7 +650,8 @@ class Coordinator:
         st: Dict[str, RunState] = {}
         for d in deps:
             nd = self._get_node(task_doc, d)
-            st[d] = nd.get("status") if nd else RunState.queued
+            rs = self._to_runstate((nd or {}).get("status"))
+            st[d] = rs or RunState.queued  # по умолчанию queued
         fan_in = (node.get("fan_in") or "all").lower()
         if fan_in == "all":
             return all(s == RunState.finished for s in st.values())
@@ -677,21 +678,61 @@ class Coordinator:
         nx = node.get("next_retry_at")
         return not (nx and now_ts() < int(nx))
 
-    async def _node_ready(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> bool:
-        status = node.get("status")
-        if status not in [RunState.queued, RunState.deferred]:
-            return False
-        if not self._node_ready_time(node):
+    async def _node_ready(self, task_doc, node) -> bool:
+        status = self._to_runstate(node.get("status"))
+        if status not in (RunState.queued, RunState.deferred):
             return False
 
-        # start_when = first_batch → как только появились первые артефакты от родителей
-        start_when = (node.get("io", {}) or {}).get("start_when", "ready")
+        fan_in = (node.get("fan_in") or "all").lower()
+        io = (node.get("io") or {})
+        start_when = (io.get("start_when") or "").lower()
+
+        # ⬇️ FIX: start_when=first_batch должен работать независимо от fan_in
+        # (как только появился partial/complete от ЛЮБОГО предка из from_nodes/depends_on)
         if start_when == "first_batch":
-            parents = node.get("depends_on") or []
-            if await self._artifacts_exist_from_parents(task_doc["id"], parents):
-                return True  # ранний старт
-            # иначе fallback к классическому fan-in
-        return self._fan_in_satisfied(task_doc, node)
+            return await self._first_batch_available(task_doc, node)
+
+        # Обычная логика ожидания завершения родителей
+        deps = node.get("depends_on") or []
+        dep_states = [
+            self._to_runstate((self._get_node(task_doc, d) or {}).get("status"))
+            for d in deps
+        ]
+
+        if fan_in == "all":
+            return all(s == RunState.finished for s in dep_states)
+        if fan_in == "any":
+            return any(s == RunState.finished for s in dep_states)
+        if fan_in.startswith("count:"):
+            try:
+                k = int(fan_in.split(":", 1)[1])
+            except Exception:
+                k = len(deps)
+            return sum(1 for s in dep_states if s == RunState.finished) >= k
+
+        return False
+
+    def _to_runstate(self, v):
+        if isinstance(v, RunState): return v
+        if isinstance(v, str):
+            try: return RunState(v)
+            except Exception: return None
+        return None
+    
+    async def _first_batch_available(self, task_doc, node) -> bool:
+        io = (node.get("io") or {})
+        inp = (io.get("input_inline") or {})
+        args = (inp.get("input_args") or {})
+        from_nodes = args.get("from_nodes") or (node.get("depends_on") or [])
+        if not from_nodes:
+            return False
+        # ищем любой артефакт от любого из предков с partial/complete
+        q = {
+            "task_id": task_doc["id"],
+            "node_id": {"$in": from_nodes},
+            "status": {"$in": ["partial", "complete"]},
+        }
+        return (await db.artifacts.find_one(q)) is not None
 
     async def _schedule_ready_nodes(self) -> None:
         cur = db.tasks.find(
@@ -699,7 +740,7 @@ class Coordinator:
             {"id": 1, "graph": 1, "status": 1}
         )
         async for t in cur:
-            if t.get("status") == RunState.queued:
+            if self._to_runstate(t.get("status")) == RunState.queued:
                 await db.tasks.update_one({"id": t["id"]}, {"$set": {"status": RunState.running}})
             for n in (t.get("graph", {}).get("nodes") or []):
                 if n.get("type") == "coordinator_fn":
@@ -945,8 +986,11 @@ class Coordinator:
                 fresh = await db.tasks.find_one({"id": task_id}, {"id": 1, "graph": 1})
                 ch_node = self._get_node(fresh, child_id) if fresh else None
                 if fresh and ch_node:
-                    if await self._node_ready(fresh, ch_node):
+                    if rule_async:
                         await self._preflight_and_maybe_start(fresh, ch_node)
+                    else:
+                        if await self._node_ready(fresh, ch_node):
+                            await self._preflight_and_maybe_start(fresh, ch_node)
 
     async def _on_batch_ok(self, env: Envelope) -> None:
         p = EvBatchOk.model_validate(env.payload)
@@ -1056,7 +1100,7 @@ class Coordinator:
         cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred]}}, {"id": 1, "graph": 1})
         async for t in cur:
             nodes = t.get("graph", {}).get("nodes") or []
-            if nodes and all(n.get("status") == RunState.finished for n in nodes):
+            if nodes and all(self._to_runstate(n.get("status")) == RunState.finished for n in nodes):
                 result = {"nodes": [{"node_id": n["node_id"], "stats": n.get("stats", {})} for n in nodes]}
                 await db.tasks.update_one({"id": t["id"]},
                     {"$set": {"status": RunState.finished, "finished_at": now_dt(), "result": result}})
@@ -1107,31 +1151,31 @@ class Coordinator:
             pass
 
 # ─────────────────────────── Minimal FastAPI ───────────────────────────
-app = FastAPI(title="Universal DAG Coordinator (Stream-aware, Outbox, fan-in/out)")
+# app = FastAPI(title="Universal DAG Coordinator (Stream-aware, Outbox, fan-in/out)")
 
-COORD = Coordinator()
+# COORD = Coordinator()
 
-@app.on_event("startup")
-async def _startup() -> None:
-    await COORD.start()
+# @app.on_event("startup")
+# async def _startup() -> None:
+#     await COORD.start()
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await COORD.stop()
+# @app.on_event("shutdown")
+# async def _shutdown() -> None:
+#     await COORD.stop()
 
-class CreateTaskBody(BaseModel):
-    params: Dict[str, Any] = Field(default_factory=dict)
-    graph: Dict[str, Any]
+# class CreateTaskBody(BaseModel):
+#     params: Dict[str, Any] = Field(default_factory=dict)
+#     graph: Dict[str, Any]
 
-@app.post("/tasks")
-async def create_task(b: CreateTaskBody) -> Dict[str, Any]:
-    task_id = await COORD.create_task(params=b.params, graph=b.graph)
-    return {"task_id": task_id}
+# @app.post("/tasks")
+# async def create_task(b: CreateTaskBody) -> Dict[str, Any]:
+#     task_id = await COORD.create_task(params=b.params, graph=b.graph)
+#     return {"task_id": task_id}
 
-@app.get("/tasks/{task_id}")
-async def get_task(task_id: str) -> Dict[str, Any]:
-    t = await db.tasks.find_one({"id": task_id})
-    if not t:
-        raise HTTPException(status_code=404, detail="task not found")
-    t["_id"] = str(t["_id"])
-    return t
+# @app.get("/tasks/{task_id}")
+# async def get_task(task_id: str) -> Dict[str, Any]:
+#     t = await db.tasks.find_one({"id": task_id})
+#     if not t:
+#         raise HTTPException(status_code=404, detail="task not found")
+#     t["_id"] = str(t["_id"])
+#     return t
