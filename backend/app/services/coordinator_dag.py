@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from enum import Enum
 
@@ -856,21 +856,27 @@ class Coordinator:
 
     # ── Event handlers ──────────────────────────────────────────────────
     async def _record_worker_event(self, env: Envelope) -> None:
-        edoc = {
-            "task_id": env.task_id,
-            "node_id": env.node_id,
-            "step_type": env.step_type,
-            "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts}),
-            "payload": env.payload,
-            "ts": env.ts,
-            "ts_dt": datetime.fromtimestamp(env.ts, tz=timezone.utc),
-            "attempt_epoch": env.attempt_epoch,
-            "created_at": now_dt(),
-            "metrics_applied": False,
-        }
+        evh = stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})
+        # upsert вместо insert_one — чтобы дубликат envelope не создавал вторую строку
         try:
-            await db.worker_events.insert_one(edoc)
+            await db.worker_events.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id, "event_hash": evh},
+                {"$setOnInsert": {
+                    "task_id": env.task_id,
+                    "node_id": env.node_id,
+                    "step_type": env.step_type,
+                    "event_hash": evh,
+                    "payload": env.payload,
+                    "ts": env.ts,
+                    "ts_dt": datetime.fromtimestamp(env.ts, tz=timezone.utc),
+                    "attempt_epoch": env.attempt_epoch,
+                    "created_at": now_dt(),
+                    "metrics_applied": False,
+                }},
+                upsert=True,
+            )
         except Exception:
+            # не блокируем поток
             pass
         await db.tasks.update_one({"id": env.task_id}, {"$max": {"last_event_ts": env.ts}, "$currentDate": {"updated_at": True}})
 
@@ -1012,9 +1018,23 @@ class Coordinator:
     async def _on_batch_failed(self, env: Envelope) -> None:
         p = EvBatchFailed.model_validate(env.payload)
         await self._apply_metrics_once(env, {})
-        # При ошибке батча мы не заваливаем всю ноду; дочерние стримы продолжают,
-        # пока воркер сам не решит завершить TASK_FAILED/TASK_DONE. Координатор
-        # фиксирует это событие для диагностики.
+        # Помечаем эпоху как «ошибочную» и переводим ноду в deferred (ретрай)
+        try:
+            tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1})
+            node = self._get_node(tdoc, env.node_id) if tdoc else None
+            policy = ((node or {}).get("retry_policy") or {})
+            backoff = int(policy.get("backoff_sec", 300))
+            await db.tasks.update_one(
+                {"id": env.task_id, "graph.nodes.node_id": env.node_id},
+                {"$set": {
+                    "graph.nodes.$.status": RunState.deferred,
+                    "graph.nodes.$.next_retry_at": now_ts() + backoff,
+                    "graph.nodes.$.lease.epoch_failed": env.attempt_epoch,
+                    "graph.nodes.$.last_error": p.reason_code,
+                }}
+            )
+        except Exception:
+            pass
         if p.artifacts_ref:
             # Можно пометить артефакт как "failed" для шардового мониторинга (без влияния на DAG)
             try:
@@ -1030,6 +1050,15 @@ class Coordinator:
 
     async def _on_task_done(self, env: Envelope) -> None:
         p = EvTaskDone.model_validate(env.payload)
+        # Если в текущей эпохе уже фиксировалась ошибка — игнорируем TASK_DONE
+        try:
+            tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1})
+            node = self._get_node(tdoc, env.node_id) if tdoc else None
+            lease = (node or {}).get("lease") or {}
+            if int(lease.get("epoch_failed", -1)) == int(env.attempt_epoch):
+                return
+        except Exception:
+            pass
         await self._apply_metrics_once(env, p.metrics or {})
         if p.artifacts_ref:
             # помечаем результат ноды как complete

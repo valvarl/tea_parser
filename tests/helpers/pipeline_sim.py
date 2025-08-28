@@ -268,6 +268,9 @@ class InMemCollection:
                     in_list = [ _norm(x) for x in v["$in"] ]
                     if val not in in_list:
                         return False
+                if "$ne" in v:
+                    if val == _norm(v["$ne"]):
+                        return False
                 if "$lte" in v:
                     if not (val is not None and val <= _norm(v["$lte"])):
                         return False
@@ -451,9 +454,9 @@ class InMemDB:
         self.stream_progress= InMemCollection("stream_progress")
 
 # ====================== setup helpers ====================
-def setup_env_and_imports(monkeypatch) -> Tuple[Any, Any]:
+def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyzer") -> Tuple[Any, Any]:
     """Подготавливает окружение, патчит Kafka на in-mem и возвращает (coordinator_dag, worker_universal)."""
-    monkeypatch.setenv("WORKER_TYPES", "indexer,enricher,ocr,analyzer")
+    monkeypatch.setenv("WORKER_TYPES", worker_types)
     monkeypatch.setenv("HB_SOFT_SEC", "120")
     monkeypatch.setenv("HB_HARD_SEC", "600")
 
