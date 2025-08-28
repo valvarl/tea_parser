@@ -262,8 +262,7 @@ async def _handle_add_collection_members(
             )
             logger.info("collections finalize", extra={"event": "collections_finalize", "task_id": task_id, "trigger": trigger})
             return
-        
-        # empty batch -> OK with zeros
+
         if not skus:
             await _send_status(
                 prod,
@@ -286,17 +285,19 @@ async def _handle_add_collection_members(
         updated = 0
         new_skus: List[str] = []
 
-        coll_map = await _map_sku_to_collection_hashes(task_id=task_id, skus=skus)
-
-        for sku in skus:
-            hashes = sorted(coll_map.get(sku, set()))
+        for sku in [str(s).strip() for s in skus if str(s).strip()]:
             try:
                 res = await db.index.update_one(
                     {"sku": sku},
                     {
                         "$set": {"last_seen_at": now_ts, "is_active": True, "task_id": task_id},
-                        "$setOnInsert": {"first_seen_at": now_ts, "candidate_id": None, "sku": sku, "status": "pending_review"},
-                        "$addToSet": {"collections": {"$each": hashes}},
+                        "$setOnInsert": {
+                            "first_seen_at": now_ts,
+                            "candidate_id": None,
+                            "sku": sku,
+                            "status": "pending_review",
+                        },
+                        # "$unset": {"collections": ""}  # не обязательно на каждом апсерте
                     },
                     upsert=True,
                 )
