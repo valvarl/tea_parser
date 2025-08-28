@@ -1,4 +1,4 @@
-# coordinator_dag.py  (v1.2 with Outbox + fan-in/out count:n)
+# coordinator_dag.py  (v2.0 stream-aware with edges_ex + first-batch start + adapters)
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +25,7 @@ db = _Fake()  # REPLACE in your project
 
 # ─────────────────────────── Config ───────────────────────────
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-WORKER_TYPES = [s.strip() for s in os.getenv("WORKER_TYPES", "indexer,enricher").split(",") if s.strip()]
+WORKER_TYPES = [s.strip() for s in os.getenv("WORKER_TYPES", "indexer,enricher,grouper,analyzer").split(",") if s.strip()]
 
 TOPIC_CMD_FMT = os.getenv("TOPIC_CMD_FMT", "cmd.{type}.v1")
 TOPIC_STATUS_FMT = os.getenv("TOPIC_STATUS_FMT", "status.{type}.v1")
@@ -50,6 +50,10 @@ OUTBOX_DISPATCH_TICK_SEC = float(os.getenv("OUTBOX_DISPATCH_TICK_SEC", "0.25"))
 OUTBOX_MAX_RETRY = int(os.getenv("OUTBOX_MAX_RETRY", "12"))
 OUTBOX_BACKOFF_MIN_MS = int(os.getenv("OUTBOX_BACKOFF_MIN_MS", "250"))
 OUTBOX_BACKOFF_MAX_MS = int(os.getenv("OUTBOX_BACKOFF_MAX_MS", "60000"))
+
+# Streaming:
+STREAM_CHILD_LAUNCH_DEDUP_SEC = int(os.getenv("STREAM_CHILD_LAUNCH_DEDUP_SEC", "60"))
+ARTIFACT_TTL_DAYS = int(os.getenv("ARTIFACT_TTL_DAYS", "14"))
 
 # ─────────────────────────── Helpers ───────────────────────────
 def now_dt() -> datetime:
@@ -170,6 +174,7 @@ class EvBatchFailed(BaseModel):
     reason_code: str
     permanent: bool = False
     error: Optional[str] = None
+    artifacts_ref: Optional[Dict[str, Any]] = None
 
 class EvTaskDone(BaseModel):
     kind: Literal[EventKind.TASK_DONE]
@@ -224,13 +229,14 @@ class DagNode(BaseModel):
     finished_at: Optional[datetime] = None
     last_event_ts: int = 0
     next_retry_at: Optional[int] = None
+    streaming: Dict[str, Any] = Field(default_factory=dict)  # e.g. {"started_on_first_batch": True}
 
 class TaskDoc(BaseModel):
     id: str
     pipeline_id: str
     status: RunState = RunState.queued
     params: Dict[str, Any] = Field(default_factory=dict)
-    graph: Dict[str, Any] = Field(default_factory=lambda: {"nodes": [], "edges": []})
+    graph: Dict[str, Any] = Field(default_factory=lambda: {"nodes": [], "edges": [], "edges_ex": []})
     result: Optional[Dict[str, Any]] = None
     status_history: List[Dict[str, Any]] = Field(default_factory=list)
     coordinator: Dict[str, Any] = Field(default_factory=lambda: {"liveness": {"state": "ok"}})
@@ -238,6 +244,46 @@ class TaskDoc(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     last_event_ts: int = 0
+
+# ─────────────────────────── Adapter Registry (coordinator_fn) ─────────
+class AdapterError(Exception):
+    pass
+
+class CoordinatorAdapters:
+    """
+    Универсальные функции, которые координатор может вызвать сам (в coordinator_fn нодах)
+    для склейки/агрегации/резки. Здесь нет IO к S3 — работаем через коллекцию artifacts.
+    """
+    @staticmethod
+    async def merge_generic(task_id: str, from_nodes: List[str], target: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Собирает все complete/partial артефакты из from_nodes, помечает target как complete.
+        Идемпотентно: ключ target {'depot','key'} перезаписывается (upsert).
+        """
+        try:
+            shards: List[Dict[str, Any]] = []
+            cur = db.artifacts.find({"task_id": task_id, "node_id": {"$in": from_nodes}})
+            async for a in cur:
+                shards.append({"node_id": a.get("node_id"), "shard_id": a.get("shard_id"), "status": a.get("status"), "meta": a.get("meta", {})})
+            # Запишем агрегированный артефакт
+            await db.artifacts.update_one(
+                {"task_id": task_id, "node_id": target.get("node_id", "coordinator"), "key": target.get("key")},
+                {"$set": {"status": "complete", "meta": {"merged_from": from_nodes, "shards": len(shards)}, "updated_at": now_dt()},
+                 "$setOnInsert": {"task_id": task_id, "node_id": target.get("node_id", "coordinator"), "attempt_epoch": 0}},
+                upsert=True
+            )
+            return {"ok": True, "count": len(shards)}
+        except Exception as e:
+            raise AdapterError(f"merge_generic failed: {e}") from e
+
+    @staticmethod
+    async def noop(_: str, **__) -> Dict[str, Any]:
+        return {"ok": True}
+
+ADAPTERS: Dict[str, Any] = {
+    "merge.generic": CoordinatorAdapters.merge_generic,
+    "noop": CoordinatorAdapters.noop,
+}
 
 # ─────────────────────────── Kafka bus ─────────────────────────────────
 class KafkaBus:
@@ -347,7 +393,6 @@ class OutboxDispatcher:
                             await db.outbox.update_one({"_id": ob["_id"]},
                                 {"$set": {"state": "failed", "last_error": str(e), "updated_at": now_dt()}})
                         else:
-                            # exponential backoff with jitter
                             backoff_ms = min(OUTBOX_BACKOFF_MAX_MS, max(OUTBOX_BACKOFF_MIN_MS, (2 ** attempts) * 100))
                             backoff_ms = _jitter_ms(backoff_ms)
                             await db.outbox.update_one({"_id": ob["_id"]},
@@ -439,7 +484,6 @@ class Coordinator:
                 msg = await c.getone()
                 env = Envelope.model_validate(msg.value)
                 if env.msg_type == MsgType.reply and env.role == Role.worker:
-                    # Attach reply to correlator
                     self.bus.push_reply(env.corr_id, env)
                 await c.commit()
         except asyncio.CancelledError:
@@ -452,32 +496,34 @@ class Coordinator:
                 env = Envelope.model_validate(msg.value)
                 payload = env.payload
                 kind = payload.get("kind")
-                if kind == EventKind.WORKER_ONLINE:
-                    await db.worker_registry.update_one(
-                        {"worker_id": payload["worker_id"]},
-                        {"$set": {
-                            "worker_id": payload["worker_id"],
-                            "type": payload.get("type"),
-                            "capabilities": payload.get("capabilities"),
-                            "version": payload.get("version"),
-                            "status": "online",
-                            "last_seen": now_dt(),
-                            "capacity": payload.get("capacity", {}),
-                        }},
-                        upsert=True
-                    )
-                elif kind == EventKind.WORKER_OFFLINE:
-                    await db.worker_registry.update_one(
-                        {"worker_id": payload["worker_id"]},
-                        {"$set": {"status": "offline", "last_seen": now_dt()}}
-                    )
-                else:
-                    await db.worker_registry.update_one(
-                        {"worker_id": payload.get("worker_id")},
-                        {"$set": {"last_seen": now_dt()}},
-                        upsert=True
-                    )
-                await c.commit()
+                try:
+                    if kind == EventKind.WORKER_ONLINE:
+                        await db.worker_registry.update_one(
+                            {"worker_id": payload["worker_id"]},
+                            {"$set": {
+                                "worker_id": payload["worker_id"],
+                                "type": payload.get("type"),
+                                "capabilities": payload.get("capabilities"),
+                                "version": payload.get("version"),
+                                "status": "online",
+                                "last_seen": now_dt(),
+                                "capacity": payload.get("capacity", {}),
+                            }},
+                            upsert=True
+                        )
+                    elif kind == EventKind.WORKER_OFFLINE:
+                        await db.worker_registry.update_one(
+                            {"worker_id": payload["worker_id"]},
+                            {"$set": {"status": "offline", "last_seen": now_dt()}}
+                        )
+                    else:
+                        await db.worker_registry.update_one(
+                            {"worker_id": payload.get("worker_id")},
+                            {"$set": {"last_seen": now_dt()}},
+                            upsert=True
+                        )
+                finally:
+                    await c.commit()
         except asyncio.CancelledError:
             return
 
@@ -485,39 +531,65 @@ class Coordinator:
         try:
             while True:
                 msg = await c.getone()
-                env = Envelope.model_validate(msg.value)
+                try:
+                    env = Envelope.model_validate(msg.value)
+                except Exception:
+                    # некорректное сообщение — пропускаем
+                    await c.commit()
+                    continue
+
                 # Dedup worker event by event_hash
-                await self._record_worker_event(env)
+                try:
+                    await self._record_worker_event(env)
+                except Exception:
+                    # не блокируем поток статусов
+                    pass
 
                 # Fencing: ignore stale epoch
-                tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1, "status": 1})
-                if not tdoc:
-                    await c.commit()
-                    continue
-                node = self._get_node(tdoc, env.node_id)
-                if not node or env.attempt_epoch != int(node.get("attempt_epoch", 0)):
+                try:
+                    tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1, "status": 1})
+                    if not tdoc:
+                        await c.commit()
+                        continue
+                    node = self._get_node(tdoc, env.node_id)
+                    if not node or env.attempt_epoch != int(node.get("attempt_epoch", 0)):
+                        await c.commit()
+                        continue
+                except Exception:
                     await c.commit()
                     continue
 
-                await db.tasks.update_one({"id": env.task_id},
-                    {"$max": {"last_event_ts": env.ts}, "$currentDate": {"updated_at": True}})
+                # apply last_event_ts
+                try:
+                    await db.tasks.update_one({"id": env.task_id},
+                        {"$max": {"last_event_ts": env.ts}, "$currentDate": {"updated_at": True}})
+                except Exception:
+                    pass
 
                 kind = env.payload.get("kind")
-                if kind == EventKind.TASK_ACCEPTED:
-                    await self._on_task_accepted(env)
-                elif kind == EventKind.TASK_HEARTBEAT:
-                    await self._on_task_heartbeat(env)
-                elif kind == EventKind.BATCH_OK:
-                    await self._on_batch_ok(env)
-                elif kind == EventKind.BATCH_FAILED:
-                    await self._on_batch_failed(env)
-                elif kind == EventKind.TASK_DONE:
-                    await self._on_task_done(env)
-                elif kind == EventKind.TASK_FAILED:
-                    await self._on_task_failed(env)
-                elif kind == EventKind.CANCELLED:
-                    await self._on_cancelled(env)
-                await c.commit()
+                try:
+                    if kind == EventKind.TASK_ACCEPTED:
+                        await self._on_task_accepted(env)
+                    elif kind == EventKind.TASK_HEARTBEAT:
+                        await self._on_task_heartbeat(env)
+                    elif kind == EventKind.BATCH_OK:
+                        await self._on_batch_ok(env)
+                    elif kind == EventKind.BATCH_FAILED:
+                        await self._on_batch_failed(env)
+                    elif kind == EventKind.TASK_DONE:
+                        await self._on_task_done(env)
+                    elif kind == EventKind.TASK_FAILED:
+                        await self._on_task_failed(env)
+                    elif kind == EventKind.CANCELLED:
+                        await self._on_cancelled(env)
+                except Exception:
+                    # Любая ошибка в обработчике — не падаем, продолжаем поток сообщений
+                    pass
+                finally:
+                    try:
+                        await c.commit()
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             return
 
@@ -530,17 +602,25 @@ class Coordinator:
 
     def _children_of(self, task_doc: Dict[str, Any], node_id: str) -> List[str]:
         g = task_doc.get("graph", {})
-        # prefer explicit edges, fallback to routing
         edges = g.get("edges") or []
         out = [dst for (src, dst) in edges if src == node_id]
-        if not out:
-            node = self._get_node(task_doc, node_id) or {}
-            out = (node.get("routing", {}) or {}).get("on_success", []) or []
-        return out
+        # include edges_ex if present
+        for ex in (g.get("edges_ex") or []):
+            if ex.get("from") == node_id:
+                out.append(ex.get("to"))
+        # dedup
+        return list(dict.fromkeys(out))
+
+    def _edges_ex_from(self, task_doc: Dict[str, Any], node_id: str) -> List[Dict[str, Any]]:
+        return [ex for ex in (task_doc.get("graph", {}).get("edges_ex") or []) if ex.get("from") == node_id]
 
     # ── Task API ────────────────────────────────────────────────────────
     async def create_task(self, *, params: Dict[str, Any], graph: Dict[str, Any]) -> str:
         task_id = str(uuid.uuid4())
+        # normalize graph keys
+        graph.setdefault("nodes", [])
+        graph.setdefault("edges", [])
+        graph.setdefault("edges_ex", [])
         doc = TaskDoc(
             id=task_id,
             pipeline_id=task_id,
@@ -554,7 +634,7 @@ class Coordinator:
         await db.tasks.insert_one(doc)
         return task_id
 
-    # ── Scheduler / fan-out & fan-in (count:n) ──────────────────────────
+    # ── Scheduler / fan-out & fan-in (count:n) + start_when:first_batch ─
     async def _scheduler_loop(self) -> None:
         try:
             while True:
@@ -567,32 +647,53 @@ class Coordinator:
         deps = node.get("depends_on") or []
         if not deps:
             return True
-        nodes = task_doc.get("graph", {}).get("nodes") or []
-        st = {d: self._get_node(task_doc, d).get("status") for d in deps}
+        st: Dict[str, RunState] = {}
+        for d in deps:
+            nd = self._get_node(task_doc, d)
+            st[d] = nd.get("status") if nd else RunState.queued
         fan_in = (node.get("fan_in") or "all").lower()
         if fan_in == "all":
             return all(s == RunState.finished for s in st.values())
         if fan_in == "any":
             return any(s == RunState.finished for s in st.values())
         if fan_in.startswith("count:"):
-            try: k = int(fan_in.split(":", 1)[1])
-            except Exception: k = len(deps)
+            try:
+                k = int(fan_in.split(":", 1)[1])
+            except Exception:
+                k = len(deps)
             return sum(1 for s in st.values() if s == RunState.finished) >= k
         return False
 
-    def _node_ready(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> bool:
+    async def _artifacts_exist_from_parents(self, task_id: str, parents: List[str]) -> bool:
+        if not parents:
+            return False
+        try:
+            doc = await db.artifacts.find_one({"task_id": task_id, "node_id": {"$in": parents}})
+            return bool(doc)
+        except Exception:
+            return False
+
+    def _node_ready_time(self, node: Dict[str, Any]) -> bool:
+        nx = node.get("next_retry_at")
+        return not (nx and now_ts() < int(nx))
+
+    async def _node_ready(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> bool:
         status = node.get("status")
         if status not in [RunState.queued, RunState.deferred]:
             return False
-        if not self._fan_in_satisfied(task_doc, node):
+        if not self._node_ready_time(node):
             return False
-        nx = node.get("next_retry_at")
-        if nx and now_ts() < int(nx):
-            return False
-        return True
+
+        # start_when = first_batch → как только появились первые артефакты от родителей
+        start_when = (node.get("io", {}) or {}).get("start_when", "ready")
+        if start_when == "first_batch":
+            parents = node.get("depends_on") or []
+            if await self._artifacts_exist_from_parents(task_doc["id"], parents):
+                return True  # ранний старт
+            # иначе fallback к классическому fan-in
+        return self._fan_in_satisfied(task_doc, node)
 
     async def _schedule_ready_nodes(self) -> None:
-        # Pick tasks with queued/deferred nodes whose dependencies satisfied and backoff expired
         cur = db.tasks.find(
             {"status": {"$in": [RunState.running, RunState.queued, RunState.deferred]}},
             {"id": 1, "graph": 1, "status": 1}
@@ -602,23 +703,40 @@ class Coordinator:
                 await db.tasks.update_one({"id": t["id"]}, {"$set": {"status": RunState.running}})
             for n in (t.get("graph", {}).get("nodes") or []):
                 if n.get("type") == "coordinator_fn":
-                    if self._node_ready(t, n):
+                    if await self._node_ready(t, n):
                         await self._run_coordinator_fn(t, n)
                     continue
-                if self._node_ready(t, n):
+                if await self._node_ready(t, n):
                     await self._preflight_and_maybe_start(t, n)
 
     async def _run_coordinator_fn(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> None:
-        await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
-                                  {"$set": {"graph.nodes.$.status": RunState.running,
-                                            "graph.nodes.$.started_at": now_dt(),
-                                            "graph.nodes.$.attempt_epoch": int(node.get("attempt_epoch", 0)) + 1}})
-        # Your postproc logic here (fan-out friendly: write artifacts for children if needed)
-        await asyncio.sleep(0)
-        await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
-                                  {"$set": {"graph.nodes.$.status": RunState.finished,
-                                            "graph.nodes.$.finished_at": now_dt(),
-                                            "graph.nodes.$.last_event_ts": now_ts()}})
+        # safe run
+        try:
+            await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
+                                      {"$set": {"graph.nodes.$.status": RunState.running,
+                                                "graph.nodes.$.started_at": now_dt(),
+                                                "graph.nodes.$.attempt_epoch": int(node.get("attempt_epoch", 0)) + 1}})
+            io = node.get("io", {}) or {}
+            fn_name = io.get("fn", "noop")
+            fn_args = io.get("fn_args", {}) or {}
+            fn = ADAPTERS.get(fn_name)
+            if not fn:
+                raise AdapterError(f"adapter '{fn_name}' not registered")
+            # Подготовим target: подставим node_id для явного владельца результата
+            if isinstance(fn_args, dict) and "target" in fn_args and isinstance(fn_args["target"], dict):
+                fn_args["target"].setdefault("node_id", node["node_id"])
+            await fn(task_doc["id"], **fn_args)
+            await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
+                                      {"$set": {"graph.nodes.$.status": RunState.finished,
+                                                "graph.nodes.$.finished_at": now_dt(),
+                                                "graph.nodes.$.last_event_ts": now_ts()}})
+        except Exception as e:
+            # Координаторные функции не «ломают» всю задачу: переводим в deferred с backoff
+            backoff = int(((node.get("retry_policy") or {}).get("backoff_sec") or 300))
+            await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
+                                      {"$set": {"graph.nodes.$.status": RunState.deferred,
+                                                "graph.nodes.$.next_retry_at": now_ts() + backoff,
+                                                "graph.nodes.$.last_error": str(e)}})
 
     # ── Preflight + Outbox enqueue ──────────────────────────────────────
     async def _enqueue_cmd(self, env: Envelope) -> None:
@@ -635,6 +753,7 @@ class Coordinator:
         node_id = node["node_id"]
         new_epoch = int(node.get("attempt_epoch", 0)) + 1
 
+        # Discover active/complete to avoid duplicate starts
         discover_env = Envelope(
             msg_type=MsgType.query,
             role=Role.coordinator,
@@ -645,7 +764,7 @@ class Coordinator:
             attempt_epoch=new_epoch,
             payload=QTaskDiscover(query=QueryKind.TASK_DISCOVER, want_epoch=new_epoch).model_dump()
         )
-        wait_ev = self.bus.register_reply(discover_env.corr_id)
+        _ = self.bus.register_reply(discover_env.corr_id)
         await self._enqueue_query(discover_env)
 
         try:
@@ -654,6 +773,7 @@ class Coordinator:
             pass
         replies = self.bus.collect_replies(discover_env.corr_id)
 
+        # If active with older epoch or finishing → set running
         active = [r for r in replies if (r.payload.get("run_state") in ("running", "finishing")
                                          and r.payload.get("attempt_epoch") == node.get("attempt_epoch"))]
         if active:
@@ -661,6 +781,7 @@ class Coordinator:
                                       {"$set": {"graph.nodes.$.status": RunState.running}})
             return
 
+        # If complete artifacts → mark finished
         complete = any((r.payload.get("artifacts") or {}).get("complete") for r in replies)
         if complete:
             await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
@@ -669,6 +790,7 @@ class Coordinator:
                                                 "graph.nodes.$.attempt_epoch": new_epoch}})
             return
 
+        # Start node
         await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
                                   {"$set": {"graph.nodes.$.status": RunState.running,
                                             "graph.nodes.$.started_at": now_dt(),
@@ -737,33 +859,135 @@ class Coordinator:
             await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
                                       {"$inc": inc, "$currentDate": {"updated_at": True}})
 
+    async def _persist_artifact_partial(self, env: Envelope, ref: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        """
+        Идемпотентная запись частичного артефакта. Любые ошибки здесь не должны
+        обрушать обработку событий — они приводят к deferred состояния/ретраю downstream.
+        """
+        try:
+            shard_id = ref.get("shard_id")
+            if not shard_id:
+                # Защита координатора: если шард без id — пометим событие и уйдём
+                await db.worker_events.update_one(
+                    {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
+                    {"$set": {"artifact_error": "missing_shard_id"}}
+                )
+                return
+            await db.artifacts.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id},
+                {"$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id,
+                                  "attempt_epoch": env.attempt_epoch, "status": "partial",
+                                  "meta": meta or {}, "payload": None, "worker_id": env.payload.get("worker_id"),
+                                  "created_at": now_dt()},
+                 "$set": {"updated_at": now_dt()}},
+                upsert=True
+            )
+        except Exception as e:
+            # Не роняем поток: просто зафиксируем ошибку
+            await db.worker_events.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
+                {"$set": {"artifact_error": str(e)}}
+            )
+
+    async def _maybe_start_children_on_first_batch(self, parent_task: Dict[str, Any], parent_node_id: str) -> None:
+        """
+        На первый батч родителя пытаемся стартовать детей, которые ожидают асинхронный запуск:
+        - edges_ex: mode=async, trigger=on_batch
+        - либо у ребёнка io.start_when=first_batch и он зависит от parent
+        Стартуем атомарно с флагом 'streaming.started_on_first_batch', чтобы не триггерить повторно.
+        """
+        task_id = parent_task["id"]
+        graph = parent_task.get("graph", {}) or {}
+        nodes = graph.get("nodes") or []
+        edges_ex = self._edges_ex_from(parent_task, parent_node_id)
+
+        # Кандидаты-дети по edges/edges_ex
+        direct_children = self._children_of(parent_task, parent_node_id)
+        if not direct_children:
+            return
+
+        for child_id in direct_children:
+            child = self._get_node(parent_task, child_id)
+            if not child:
+                continue
+
+            # Применим правила:
+            rule_async = any(ex for ex in edges_ex if ex.get("to") == child_id and ex.get("mode") == "async" and ex.get("trigger") == "on_batch")
+            sw = (child.get("io", {}) or {}).get("start_when", "ready")
+            wants_first_batch = (sw == "first_batch")
+
+            if not (rule_async or wants_first_batch):
+                continue
+
+            # Попытаемся атомарно пометить, что мы запускаем этого ребёнка "по первому батчу"
+            # Запустим только если он ещё в queued/deferred и не запускался ранним способом.
+            q = {"id": task_id, "graph.nodes": {"$elemMatch": {"node_id": child_id,
+                                                                "status": {"$in": [RunState.queued, RunState.deferred]},
+                                                                "streaming.started_on_first_batch": {"$ne": True}}}}
+            res = await db.tasks.find_one_and_update(
+                q,
+                {"$set": {"graph.nodes.$.streaming.started_on_first_batch": True,
+                          "graph.nodes.$.next_retry_at": 0}},
+            )
+            if res:
+                # scheduler подберёт через _node_ready (first_batch) → но чтобы ускорить,
+                # можно прямо сейчас инициировать preflight if ready:
+                fresh = await db.tasks.find_one({"id": task_id}, {"id": 1, "graph": 1})
+                ch_node = self._get_node(fresh, child_id) if fresh else None
+                if fresh and ch_node:
+                    if await self._node_ready(fresh, ch_node):
+                        await self._preflight_and_maybe_start(fresh, ch_node)
+
     async def _on_batch_ok(self, env: Envelope) -> None:
         p = EvBatchOk.model_validate(env.payload)
         await self._apply_metrics_once(env, p.metrics or {})
+
+        # Идемпотентно фиксируем partial артефакт (шард)
         if p.artifacts_ref:
-            await db.artifacts.update_one(
-                {"task_id": env.task_id, "node_id": env.node_id, "shard_id": p.artifacts_ref.get("shard_id")},
-                {"$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id,
-                                  "attempt_epoch": env.attempt_epoch, "status": "partial",
-                                  "meta": p.metrics or {}, "payload": None, "worker_id": p.worker_id,
-                                  "updated_at": now_dt()},
-                 "$currentDate": {"updated_at": True}}, upsert=True)
+            await self._persist_artifact_partial(env, p.artifacts_ref, p.metrics or {})
+
+        # Попробуем «ранний старт» downstream на первый батч
+        try:
+            tdoc = await db.tasks.find_one({"id": env.task_id}, {"id": 1, "graph": 1})
+            if tdoc:
+                await self._maybe_start_children_on_first_batch(tdoc, env.node_id)
+        except Exception:
+            # Не блокируем обработку батчей из-за ошибок триггера
+            pass
 
     async def _on_batch_failed(self, env: Envelope) -> None:
         p = EvBatchFailed.model_validate(env.payload)
         await self._apply_metrics_once(env, {})
-        # partial failure; finalizer/heartbeat may decide retries/defer
+        # При ошибке батча мы не заваливаем всю ноду; дочерние стримы продолжают,
+        # пока воркер сам не решит завершить TASK_FAILED/TASK_DONE. Координатор
+        # фиксирует это событие для диагностики.
+        if p.artifacts_ref:
+            # Можно пометить артефакт как "failed" для шардового мониторинга (без влияния на DAG)
+            try:
+                shard_id = p.artifacts_ref.get("shard_id")
+                if shard_id:
+                    await db.artifacts.update_one(
+                        {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id},
+                        {"$set": {"status": "failed", "updated_at": now_dt(), "error": p.reason_code}},
+                        upsert=True
+                    )
+            except Exception:
+                pass
 
     async def _on_task_done(self, env: Envelope) -> None:
         p = EvTaskDone.model_validate(env.payload)
         await self._apply_metrics_once(env, p.metrics or {})
         if p.artifacts_ref:
-            await db.artifacts.update_one(
-                {"task_id": env.task_id, "node_id": env.node_id},
-                {"$set": {"status": "complete", "meta": p.metrics or {}, "updated_at": now_dt()},
-                 "$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id, "attempt_epoch": env.attempt_epoch}},
-                upsert=True
-            )
+            # помечаем результат ноды как complete
+            try:
+                await db.artifacts.update_one(
+                    {"task_id": env.task_id, "node_id": env.node_id},
+                    {"$set": {"status": "complete", "meta": p.metrics or {}, "updated_at": now_dt()},
+                     "$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id, "attempt_epoch": env.attempt_epoch}},
+                    upsert=True
+                )
+            except Exception:
+                pass
         await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
                                   {"$set": {"graph.nodes.$.status": RunState.finished,
                                             "graph.nodes.$.finished_at": now_dt()}})
@@ -779,7 +1003,8 @@ class Coordinator:
             backoff = int(((node or {}).get("retry_policy") or {}).get("backoff_sec", 300))
             await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
                                       {"$set": {"graph.nodes.$.status": RunState.deferred,
-                                                "graph.nodes.$.next_retry_at": now_ts() + backoff}})
+                                                "graph.nodes.$.next_retry_at": now_ts() + backoff,
+                                                "graph.nodes.$.last_error": p.reason_code}})
 
     async def _on_cancelled(self, env: Envelope) -> None:
         await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
@@ -818,7 +1043,6 @@ class Coordinator:
             return
 
     async def _finalize_nodes_and_tasks(self) -> None:
-        # Propagate to children (fan-out) automatically via scheduler readiness.
         cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred]}}, {"id": 1, "graph": 1})
         async for t in cur:
             nodes = t.get("graph", {}).get("nodes") or []
@@ -852,7 +1076,7 @@ class Coordinator:
 
     # ── Resume inflight ─────────────────────────────────────────────────
     async def _resume_inflight(self) -> None:
-        cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred, RunState.queued]}},
+        cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred, RunState.queued]}} ,
                             {"id": 1, "graph": 1, "status": 1})
         async for _ in cur:
             # scheduler will adopt/start as needed
@@ -866,14 +1090,14 @@ class Coordinator:
             await db.worker_events.create_index([("ts_dt", 1)], name="ttl_worker_events", expireAfterSeconds=14*24*3600)
             await db.worker_registry.create_index([("worker_id", 1)], unique=True, name="uniq_worker")
             await db.artifacts.create_index([("task_id", 1), ("node_id", 1)], name="ix_artifacts_task_node")
-            # Outbox indexes
+            await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("shard_id", 1)], unique=True, sparse=True, name="uniq_artifact_shard")
             await db.outbox.create_index([("fp", 1)], unique=True, name="uniq_outbox_fp")
             await db.outbox.create_index([("state", 1), ("next_attempt_at", 1)], name="ix_outbox_state_next")
         except Exception:
             pass
 
 # ─────────────────────────── Minimal FastAPI ───────────────────────────
-app = FastAPI(title="Universal DAG Coordinator (Outbox + fan-in/out)")
+app = FastAPI(title="Universal DAG Coordinator (Stream-aware, Outbox, fan-in/out)")
 
 COORD = Coordinator()
 

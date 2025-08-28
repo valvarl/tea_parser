@@ -1,4 +1,4 @@
-# worker_universal.py
+# worker_universal.py  (v2.0 stream-aware, pull.from_artifacts, resilient batching)
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +11,7 @@ import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List, Literal, AsyncIterator
+from typing import Any, Dict, Optional, List, Literal, AsyncIterator, Tuple, Callable
 from enum import Enum
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -43,13 +43,17 @@ HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "20"))
 DEDUP_CACHE_SIZE = int(os.getenv("DEDUP_CACHE_SIZE", "10000"))
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "3600"))
 
+# Streaming poll
+PULL_POLL_MS_DEFAULT = int(os.getenv("PULL_POLL_MS", "300"))
+PULL_EMPTY_BACKOFF_MS_MAX = int(os.getenv("PULL_EMPTY_BACKOFF_MS_MAX", "4000"))
+
 # State
 STATE_DIR = os.getenv("WORKER_STATE_DIR", "./.worker_state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 # Worker identity
 WORKER_ID = os.getenv("WORKER_ID", f"w-{uuid.uuid4().hex[:8]}")
-WORKER_VERSION = os.getenv("WORKER_VERSION", "1.0.0")
+WORKER_VERSION = os.getenv("WORKER_VERSION", "2.0.0")
 
 # ─────────────────────────── Helpers ───────────────────────────
 def now_ts() -> int:
@@ -126,7 +130,7 @@ class Envelope(BaseModel):
 class CmdTaskStart(BaseModel):
     cmd: Literal[CommandKind.TASK_START]
     input_ref: Optional[Dict[str, Any]] = None
-    input_inline: Optional[Dict[str, Any]] = None
+    input_inline: Optional[Dict[str, Any]] = None  # сюда можно положить input_adapter/input_args
     batching: Optional[Dict[str, Any]] = None
     cancel_token: str
 
@@ -210,7 +214,12 @@ class RoleHandler:
         pass
 
     async def load_input(self, input_ref: Optional[Dict[str, Any]], input_inline: Optional[Dict[str, Any]]) -> Any:
-        return {"input_ref": input_ref, "input_inline": input_inline}
+        """
+        Возвращает структуру, на основе которой iter_batches решит, как стримить.
+        По умолчанию — просто возвращаем объединённый словарь.
+        """
+        res = {"input_ref": input_ref or {}, "input_inline": input_inline or {}}
+        return res
 
     async def iter_batches(self, loaded: Any) -> AsyncIterator[Batch]:
         # default: single batch with inline payload
@@ -234,9 +243,179 @@ class EchoHandler(RoleHandler):
     async def process_batch(self, batch: Batch, ctx: RunContext) -> BatchResult:
         if ctx.cancelled():
             return BatchResult(success=False, reason_code="cancelled", permanent=False)
-        # pretend work
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
         return BatchResult(success=True, metrics={"echoed": 1})
+
+# ─────────────────────────── Pull adapters (streaming) ─────────────────
+class PullAdapters:
+    """
+    Реализация pull.from_artifacts:
+    - Источник: db.artifacts (upstream node(s), status=partial)
+    - Клейм шардов: db.stream_progress с уникальным ключом (task_id, consumer_node, from_node, shard_id)
+    - Остановка: если все from_nodes помечены как complete и новых шардов нет.
+    """
+
+    @staticmethod
+    async def iter_from_artifacts(
+        task_id: str,
+        consumer_node: str,
+        from_nodes: List[str],
+        poll_ms: int = PULL_POLL_MS_DEFAULT,
+        eof_on_task_done: bool = True,
+        backoff_max_ms: int = PULL_EMPTY_BACKOFF_MS_MAX,
+        cancel_flag: Optional[asyncio.Event] = None,
+    ) -> AsyncIterator[Batch]:
+
+        if not from_nodes:
+            return
+
+        backoff_ms = poll_ms
+        already_warned = False
+
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                break
+
+            got_any = False
+            try:
+                for src in from_nodes:
+                    # Ищем partial-шарды этого src
+                    # Берём небольшими пачками, чтобы не держать курсор долго
+                    cur = db.artifacts.find(
+                        {"task_id": task_id, "node_id": src, "status": "partial"},
+                        {"_id": 0, "task_id": 1, "node_id": 1, "shard_id": 1, "meta": 1, "created_at": 1}
+                    ).sort([("created_at", 1)]).limit(200)
+
+                    async for a in cur:
+                        if cancel_flag and cancel_flag.is_set():
+                            break
+                        shard_id = a.get("shard_id")
+                        if not shard_id:
+                            continue
+                        # Попытка клейма: уникальный insert
+                        try:
+                            await db.stream_progress.insert_one({
+                                "task_id": task_id,
+                                "consumer_node": consumer_node,
+                                "from_node": src,
+                                "shard_id": shard_id,
+                                "claimed_at": now_dt()
+                            })
+                        except Exception:
+                            # duplicate или временная ошибка → пропустим
+                            continue
+
+                        got_any = True
+                        backoff_ms = poll_ms  # сброс бэк-оффа
+                        yield Batch(
+                            shard_id=shard_id,
+                            payload={
+                                "from_node": src,
+                                "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
+                                "meta": a.get("meta") or {}
+                            }
+                        )
+
+                if got_any:
+                    continue
+
+                # Нет новых шардов — проверим EOF
+                if eof_on_task_done:
+                    all_complete = True
+                    for src in from_nodes:
+                        try:
+                            c = await db.artifacts.count_documents({"task_id": task_id, "node_id": src, "status": "complete"})
+                            if c <= 0:
+                                all_complete = False
+                                break
+                        except Exception:
+                            # не удалось проверить — считаем, что ещё не конец
+                            all_complete = False
+                            break
+                    if all_complete:
+                        break
+
+                # Пусто → подождём (экспоненциальный бэк-офф до backoff_max_ms)
+                await asyncio.sleep(backoff_ms / 1000.0)
+                backoff_ms = min(backoff_ms * 2, backoff_max_ms)
+                already_warned = False
+
+            except Exception as e:
+                # Ошибка чтения/клейма — не валим задачу, ждём и пробуем снова
+                if not already_warned:
+                    log(level="WARNING", msg="pull.from_artifacts error, backing off", error=str(e))
+                    already_warned = True
+                await asyncio.sleep(backoff_ms / 1000.0)
+                backoff_ms = min(backoff_ms * 2, backoff_max_ms)
+
+    @staticmethod
+    async def iter_from_artifacts_rechunk(
+        task_id: str,
+        consumer_node: str,
+        from_nodes: List[str],
+        *,
+        size: int,
+        poll_ms: int = PULL_POLL_MS_DEFAULT,
+        eof_on_task_done: bool = True,
+        backoff_max_ms: int = PULL_EMPTY_BACKOFF_MS_MAX,
+        meta_list_key: Optional[str] = None,
+        cancel_flag: Optional[asyncio.Event] = None,
+    ) -> AsyncIterator[Batch]:
+        """
+        Обёртка над iter_from_artifacts: вытаскивает из meta список и режет его на чанки по size.
+        Эвристика ключа списка: meta_list_key → items → skus → enriched → ocr.
+        """
+        if size <= 0:
+            size = 1
+
+        async def _inner():
+            base = PullAdapters.iter_from_artifacts(
+                task_id=task_id,
+                consumer_node=consumer_node,
+                from_nodes=from_nodes,
+                poll_ms=poll_ms,
+                eof_on_task_done=eof_on_task_done,
+                backoff_max_ms=backoff_max_ms,
+                cancel_flag=cancel_flag,
+            )
+            async for b in base:
+                src = (b.payload or {}).get("from_node") or (b.payload or {}).get("ref", {}).get("node_id")
+                ref = (b.payload or {}).get("ref") or {}
+                orig_shard = ref.get("shard_id") or b.shard_id or "sh"
+                meta = (b.payload or {}).get("meta") or {}
+
+                # Найти список
+                key = meta_list_key
+                if key is None:
+                    for cand in ("items", "skus", "enriched", "ocr"):
+                        if isinstance(meta.get(cand), list):
+                            key = cand
+                            break
+                items = meta.get(key) if key else None
+                if not isinstance(items, list):
+                    # fallback: трактуем мету целиком как единичный элемент
+                    items = [meta]
+
+                # Нарезка
+                idx = 0
+                for i in range(0, len(items), size):
+                    chunk = items[i:i+size]
+                    yield Batch(
+                        shard_id=f"{src}-{orig_shard}-{idx}",
+                        payload={"from_node": src, "items": chunk, "parent": {"ref": ref, "list_key": key}}
+                    )
+                    idx += 1
+
+        async for y in _inner():
+            if cancel_flag and cancel_flag.is_set():
+                break
+            yield y
+
+# Регистр доступных pull-адаптеров (по имени)
+INPUT_ADAPTERS: Dict[str, Callable[..., AsyncIterator[Batch]]] = {
+    "pull.from_artifacts": PullAdapters.iter_from_artifacts,
+    "pull.from_artifacts.rechunk:size": PullAdapters.iter_from_artifacts_rechunk,
+}
 
 # ─────────────────────────── Artifacts writer ──────────────────────────
 class ArtifactsWriter:
@@ -287,7 +466,6 @@ class Worker:
         self._dedup: OrderedDict[str, int] = OrderedDict()
         self._dedup_lock = asyncio.Lock()
 
-        self._heartbeat_task: Optional[asyncio.Task] = None
         self._main_tasks: set[asyncio.Task] = set()
         self._stopping = False
 
@@ -324,7 +502,7 @@ class Worker:
         # Heartbeat announce (optional every 60s)
         self._spawn(self._periodic_announce())
 
-        # If recovering active run, set busy and resume execution (coordinator may adopt/cancel)
+        # Recover flag (координатор сам решит, что делать с активным ранoм)
         if self.active:
             self._busy = True
             self._cancel_flag.clear()
@@ -417,10 +595,9 @@ class Worker:
         cmd = CmdTaskStart.model_validate(env.payload)
         async with self._busy_lock:
             if self._busy:
-                # we are busy → ignore other jobs
+                # already busy → ignore; координатор сделает retry/defer
                 await consumer.commit()
                 return
-            # fencing: if we are recovering a different run, ignore
             if self.active and not (self.active.task_id == env.task_id and self.active.node_id == env.node_id):
                 await consumer.commit()
                 return
@@ -437,7 +614,7 @@ class Worker:
             )
             await self.state.write_active(self.active)
 
-            # Announce TASK_ACCEPTED
+            # TASK_ACCEPTED
             acc_env = Envelope(msg_type=MsgType.event, role=RoleKind.worker,
                                dedup_id=stable_hash({"acc": env.task_id, "n": env.node_id, "e": env.attempt_epoch, "lease": lease_id}),
                                task_id=env.task_id, node_id=env.node_id, step_type=role, attempt_epoch=env.attempt_epoch,
@@ -456,13 +633,11 @@ class Worker:
 
     async def _handle_task_cancel(self, role: str, env: Envelope, consumer: AIOKafkaConsumer) -> None:
         cmd = CmdTaskCancel.model_validate(env.payload)
-        # Only respect cancel that matches active run & epoch
         if self.active and self.active.task_id == env.task_id and self.active.node_id == env.node_id \
            and self.active.attempt_epoch == env.attempt_epoch:
             self._cancel_flag.set()
             self.active.state = "cancelling"
             await self.state.write_active(self.active)
-            # We'll send CANCELLED when run loop observes cancellation or in finalization
         await consumer.commit()
 
     async def _pause_all_cmd_consumers(self) -> None:
@@ -482,7 +657,6 @@ class Worker:
         assert self.active is not None
         handler = self.handlers.get(role)
         if not handler:
-            # no handler → hard fail
             await self._emit_task_failed(role, start_env, "no_handler", True, "handler not registered")
             await self._cleanup_after_run()
             return
@@ -491,38 +665,85 @@ class Worker:
             await handler.init({})
             artifacts = ArtifactsWriter(self.active.task_id, self.active.node_id, self.active.attempt_epoch, WORKER_ID)
             ctx = RunContext(self._cancel_flag, artifacts)
-            loaded = await handler.load_input(cmd.input_ref, cmd.input_inline)
 
-            # iterate batches
-            async for batch in handler.iter_batches(loaded):
+            loaded = await handler.load_input(cmd.input_ref, cmd.input_inline)
+            # Встроенная маршрутизация входа: если указан input_adapter — используем наш pull-итератор,
+            # иначе — делегируем iter_batches хэндлеру.
+            input_inline = (loaded or {}).get("input_inline") if isinstance(loaded, dict) else {}
+            adapter_name = (input_inline or {}).get("input_adapter")
+            adapter_args = (input_inline or {}).get("input_args", {}) or {}
+
+            if adapter_name and adapter_name in INPUT_ADAPTERS:
+                # Параметры адаптера
+                from_nodes = adapter_args.get("from_nodes") or (adapter_args.get("from_node") and [adapter_args["from_node"]]) or []
+                poll_ms = int(adapter_args.get("poll_ms", PULL_POLL_MS_DEFAULT))
+                eof_on_task_done = bool(adapter_args.get("eof_on_task_done", True))
+                backoff_max_ms = int(adapter_args.get("backoff_max_ms", PULL_EMPTY_BACKOFF_MS_MAX))
+
+                async def _iter_batches_adapter() -> AsyncIterator[Batch]:
+                    it = INPUT_ADAPTERS[adapter_name](
+                        task_id=self.active.task_id,
+                        consumer_node=self.active.node_id,
+                        from_nodes=from_nodes,
+                        poll_ms=poll_ms,
+                        eof_on_task_done=eof_on_task_done,
+                        backoff_max_ms=backoff_max_ms,
+                        cancel_flag=self._cancel_flag,
+                    )
+                    async for b in it:
+                        yield b
+
+                batch_iter = _iter_batches_adapter()
+            else:
+                batch_iter = handler.iter_batches(loaded)
+
+            # iterate batches with resilience
+            async for batch in batch_iter:
                 if self._cancel_flag.is_set():
                     raise asyncio.CancelledError()
-                # optional claimed event
-                # await self._emit_batch_claimed(role, start_env, batch)
-                res = await handler.process_batch(batch, ctx)
+
+                try:
+                    res = await handler.process_batch(batch, ctx)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Ошибка обработки батча -> классифицируем
+                    reason, permanent = handler.classify_error(e)
+                    res = BatchResult(success=False, reason_code=reason, permanent=permanent, error=str(e), metrics={})
+
                 if res.success:
-                    # write partial if provided
+                    # Идемпотентный partial (если есть shard_id)
+                    artifacts_ref = res.artifacts_ref
                     if batch.shard_id is not None:
-                        await artifacts.upsert_partial(batch.shard_id, res.metrics or {})
-                    await self._emit_batch_ok(role, start_env, batch, res)
+                        try:
+                            await artifacts.upsert_partial(batch.shard_id, res.metrics or {})
+                        except Exception as e:
+                            # Ошибка записи partial — всё равно отправим BATCH_OK, чтобы координатор мог принять решение,
+                            # но приложим минимальный artifacts_ref
+                            log(level="ERROR", msg="upsert_partial failed", shard_id=batch.shard_id, error=str(e))
+                        if not artifacts_ref:
+                            artifacts_ref = {"shard_id": batch.shard_id}
+
+                    await self._emit_batch_ok(role, start_env, batch, res, override_artifacts_ref=artifacts_ref)
                 else:
-                    await self._emit_batch_failed(role, start_env, batch, res)
+                    # Сообщаем про упавший батч и продолжим (если не permanent)
+                    artifacts_ref = None
+                    if batch.shard_id is not None:
+                        artifacts_ref = {"shard_id": batch.shard_id}
+                    await self._emit_batch_failed(role, start_env, batch, res, override_artifacts_ref=artifacts_ref)
                     if res.permanent:
                         raise RuntimeError(f"permanent:{res.reason_code or 'error'}")
-                    # transient failure → continue (coordinator решит про deferred)
 
             # finalize
             fin = await handler.finalize(ctx)
             metrics = (fin.metrics if fin else {}) if fin else {}
             ref = (fin.artifacts_ref if fin else None)
-            # mark complete artifacts
             ref = await artifacts.mark_complete(metrics, ref)
             await self._emit_task_done(role, start_env, metrics, ref)
 
         except asyncio.CancelledError:
             await self._emit_cancelled(role, start_env, "cancelled")
         except Exception as e:
-            # classify
             reason, permanent = handler.classify_error(e) if handler else ("unexpected_error", False)
             await self._emit_task_failed(role, start_env, reason, permanent, str(e))
         finally:
@@ -553,23 +774,25 @@ class Worker:
             return
 
     # ── Status emitters ────────────────────────────────────────────────
-    async def _emit_batch_ok(self, role: str, base: Envelope, batch: Batch, res: BatchResult) -> None:
+    async def _emit_batch_ok(self, role: str, base: Envelope, batch: Batch, res: BatchResult, override_artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
+        artifacts_ref = override_artifacts_ref if override_artifacts_ref is not None else res.artifacts_ref
         env = Envelope(
             msg_type=MsgType.event, role=RoleKind.worker,
             dedup_id=stable_hash({"bok": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "shard": batch.shard_id, "m": res.metrics}),
             task_id=base.task_id, node_id=base.node_id, step_type=role, attempt_epoch=base.attempt_epoch,
             payload={"kind": EventKind.BATCH_OK, "worker_id": WORKER_ID, "batch_id": None,
-                     "metrics": res.metrics or {}, "artifacts_ref": res.artifacts_ref}
+                     "metrics": res.metrics or {}, "artifacts_ref": artifacts_ref}
         )
         await self._send_status(role, env)
 
-    async def _emit_batch_failed(self, role: str, base: Envelope, batch: Batch, res: BatchResult) -> None:
+    async def _emit_batch_failed(self, role: str, base: Envelope, batch: Batch, res: BatchResult, override_artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
         env = Envelope(
             msg_type=MsgType.event, role=RoleKind.worker,
             dedup_id=stable_hash({"bf": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "shard": batch.shard_id, "r": res.reason_code}),
             task_id=base.task_id, node_id=base.node_id, step_type=role, attempt_epoch=base.attempt_epoch,
             payload={"kind": EventKind.BATCH_FAILED, "worker_id": WORKER_ID, "batch_id": None,
-                     "reason_code": res.reason_code or "error", "permanent": bool(res.permanent), "error": res.error}
+                     "reason_code": res.reason_code or "error", "permanent": bool(res.permanent), "error": res.error,
+                     "artifacts_ref": override_artifacts_ref}
         )
         await self._send_status(role, env)
 
@@ -611,11 +834,9 @@ class Worker:
                 if env.payload.get("query") != QueryKind.TASK_DISCOVER:
                     await consumer.commit(); continue
 
-                # Reply only if we can potentially handle this step_type
                 if env.step_type not in self.roles:
                     await consumer.commit(); continue
 
-                # Build snapshot
                 ar = self.active
                 if ar and ar.task_id == env.task_id and ar.node_id == env.node_id:
                     run_state = "cancelling" if self._cancel_flag.is_set() else "running"
@@ -625,12 +846,10 @@ class Worker:
                         "run_state": run_state,
                         "attempt_epoch": ar.attempt_epoch,
                         "lease": {"worker_id": WORKER_ID, "lease_id": ar.lease_id, "deadline_ts": now_ts() + LEASE_TTL_SEC},
-                        "progress": {},  # optionally fill
+                        "progress": {},
                         "artifacts": None
                     }
                 else:
-                    # Check artifacts existence to hint completeness
-                    # (best effort: query db.artifacts quickly)
                     complete = False
                     try:
                         cnt = await db.artifacts.count_documents({"task_id": env.task_id, "node_id": env.node_id, "status": "complete"})
@@ -667,10 +886,16 @@ class Worker:
         except asyncio.CancelledError:
             return
 
-    # ── DB indexes (optional) ───────────────────────────────────────────
+    # ── DB indexes (optional but recommended) ───────────────────────────
     async def _ensure_indexes(self) -> None:
         try:
             await db.artifacts.create_index([("task_id", 1), ("node_id", 1)], name="ix_artifacts_task_node")
+            await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("shard_id", 1)], unique=True, sparse=True, name="uniq_artifact_shard")
+            await db.stream_progress.create_index(
+                [("task_id", 1), ("consumer_node", 1), ("from_node", 1), ("shard_id", 1)],
+                unique=True,
+                name="uniq_stream_claim"
+            )
         except Exception:
             pass
 
@@ -680,8 +905,8 @@ async def _main() -> None:
     handlers: Dict[str, RoleHandler] = {}
 
     # register your concrete handlers here
-    # e.g., handlers["indexer"] = IndexerHandler()
-    #       handlers["enricher"] = EnricherHandler()
+    # handlers["indexer"] = IndexerHandler()
+    # handlers["enricher"] = EnricherHandler()
     if "echo" in roles:
         handlers["echo"] = EchoHandler()
 
