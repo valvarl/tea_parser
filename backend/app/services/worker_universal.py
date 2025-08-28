@@ -197,14 +197,14 @@ class Batch(BaseModel):
 
 class BatchResult(BaseModel):
     success: bool
-    metrics: Dict[str, int] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
     artifacts_ref: Optional[Dict[str, Any]] = None
     reason_code: Optional[str] = None
     permanent: bool = False
     error: Optional[str] = None
 
 class FinalizeResult(BaseModel):
-    metrics: Dict[str, int] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
     artifacts_ref: Optional[Dict[str, Any]] = None
 
 class RoleHandler:
@@ -676,19 +676,24 @@ class Worker:
             if adapter_name and adapter_name in INPUT_ADAPTERS:
                 # Параметры адаптера
                 from_nodes = adapter_args.get("from_nodes") or (adapter_args.get("from_node") and [adapter_args["from_node"]]) or []
-                poll_ms = int(adapter_args.get("poll_ms", PULL_POLL_MS_DEFAULT))
-                eof_on_task_done = bool(adapter_args.get("eof_on_task_done", True))
-                backoff_max_ms = int(adapter_args.get("backoff_max_ms", PULL_EMPTY_BACKOFF_MS_MAX))
+
+                # Подготовим kwargs для адаптера: передаём ВСЕ, кроме from_nodes/from_node (их даём явно).
+                adapter_kwargs = dict(adapter_args)
+                adapter_kwargs.pop("from_nodes", None)
+                adapter_kwargs.pop("from_node", None)
+
+                # Значения по умолчанию (если не указаны)
+                adapter_kwargs.setdefault("poll_ms", PULL_POLL_MS_DEFAULT)
+                adapter_kwargs.setdefault("eof_on_task_done", True)
+                adapter_kwargs.setdefault("backoff_max_ms", PULL_EMPTY_BACKOFF_MS_MAX)
 
                 async def _iter_batches_adapter() -> AsyncIterator[Batch]:
                     it = INPUT_ADAPTERS[adapter_name](
                         task_id=self.active.task_id,
                         consumer_node=self.active.node_id,
                         from_nodes=from_nodes,
-                        poll_ms=poll_ms,
-                        eof_on_task_done=eof_on_task_done,
-                        backoff_max_ms=backoff_max_ms,
                         cancel_flag=self._cancel_flag,
+                        **adapter_kwargs,  # <-- тут приходят size, meta_list_key и пр.
                     )
                     async for b in it:
                         yield b

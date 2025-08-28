@@ -164,7 +164,7 @@ class EvBatchOk(BaseModel):
     kind: Literal[EventKind.BATCH_OK]
     worker_id: str
     batch_id: Optional[int] = None
-    metrics: Dict[str, int] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
     artifacts_ref: Optional[Dict[str, Any]] = None
 
 class EvBatchFailed(BaseModel):
@@ -179,7 +179,7 @@ class EvBatchFailed(BaseModel):
 class EvTaskDone(BaseModel):
     kind: Literal[EventKind.TASK_DONE]
     worker_id: str
-    metrics: Dict[str, int] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
     artifacts_ref: Optional[Dict[str, Any]] = None
 
 class EvTaskFailed(BaseModel):
@@ -855,9 +855,19 @@ class Coordinator:
             {"$set": {"metrics_applied": True}}
         )
         if res and metrics:
-            inc = {f"graph.nodes.$.stats.{k}": int(v) for k, v in metrics.items()}
-            await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
-                                      {"$inc": inc, "$currentDate": {"updated_at": True}})
+            inc: Dict[str, int] = {}
+            for k, v in (metrics or {}).items():
+                try:
+                    # допускаем числа и числовые строки
+                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()):
+                        inc[f"graph.nodes.$.stats.{k}"] = int(v)
+                except Exception:
+                    continue
+            if inc:
+                await db.tasks.update_one(
+                    {"id": env.task_id, "graph.nodes.node_id": env.node_id},
+                    {"$inc": inc, "$currentDate": {"updated_at": True}}
+                )
 
     async def _persist_artifact_partial(self, env: Envelope, ref: Dict[str, Any], meta: Dict[str, Any]) -> None:
         """
