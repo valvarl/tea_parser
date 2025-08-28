@@ -182,7 +182,6 @@ export default function ProductsPage({ api, initialQuery, onPersist }) {
     // стандартизируем URL под выбранный снапшот
     writeQueryToUrl(snap);
     setDidInit(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // один раз на маунт
 
   // ----- sync URL + persist to parent when state changes -----
