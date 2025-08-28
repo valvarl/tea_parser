@@ -1,381 +1,271 @@
+# indexer_handler.py
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from pydantic import BaseModel, Field
 
-from app.core.logging import configure_logging, get_logger
 from app.db.mongo import db
 from app.services.indexer import ProductIndexer, CircuitOpen
 
-BOOT = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_INDEXER_CMD = os.getenv("TOPIC_INDEXER_CMD", "indexer_cmd")
-TOPIC_INDEXER_STATUS = os.getenv("TOPIC_INDEXER_STATUS", "indexer_status")
+# импортируйте базовые классы из worker_universal.py
+from worker_universal import RoleHandler, RunContext, Batch, BatchResult, FinalizeResult
 
-MAX_PAGES_DEF = int(os.getenv("INDEX_MAX_PAGES", 1))
-CATEGORY_DEF = os.getenv("INDEX_CATEGORY_ID", "9373")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", os.getenv("GIT_SHA", "dev"))
+# ---- конфиг (аналог исходного) ----
+INDEX_MAX_PAGES = int(os.getenv("INDEX_MAX_PAGES", "1"))
+INDEX_CATEGORY_ID = os.getenv("INDEX_CATEGORY_ID", "9373")
 
 INDEX_RETRY_MAX = int(os.getenv("INDEX_RETRY_MAX", "3"))
 INDEX_RETRY_BASE_SEC = int(os.getenv("INDEX_RETRY_BASE_SEC", "60"))
 INDEX_RETRY_MAX_SEC = int(os.getenv("INDEX_RETRY_MAX_SEC", "3600"))
 
-configure_logging(service="indexer", worker="indexer-worker")
-logger = get_logger("indexer-worker")
-indexer = ProductIndexer()
-
-
-# ---------- utils ----------
+# для upsert коллекций
+COLL_BATCH_SIZE_DEF = int(os.getenv("INDEX_COLL_BATCH_SIZE", "200"))
 
 def _now_ts() -> int:
     return int(time.time())
 
-def _loads(x: bytes) -> Any:
-    return json.loads(x.decode("utf-8"))
 
-def _dumps(x: Any) -> bytes:
-    return json.dumps(x, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-def _chunked(seq: Iterable[Any], size: int) -> Iterable[List[Any]]:
-    buf: List[Any] = []
-    for it in seq:
-        buf.append(it)
-        if len(buf) >= size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
-
-async def _send_status(prod: AIOKafkaProducer, payload: Dict[str, Any]) -> None:
-    base = {"source": "indexer", "version": SERVICE_VERSION, "ts": _now_ts()}
-    base.update(payload)
-    await prod.send_and_wait(TOPIC_INDEXER_STATUS, base)
+class _LoadedSearch(BaseModel):
+    mode: str = "search"
+    query: str
+    category_id: str = Field(default=INDEX_CATEGORY_ID)
+    max_pages: int = Field(default=INDEX_MAX_PAGES)
+    headless: bool = True
 
 
-# ---------- dispatcher ----------
+class _LoadedCollections(BaseModel):
+    mode: str = "collections_upsert"
+    skus: List[str]
+    batch_size: int = Field(default=COLL_BATCH_SIZE_DEF)
 
-async def _dispatch(payload: Dict[str, Any], prod: AIOKafkaProducer) -> None:
-    cmd = (payload.get("cmd") or "").lower()
-    task_id = payload.get("task_id")
-    trigger = payload.get("trigger") or "ad-hoc"
-    logger.info("dispatch", extra={"event": "dispatch", "cmd": cmd or "search", "task_id": task_id, "trigger": trigger})
 
-    if cmd == "add_collection_members":
-        await _handle_add_collection_members(
-            task_id=task_id,
-            batch_id=payload.get("batch_id"),
-            skus=list(payload.get("skus") or []),
-            trigger=trigger,
-            prod=prod,
-        )
+class IndexerHandler(RoleHandler):
+    """
+    Роль: "indexer".
+    Режимы:
+      - search:   поисковая индексация страниц; батч = одна страница продуктов
+      - collections_upsert: апсерт списка SKU; батч = часть SKU (chunk)
+    """
+    role = "indexer"
+
+    def __init__(self) -> None:
+        self._indexer = ProductIndexer()
+
+    async def init(self, cfg: Dict[str, Any]) -> None:
+        # здесь можно инициализировать внешние клиенты/кэш
         return
 
-    await _handle_search(
-        task_id=task_id,
-        query=(payload.get("search_term") or "").strip(),
-        category=str(payload.get("category_id") or CATEGORY_DEF),
-        max_pages=int(payload.get("max_pages", MAX_PAGES_DEF)),
-        trigger=trigger,
-        prod=prod,
-    )
+    # ── Входные данные от координатора ─────────────────────────────────
+    async def load_input(
+        self,
+        input_ref: Optional[Dict[str, Any]],
+        input_inline: Optional[Dict[str, Any]],
+    ) -> Any:
+        """
+        Ожидаемые варианты input_inline:
+        - {"mode":"search","search_term":"чай","category_id":"9373","max_pages":3}
+        - {"mode":"collections_upsert","skus":[...], "batch_size": 200}
+        Back-compat: если mode отсутствует, определяем по наличию ключей.
+        """
+        inp = input_inline or {}
+        mode = (inp.get("mode") or "").strip().lower()
 
+        if not mode:
+            # эвристика
+            if "skus" in inp:
+                mode = "collections_upsert"
+            else:
+                mode = "search"
 
-# ---------- search flow ----------
+        if mode == "collections_upsert":
+            skus = [str(s).strip() for s in (inp.get("skus") or []) if str(s).strip()]
+            return _LoadedCollections(
+                mode="collections_upsert",
+                skus=skus,
+                batch_size=int(inp.get("batch_size") or COLL_BATCH_SIZE_DEF),
+            )
 
-async def _handle_search(
-    task_id: str,
-    query: str,
-    category: str,
-    max_pages: int,
-    trigger: str,
-    prod: AIOKafkaProducer,
-) -> None:
-    logger.info(
-        "start search",
-        extra={"event": "start", "task_id": task_id, "trigger": trigger, "params": {"query": query, "category": category, "max_pages": max_pages}},
-    )
-    try:
-        await _send_status(prod, {"task_id": task_id, "status": "running", "trigger": trigger})
+        # default → search
+        return _LoadedSearch(
+            mode="search",
+            query=str(inp.get("search_term") or "").strip(),
+            category_id=str(inp.get("category_id") or INDEX_CATEGORY_ID),
+            max_pages=int(inp.get("max_pages") or INDEX_MAX_PAGES),
+            headless=True,
+        )
 
-        totals_inserted = 0
-        totals_updated = 0
-        totals_pages = 0
-        attempt = 0
+    # ── Планирование батчей ─────────────────────────────────────────────
+    async def iter_batches(self, loaded: Any) -> AsyncIterator[Batch]:
+        """
+        - search: отдаём батчи постранично (payload={"page_no":N,"products":[...]})
+        - collections_upsert: отдаём чанки sku (payload={"skus":[...]})
+        """
+        if isinstance(loaded, _LoadedCollections):
+            skus = loaded.skus
+            bs = max(1, int(loaded.batch_size or COLL_BATCH_SIZE_DEF))
+            shard = 0
+            for i in range(0, len(skus), bs):
+                shard += 1
+                chunk = skus[i : i + bs]
+                yield Batch(shard_id=str(shard), payload={"mode": "collections_upsert", "skus": chunk})
+            return
 
-        while True:
-            attempt += 1
-            try:
-                page_no = 0
-                async for batch in indexer.iter_products(
-                    query=query,
-                    category=category,
-                    start_page=1,
-                    max_pages=max_pages,
-                    headless=True,
-                ):
-                    page_no += 1
-                    totals_pages += 1
+        if isinstance(loaded, _LoadedSearch):
+            # Мы хотим выдавать готовые страницы, чтобы process_batch занимался апсертами
+            page_no = 0
+            # Встроенные ретраи для CircuitOpen на уровне выдачи страниц
+            attempt = 0
+            while True:
+                try:
+                    async for products in self._indexer.iter_products(
+                        query=loaded.query,
+                        category=loaded.category_id,
+                        start_page=1,
+                        max_pages=loaded.max_pages,
+                        headless=loaded.headless,
+                    ):
+                        page_no += 1
+                        yield Batch(shard_id=str(page_no), payload={
+                            "mode": "search",
+                            "page_no": page_no,
+                            "products": products or []
+                        })
+                    break  # completed
+                except CircuitOpen:
+                    attempt += 1
+                    if attempt >= INDEX_RETRY_MAX:
+                        # пробрасываем дальше — worker отправит TASK_FAILED(permanent=False) по classify_error
+                        raise
+                    delay = min(INDEX_RETRY_MAX_SEC, INDEX_RETRY_BASE_SEC * (2 ** (attempt - 1)))
+                    await asyncio.sleep(delay)
+            return
 
-                    batch_skus: List[str] = []
-                    batch_inserted = 0
-                    batch_updated = 0
+        # на всякий случай — ничего
+        return
 
-                    for p in batch:
-                        sku = str(p.get("sku") or "").strip()
-                        if not sku:
-                            continue
-                        try:
-                            res = await db.index.update_one(
-                                {"sku": sku},
-                                {
-                                    "$set": {
-                                        "last_seen_at": _now_ts(),
-                                        "is_active": True,
-                                        "task_id": task_id,
-                                    },
-                                    "$setOnInsert": {
-                                        "first_seen_at": _now_ts(),
-                                        "candidate_id": None,
-                                        "sku": sku,
-                                        "status": "indexed_auto",
-                                    },
-                                },
-                                upsert=True,
-                            )
-                            is_insert = res.upserted_id is not None
-                            batch_inserted += int(is_insert)
-                            batch_updated += int(not is_insert)
-                            batch_skus.append(sku)
-                        except Exception:
-                            logger.error("index upsert failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
+    # ── Выполнение батча ────────────────────────────────────────────────
+    async def process_batch(self, batch: Batch, ctx: RunContext) -> BatchResult:
+        if ctx.cancelled():
+            return BatchResult(success=False, reason_code="cancelled", permanent=False)
 
-                    totals_inserted += batch_inserted
-                    totals_updated += batch_updated
-                    batch_indexed = batch_inserted + batch_updated
+        payload = batch.payload or {}
+        mode = payload.get("mode")
 
-                    await _send_status(
-                        prod,
-                        {
-                            "task_id": task_id,
-                            "status": "ok",
-                            "batch_id": page_no,
-                            "trigger": trigger,
-                            "batch_data": {
-                                "batch_id": page_no,
-                                "skus": batch_skus,
-                                "indexed": batch_indexed,
-                                "inserted": batch_inserted,
-                                "updated": batch_updated,
-                                "pages": 1,
-                            },
-                        },
-                    )
-                    logger.info(
-                        "page done",
-                        extra={
-                            "event": "batch_ok",
-                            "task_id": task_id,
-                            "batch_id": page_no,
-                            "counts": {"indexed": batch_indexed, "inserted": batch_inserted, "updated": batch_updated, "pages": 1},
-                        },
-                    )
+        if mode == "collections_upsert":
+            return await self._process_collections_batch(payload, ctx)
 
-                break  # completed without CircuitOpen
+        # default: search
+        return await self._process_search_page(payload, ctx)
 
-            except CircuitOpen as co:
-                if attempt >= INDEX_RETRY_MAX:
-                    err = f"circuit_open_retry_exhausted: {co}"
-                    await _send_status(
-                        prod,
-                        {
-                            "task_id": task_id,
-                            "status": "failed",
-                            "error": err,
-                            "error_message": err,
-                            "reason_code": "circuit_open_retry_exhausted",
-                            "trigger": trigger,
-                        },
-                    )
-                    logger.error(
-                        "circuit open retries exhausted",
-                        extra={"event": "failed", "task_id": task_id, "attempts": attempt, "reason_code": "circuit_open_retry_exhausted"},
-                    )
-                    return
-                delay = min(INDEX_RETRY_MAX_SEC, INDEX_RETRY_BASE_SEC * (2 ** (attempt - 1)))
-                await _send_status(
-                    prod,
-                    {"task_id": task_id, "status": "retrying", "attempt": attempt, "next_retry_in_sec": delay, "trigger": trigger},
-                )
-                logger.warning(
-                    "retrying after circuit open",
-                    extra={"event": "retrying", "task_id": task_id, "attempt": attempt, "delay_sec": delay},
-                )
-                await asyncio.sleep(delay)
+    async def _process_search_page(self, payload: Dict[str, Any], ctx: RunContext) -> BatchResult:
+        products = list(payload.get("products") or [])
+        page_no = int(payload.get("page_no") or 0)
+
+        batch_skus: List[str] = []
+        batch_inserted = 0
+        batch_updated = 0
+
+        for p in products:
+            if ctx.cancelled():
+                return BatchResult(success=False, reason_code="cancelled", permanent=False)
+
+            sku = str((p or {}).get("sku") or "").strip()
+            if not sku:
                 continue
 
-        await _send_status(prod, {"task_id": task_id, "status": "task_done", "done": True, "trigger": trigger})
-        logger.info(
-            "task done",
-            extra={
-                "event": "task_done",
-                "task_id": task_id,
-                "totals": {
-                    "indexed": totals_inserted + totals_updated,
-                    "inserted": totals_inserted,
-                    "updated": totals_updated,
-                    "pages": totals_pages,
-                },
-            },
-        )
-
-    except Exception as e:
-        await _send_status(
-            prod,
-            {"task_id": task_id, "status": "failed", "error": str(e), "error_message": str(e), "reason_code": "unexpected_error", "trigger": trigger},
-        )
-        logger.exception("task failed", extra={"event": "failed", "task_id": task_id, "reason_code": "unexpected_error"})
-
-
-# ---------- collections flow ----------
-
-async def _handle_add_collection_members(
-    task_id: str,
-    batch_id: Optional[int],
-    skus: List[str],
-    trigger: str,
-    prod: AIOKafkaProducer,
-) -> None:
-    is_finalize = str(trigger or "").lower().endswith("finalize")
-    logger.info(
-        "collections batch start",
-        extra={"event": "collections_start", "task_id": task_id, "batch_id": batch_id, "skus_count": len(skus)},
-    )
-    try:
-        if is_finalize or (not skus and batch_id is None):
-            await _send_status(
-                prod,
-                {"task_id": task_id, "status": "task_done", "done": True, "trigger": trigger},
-            )
-            logger.info("collections finalize", extra={"event": "collections_finalize", "task_id": task_id, "trigger": trigger})
-            return
-
-        if not skus:
-            await _send_status(
-                prod,
-                {
-                    "task_id": task_id,
-                    "status": "ok",
-                    "batch_id": batch_id,
-                    "trigger": trigger,
-                    "batch_data": {
-                        "batch_id": batch_id, "pages": 0, "skus": [],
-                        "inserted": 0, "updated": 0, "new_skus": []
-                    },
-                },
-            )
-            logger.info("collections batch empty", extra={"event": "collections_empty", "task_id": task_id, "batch_id": batch_id})
-            return
-
-        now_ts = _now_ts()
-        inserted = 0
-        updated = 0
-        new_skus: List[str] = []
-
-        for sku in [str(s).strip() for s in skus if str(s).strip()]:
             try:
                 res = await db.index.update_one(
                     {"sku": sku},
                     {
-                        "$set": {"last_seen_at": now_ts, "is_active": True, "task_id": task_id},
+                        "$set": {
+                            "last_seen_at": _now_ts(),
+                            "is_active": True,
+                            "status": "indexed_auto",    # как в старом коде
+                        },
+                        "$setOnInsert": {
+                            "first_seen_at": _now_ts(),
+                            "candidate_id": None,
+                            "sku": sku,
+                        },
+                    },
+                    upsert=True,
+                )
+                is_insert = res.upserted_id is not None
+                batch_inserted += int(is_insert)
+                batch_updated += int(not is_insert)
+                batch_skus.append(sku)
+            except Exception as e:
+                # не валим батч: просто логика best-effort
+                # координация ошибку на батче не требует, метрики отражают апсерты
+                # (можно добавить отдельную метрику "upsert_errors")
+                pass
+
+        metrics = {
+            "indexed": batch_inserted + batch_updated,
+            "inserted": batch_inserted,
+            "updated": batch_updated,
+            "pages": 1,
+        }
+        # artifacts_ref можно не возвращать — координатор использует метрики
+        return BatchResult(success=True, metrics=metrics)
+
+    async def _process_collections_batch(self, payload: Dict[str, Any], ctx: RunContext) -> BatchResult:
+        skus: List[str] = [str(s).strip() for s in (payload.get("skus") or []) if str(s).strip()]
+        if not skus:
+            return BatchResult(success=True, metrics={"pages": 0, "indexed": 0, "inserted": 0, "updated": 0})
+
+        now_ts = _now_ts()
+        inserted = 0
+        updated = 0
+
+        for sku in skus:
+            if ctx.cancelled():
+                return BatchResult(success=False, reason_code="cancelled", permanent=False)
+            try:
+                res = await db.index.update_one(
+                    {"sku": sku},
+                    {
+                        "$set": {
+                            "last_seen_at": now_ts,
+                            "is_active": True,
+                            "status": "pending_review",   # как в исходном collections-flow
+                        },
                         "$setOnInsert": {
                             "first_seen_at": now_ts,
                             "candidate_id": None,
                             "sku": sku,
-                            "status": "pending_review",
                         },
-                        # "$unset": {"collections": ""}  # не обязательно на каждом апсерте
                     },
                     upsert=True,
                 )
                 is_insert = res.upserted_id is not None
                 inserted += int(is_insert)
                 updated += int(not is_insert)
-                if is_insert:
-                    new_skus.append(sku)
             except Exception:
-                logger.error("index upsert (collections) failed", extra={"event": "index_upsert_failed", "task_id": task_id, "sku": sku})
+                # best-effort
+                pass
 
-        await _send_status(
-            prod,
-            {
-                "task_id": task_id,
-                "status": "ok",
-                "batch_id": batch_id,
-                "trigger": trigger,
-                "batch_data": {"batch_id": batch_id, "pages": 0, "skus": skus, "inserted": inserted, "updated": updated, "new_skus": new_skus},
-            },
-        )
-        logger.info(
-            "collections batch done",
-            extra={"event": "collections_ok", "task_id": task_id, "batch_id": batch_id, "counts": {"inserted": inserted, "updated": updated, "new_skus": len(new_skus)}},
-        )
-    except Exception as e:
-        await _send_status(
-            prod,
-            {"task_id": task_id, "status": "failed", "batch_id": batch_id, "error": str(e), "error_message": str(e), "reason_code": "unexpected_error", "trigger": trigger},
-        )
-        logger.exception("collections batch failed", extra={"event": "failed", "task_id": task_id, "batch_id": batch_id})
+        metrics = {
+            "indexed": inserted + updated,
+            "inserted": inserted,
+            "updated": updated,
+            "pages": 0,
+        }
+        return BatchResult(success=True, metrics=metrics)
 
+    # ── Финализация ─────────────────────────────────────────────────────
+    async def finalize(self, ctx: RunContext) -> Optional[FinalizeResult]:
+        # Для indexer в базовой версии ничего финализировать не требуется.
+        # Если нужна агрегация или выгрузка артефактов — добавьте здесь.
+        return FinalizeResult(metrics={})
 
-async def _map_sku_to_collection_hashes(task_id: str, skus: List[str]) -> Dict[str, Set[str]]:
-    mapping: Dict[str, Set[str]] = {s: set() for s in skus}
-    cur = db.collection_members.find(
-        {"task_id": task_id, "sku": {"$in": [str(s).strip() for s in skus]}},
-        {"collection_hash": 1, "sku": 1, "_id": 0},
-    )
-    async for doc in cur:
-        s = str(doc.get("sku") or "")
-        ch = doc.get("collection_hash")
-        if s and ch and s in mapping:
-            mapping[s].add(ch)
-    return mapping
-
-
-# ---------- kafka main ----------
-
-async def main() -> None:
-    cons = AIOKafkaConsumer(
-        TOPIC_INDEXER_CMD,
-        bootstrap_servers=BOOT,
-        group_id="indexer-worker",
-        value_deserializer=_loads,
-        auto_offset_reset="earliest",
-        enable_auto_commit=False,
-    )
-    prod = AIOKafkaProducer(bootstrap_servers=BOOT, value_serializer=_dumps, enable_idempotence=True)
-
-    await cons.start()
-    await prod.start()
-    logger.info("consumer/producer started", extra={"event": "boot"})
-    try:
-        async for msg in cons:
-            payload = msg.value or {}
-            logger.info("message received", extra={"event": "msg", "topic": TOPIC_INDEXER_CMD, "has_task_id": bool(payload.get("task_id")), "cmd": payload.get("cmd")})
-            try:
-                await _dispatch(payload, prod)
-                await cons.commit()
-                logger.info("message committed", extra={"event": "commit_ok"})
-            except Exception:
-                logger.exception("message processing failed", extra={"event": "task_failed"})
-    finally:
-        await cons.stop()
-        await prod.stop()
-        logger.info("consumer/producer stopped", extra={"event": "shutdown"})
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # ── Классификация ошибок ────────────────────────────────────────────
+    def classify_error(self, exc: BaseException) -> tuple[str, bool]:
+        # CircuitOpen — транзиентная (permanent=False), даём координатору отложить/ретраить
+        if isinstance(exc, CircuitOpen):
+            return ("circuit_open", False)
+        return ("unexpected_error", False)
