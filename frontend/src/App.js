@@ -7,6 +7,7 @@ import "./App.css";
 import DashboardPage from "./components/DashboardPage";
 import ScrapingPage from "./components/ScrapingPage";
 import ProductsPage from "./components/ProductsPage";
+import CollectionsPage from "./components/CollectionsPage";
 import TasksPage from "./components/TasksPage";
 
 // --- API instance ---
@@ -126,6 +127,7 @@ export default function App() {
               { id: "dashboard", label: "Dashboard", icon: "📊" },
               { id: "scraping", label: "Scraping", icon: "🔍" },
               { id: "products", label: "Products", icon: "🍃" },
+              { id: "collections", label: "Collections", icon: "🧺" },
               { id: "tasks", label: "Tasks", icon: "⚙️" },
             ].map((tab) => (
               <button
@@ -158,6 +160,8 @@ export default function App() {
             onPersist={setLastProductsQuery}
           />
         )}
+
+        {activeTab === "collections" && <CollectionsPage api={api} />}
 
         {activeTab === "tasks" && <TasksPage api={api} onOpenProducts={openProductsForTask} />}
       </main>
