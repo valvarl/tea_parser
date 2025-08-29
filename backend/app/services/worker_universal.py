@@ -475,6 +475,12 @@ class Worker:
         self._producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP, value_serializer=dumps, enable_idempotence=True)
         await self._producer.start()
 
+        self.active = self.state.read_active()
+        # если state от старого ран-а другой роли — игнорируем
+        if self.active and self.active.step_type not in self.roles:
+            self.active = None
+            await self.state.write_active(None)
+
         # Announce ONLINE (with resume info)
         await self._send_announce(EventKind.WORKER_ONLINE, extra={
             "worker_id": WORKER_ID, "type": ",".join(self.roles), "capabilities": {"roles": self.roles},
@@ -865,7 +871,7 @@ class Worker:
                         "reply": ReplyKind.TASK_SNAPSHOT,
                         "worker_id": None,
                         "run_state": "idle",
-                        "attempt_epoch": ar.attempt_epoch if ar else 0,
+                        "attempt_epoch": 0,
                         "lease": None,
                         "progress": None,
                         "artifacts": {"complete": complete} if complete else None

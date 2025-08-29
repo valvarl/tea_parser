@@ -309,6 +309,20 @@ class KafkaBus:
             await self._producer.stop()
         self._producer = None
 
+    def register_reply(self, corr_id: str) -> asyncio.Event:
+        ev = asyncio.Event()
+        self._replies[corr_id] = []
+        self._reply_events[corr_id] = ev
+        return ev
+    
+    def push_reply(self, corr_id: str, env: Envelope) -> None:
+        bucket = self._replies.get(corr_id)
+        if bucket is not None:
+            bucket.append(env)
+        ev = self._reply_events.get(corr_id)
+        if ev:
+            ev.set()
+
     def _topic_cmd(self, step_type: str) -> str:
         return TOPIC_CMD_FMT.format(type=step_type)
 
@@ -794,7 +808,23 @@ class Coordinator:
         node_id = node["node_id"]
         new_epoch = int(node.get("attempt_epoch", 0)) + 1
 
-        # Discover active/complete to avoid duplicate starts
+        # FAST-PATH: артефакт уже complete → просто завершаем ноду
+        try:
+            cnt = await db.artifacts.count_documents({"task_id": task_id, "node_id": node_id, "status": "complete"})
+            if cnt > 0:
+                await db.tasks.update_one(
+                    {"id": task_id, "graph.nodes.node_id": node_id},
+                    {"$set": {
+                        "graph.nodes.$.status": RunState.finished,
+                        "graph.nodes.$.finished_at": now_dt(),
+                        "graph.nodes.$.attempt_epoch": new_epoch
+                    }}
+                )
+                return
+        except Exception:
+            pass
+
+        # DISCOVER: регистрируем ожидание ответа и шлём запрос
         discover_env = Envelope(
             msg_type=MsgType.query,
             role=Role.coordinator,
@@ -805,28 +835,30 @@ class Coordinator:
             attempt_epoch=new_epoch,
             payload=QTaskDiscover(query=QueryKind.TASK_DISCOVER, want_epoch=new_epoch).model_dump()
         )
-        _ = self.bus.register_reply(discover_env.corr_id)
+        ev = self.bus.register_reply(discover_env.corr_id)
         await self._enqueue_query(discover_env)
 
+        # ждём хотя бы один ответ, но не дольше окна
         try:
-            await asyncio.sleep(DISCOVERY_WINDOW_SEC)
+            await asyncio.wait_for(ev.wait(), timeout=DISCOVERY_WINDOW_SEC)
         except asyncio.TimeoutError:
             pass
+
         replies = self.bus.collect_replies(discover_env.corr_id)
 
-        # If active with older epoch or finishing → set running
+        # Узел уже активен на старой эпохе → принимаем как running
         active = [r for r in replies if (r.payload.get("run_state") in ("running", "finishing")
-                                         and r.payload.get("attempt_epoch") == node.get("attempt_epoch"))]
+                                        and r.payload.get("attempt_epoch") == node.get("attempt_epoch"))]
         if active:
             await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
-                                      {"$set": {"graph.nodes.$.status": RunState.running}})
+                                    {"$set": {"graph.nodes.$.status": RunState.running}})
             return
 
-        # If complete artifacts → mark finished
+        # Если кто-то сообщил, что артефакт уже complete → завершаем
         complete = any((r.payload.get("artifacts") or {}).get("complete") for r in replies)
         if complete:
             await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
-                                      {"$set": {"graph.nodes.$.status": RunState.finished,
+                                    {"$set": {"graph.nodes.$.status": RunState.finished,
                                                 "graph.nodes.$.finished_at": now_dt(),
                                                 "graph.nodes.$.attempt_epoch": new_epoch}})
             return
