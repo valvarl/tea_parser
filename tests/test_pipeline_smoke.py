@@ -1,4 +1,3 @@
-# tests/test_pipeline_smoke.py
 import pytest
 import pytest_asyncio
 
@@ -78,7 +77,7 @@ async def test_e2e_streaming_with_kafka_sim(env_and_imports, inmemory_db, coordi
     assert st["w5"] == cd.RunState.finished
     assert st["w4"] == cd.RunState.finished
 
-    # есть partial у w1,w2,w5
+    # есть partial/complete артефакты у w1,w2,w5 (batch_uid-based)
     assert await inmemory_db.artifacts.count_documents({"task_id": task_id, "node_id": "w1"}) > 0
     assert await inmemory_db.artifacts.count_documents({"task_id": task_id, "node_id": "w2"}) > 0
     assert await inmemory_db.artifacts.count_documents({"task_id": task_id, "node_id": "w5"}) > 0

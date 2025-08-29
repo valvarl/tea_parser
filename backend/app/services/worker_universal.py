@@ -1,4 +1,4 @@
-# worker_universal.py  (v2.0 stream-aware, pull.from_artifacts, resilient batching)
+# worker_universal.py  (v2.0 stream-aware, pull.from_artifacts, resilient batching — batch_uid only)
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +11,7 @@ import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List, Literal, AsyncIterator, Tuple, Callable
+from typing import Any, Dict, Optional, List, Literal, AsyncIterator, Callable
 from enum import Enum
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -99,7 +99,6 @@ class EventKind(str, Enum):
     WORKER_OFFLINE = "WORKER_OFFLINE"
     TASK_ACCEPTED = "TASK_ACCEPTED"
     TASK_HEARTBEAT = "TASK_HEARTBEAT"
-    BATCH_CLAIMED = "BATCH_CLAIMED"
     BATCH_OK = "BATCH_OK"
     BATCH_FAILED = "BATCH_FAILED"
     TASK_DONE = "TASK_DONE"
@@ -192,7 +191,7 @@ class RunContext:
         return self._cancel_flag.is_set()
 
 class Batch(BaseModel):
-    shard_id: Optional[str] = None
+    batch_uid: Optional[str] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 class BatchResult(BaseModel):
@@ -223,7 +222,7 @@ class RoleHandler:
 
     async def iter_batches(self, loaded: Any) -> AsyncIterator[Batch]:
         # default: single batch with inline payload
-        yield Batch(shard_id=None, payload=loaded or {})
+        yield Batch(batch_uid=None, payload=loaded or {})
 
     async def process_batch(self, batch: Batch, ctx: RunContext) -> BatchResult:
         # default: no-op success
@@ -251,8 +250,8 @@ class PullAdapters:
     """
     Реализация pull.from_artifacts:
     - Источник: db.artifacts (upstream node(s), status=partial)
-    - Клейм шардов: db.stream_progress с уникальным ключом (task_id, consumer_node, from_node, shard_id)
-    - Остановка: если все from_nodes помечены как complete и новых шардов нет.
+    - Клейм батчей: db.stream_progress с уникальным ключом (task_id, consumer_node, from_node, batch_uid)
+    - Остановка: если все from_nodes помечены как complete и новых батчей нет.
     """
 
     @staticmethod
@@ -267,7 +266,7 @@ class PullAdapters:
     ) -> AsyncIterator[Batch]:
 
         # На случай «немого» in-mem драйвера сделаем мягкий in-process клейм,
-        # чтобы не дублировать шарды при фолбэке.
+        # чтобы не дублировать батчи при фолбэке.
         claimed_mem: set[tuple[str, str, str, str]] = set()
         if not from_nodes:
             return
@@ -284,16 +283,15 @@ class PullAdapters:
                 for src in from_nodes:
                     matched = 0
                     used_fallback = False
-                    # Ищем partial-шарды этого src
-                    # Берём небольшими пачками, чтобы не держать курсор долго
+                    # Ищем partial-батчи этого src
                     try:
                         cur = db.artifacts.find(
                             {"task_id": task_id, "node_id": src, "status": "partial"},
-                            {"_id": 0, "task_id": 1, "node_id": 1, "shard_id": 1, "meta": 1, "created_at": 1}
+                            {"_id": 0, "task_id": 1, "node_id": 1, "batch_uid": 1, "meta": 1, "created_at": 1}
                         ).sort([("created_at", 1)]).limit(200)
                         async for a in cur:
-                            shard_id = a.get("shard_id")
-                            if not shard_id:
+                            batch_uid = a.get("batch_uid")
+                            if not batch_uid:
                                 continue
                             # Попытка клейма: уникальный insert
                             try:
@@ -301,7 +299,7 @@ class PullAdapters:
                                     "task_id": task_id,
                                     "consumer_node": consumer_node,
                                     "from_node": src,
-                                    "shard_id": shard_id,
+                                    "batch_uid": batch_uid,
                                     "claimed_at": now_dt()
                                 })
                             except Exception:
@@ -311,10 +309,10 @@ class PullAdapters:
                             got_any = True
                             backoff_ms = poll_ms  # сброс бэк-оффа
                             yield Batch(
-                                shard_id=shard_id,
+                                batch_uid=batch_uid,
                                 payload={
                                     "from_node": src,
-                                    "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
+                                    "ref": {"task_id": task_id, "node_id": src, "batch_uid": batch_uid},
                                     "meta": a.get("meta") or {}
                                 }
                             )
@@ -326,10 +324,8 @@ class PullAdapters:
                             for a in list(rows):
                                 if a.get("task_id") != task_id or a.get("node_id") != src or a.get("status") != "partial":
                                     continue
-                                shard_id = a.get("shard_id")
-                                if not shard_id:
-                                    continue
-                                key = (task_id, consumer_node, src, shard_id)
+                                batch_uid = a.get("batch_uid") or stable_hash({"task_id": task_id, "node_id": src, "meta": a.get("meta", {})})
+                                key = (task_id, consumer_node, src, batch_uid)
                                 if key in claimed_mem:
                                     continue
                                 # Попробуем зафиксировать claim и в коллекции (если есть)
@@ -338,7 +334,7 @@ class PullAdapters:
                                         "task_id": task_id,
                                         "consumer_node": consumer_node,
                                         "from_node": src,
-                                        "shard_id": shard_id,
+                                        "batch_uid": batch_uid,
                                         "claimed_at": now_dt()
                                     })
                                 except Exception:
@@ -348,10 +344,10 @@ class PullAdapters:
                                 got_any = True
                                 backoff_ms = poll_ms
                                 yield Batch(
-                                    shard_id=shard_id,
+                                    batch_uid=batch_uid,
                                     payload={
                                         "from_node": src,
-                                        "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
+                                        "ref": {"task_id": task_id, "node_id": src, "batch_uid": batch_uid},
                                         "meta": (a.get("meta") or {})
                                     }
                                 )
@@ -362,7 +358,7 @@ class PullAdapters:
                 if got_any:
                     continue
 
-                # Нет новых шардов — проверим EOF
+                # Нет новых батчей — проверим EOF
                 if eof_on_task_done:
                     all_complete = True
                     for src in from_nodes:
@@ -407,6 +403,7 @@ class PullAdapters:
         """
         Обёртка над iter_from_artifacts: вытаскивает из meta список и режет его на чанки по size.
         Эвристика ключа списка: meta_list_key → items → skus → enriched → ocr.
+        Каждый дочерний чанк получает новый стабильный batch_uid = sha1({src,parent_uid,idx}).
         """
         if size <= 0:
             size = 1
@@ -423,8 +420,7 @@ class PullAdapters:
             )
             async for b in base:
                 src = (b.payload or {}).get("from_node") or (b.payload or {}).get("ref", {}).get("node_id")
-                ref = (b.payload or {}).get("ref") or {}
-                orig_shard = ref.get("shard_id") or b.shard_id or "sh"
+                parent_uid = b.batch_uid or stable_hash({"payload": b.payload})
                 meta = (b.payload or {}).get("meta") or {}
 
                 # Найти список
@@ -436,16 +432,16 @@ class PullAdapters:
                             break
                 items = meta.get(key) if key else None
                 if not isinstance(items, list):
-                    # fallback: трактуем мету целиком как единичный элемент
                     items = [meta]
 
                 # Нарезка
                 idx = 0
                 for i in range(0, len(items), size):
                     chunk = items[i:i+size]
+                    chunk_uid = stable_hash({"src": src, "parent": parent_uid, "idx": idx})
                     yield Batch(
-                        shard_id=f"{src}-{orig_shard}-{idx}",
-                        payload={"from_node": src, "items": chunk, "parent": {"ref": ref, "list_key": key}}
+                        batch_uid=chunk_uid,
+                        payload={"from_node": src, "items": chunk, "parent": {"ref": {"batch_uid": parent_uid}, "list_key": key}}
                     )
                     idx += 1
 
@@ -468,16 +464,27 @@ class ArtifactsWriter:
         self.attempt_epoch = attempt_epoch
         self.worker_id = worker_id
 
-    async def upsert_partial(self, shard_id: Optional[str], meta: Dict[str, Any]) -> Dict[str, Any]:
+    async def upsert_partial(self, batch_uid: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Идемпотентный partial по batch_uid.
+        """
+        if not batch_uid:
+            raise ValueError("batch_uid is required for partial artifact")
+        filt = {"task_id": self.task_id, "node_id": self.node_id, "batch_uid": batch_uid}
         await db.artifacts.update_one(
-            {"task_id": self.task_id, "node_id": self.node_id, "shard_id": shard_id},
-            {"$setOnInsert": {"task_id": self.task_id, "node_id": self.node_id, "attempt_epoch": self.attempt_epoch,
-                              "status": "partial", "worker_id": self.worker_id, "payload": None,
-                              "created_at": now_dt()},
-             "$set": {"meta": meta, "updated_at": now_dt()}},
+            filt,
+            {"$setOnInsert": {
+                "task_id": self.task_id, "node_id": self.node_id,
+                "attempt_epoch": self.attempt_epoch, "status": "partial",
+                "worker_id": self.worker_id, "payload": None,
+                "created_at": now_dt()
+            },
+             "$set": {"status": "partial", "meta": meta or {},
+                      "batch_uid": batch_uid,
+                      "updated_at": now_dt()}},
             upsert=True
         )
-        return {"task_id": self.task_id, "node_id": self.node_id, "shard_id": shard_id}
+        return {"task_id": self.task_id, "node_id": self.node_id, "batch_uid": batch_uid}
 
     async def mark_complete(self, meta: Dict[str, Any], artifacts_ref: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         await db.artifacts.update_one(
@@ -511,6 +518,11 @@ class Worker:
 
         self._main_tasks: set[asyncio.Task] = set()
         self._stopping = False
+
+    # Helper to derive a stable uid when handler/adapter didn't set it
+    @staticmethod
+    def _derive_batch_uid(batch: Batch) -> str:
+        return str(batch.batch_uid) if batch.batch_uid else stable_hash({"payload": batch.payload})
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -745,13 +757,12 @@ class Worker:
                         consumer_node=self.active.node_id,
                         from_nodes=from_nodes,
                         cancel_flag=self._cancel_flag,
-                        **adapter_kwargs,  # <-- тут приходят size, meta_list_key и пр.
+                        **adapter_kwargs,
                     )
                     async for b in it:
-                        # Диагностика: что реально прилетело аналайзеру
                         if isinstance(b.payload, dict):
                             _cnt = len(b.payload.get("items") or b.payload.get("skus") or [])
-                            log(event="adapter_batch", node=self.active.node_id, shard=b.shard_id, items=_cnt)
+                            log(event="adapter_batch", node=self.active.node_id, batch_uid=b.batch_uid, items=_cnt)
                         yield b
 
                 batch_iter = _iter_batches_adapter()
@@ -764,6 +775,9 @@ class Worker:
                 if self._cancel_flag.is_set():
                     raise asyncio.CancelledError()
 
+                # стабильный идентификатор батча
+                uid = self._derive_batch_uid(batch)
+
                 try:
                     res = await handler.process_batch(batch, ctx)
                 except asyncio.CancelledError:
@@ -774,25 +788,17 @@ class Worker:
                     res = BatchResult(success=False, reason_code=reason, permanent=permanent, error=str(e), metrics={})
 
                 if res.success:
-                    # Идемпотентный partial (если есть shard_id)
                     artifacts_ref = res.artifacts_ref
-                    if batch.shard_id is not None:
-                        try:
-                            await artifacts.upsert_partial(batch.shard_id, res.metrics or {})
-                        except Exception as e:
-                            # Ошибка записи partial — всё равно отправим BATCH_OK, чтобы координатор мог принять решение,
-                            # но приложим минимальный artifacts_ref
-                            log(level="ERROR", msg="upsert_partial failed", shard_id=batch.shard_id, error=str(e))
+                    try:
+                        artifacts_ref = await artifacts.upsert_partial(uid, res.metrics or {})
+                    except Exception as e:
+                        log(level="ERROR", msg="upsert_partial failed", batch_uid=uid, error=str(e))
                         if not artifacts_ref:
-                            artifacts_ref = {"shard_id": batch.shard_id}
-
-                    await self._emit_batch_ok(role, start_env, batch, res, override_artifacts_ref=artifacts_ref)
+                            artifacts_ref = {"batch_uid": uid}
+                    await self._emit_batch_ok(role, start_env, batch, res, uid, override_artifacts_ref=artifacts_ref)
                 else:
-                    # Сообщаем про упавший батч и продолжим (если не permanent)
-                    artifacts_ref = None
-                    if batch.shard_id is not None:
-                        artifacts_ref = {"shard_id": batch.shard_id}
-                    await self._emit_batch_failed(role, start_env, batch, res, override_artifacts_ref=artifacts_ref)
+                    artifacts_ref = {"batch_uid": uid}
+                    await self._emit_batch_failed(role, start_env, batch, res, uid, override_artifacts_ref=artifacts_ref)
                     if res.permanent:
                         raise RuntimeError(f"permanent:{res.reason_code or 'error'}")
 
@@ -836,30 +842,45 @@ class Worker:
             return
 
     # ── Status emitters ────────────────────────────────────────────────
-    async def _emit_batch_ok(self, role: str, base: Envelope, batch: Batch, res: BatchResult, override_artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
+    async def _emit_batch_ok(
+        self, role: str, base: Envelope, batch: Batch, res: BatchResult, batch_uid: str,
+        override_artifacts_ref: Optional[Dict[str, Any]] = None
+    ) -> None:
         artifacts_ref = override_artifacts_ref if override_artifacts_ref is not None else res.artifacts_ref
         env = Envelope(
             msg_type=MsgType.event, role=RoleKind.worker,
-            dedup_id=stable_hash({"bok": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "shard": batch.shard_id, "m": res.metrics}),
+            dedup_id=stable_hash({"bok": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "uid": batch_uid, "m": res.metrics}),
             task_id=base.task_id, node_id=base.node_id, step_type=role, attempt_epoch=base.attempt_epoch,
-            payload={"kind": EventKind.BATCH_OK, "worker_id": WORKER_ID, "batch_id": None,
-                     "metrics": res.metrics or {}, "artifacts_ref": artifacts_ref}
+            payload={
+                "kind": EventKind.BATCH_OK, "worker_id": WORKER_ID,
+                "batch_uid": batch_uid,
+                "metrics": res.metrics or {},
+                "artifacts_ref": artifacts_ref
+            }
         )
         try:
             c = (res.metrics or {}).get("count")
-            log(event="emit_batch_ok", node=base.node_id, shard=batch.shard_id, count=c, metrics=res.metrics)
+            log(event="emit_batch_ok", node=base.node_id, batch_uid=batch_uid, count=c, metrics=res.metrics)
         except Exception:
             pass
         await self._send_status(role, env)
 
-    async def _emit_batch_failed(self, role: str, base: Envelope, batch: Batch, res: BatchResult, override_artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
+    async def _emit_batch_failed(
+        self, role: str, base: Envelope, batch: Batch, res: BatchResult, batch_uid: str,
+        override_artifacts_ref: Optional[Dict[str, Any]] = None
+    ) -> None:
         env = Envelope(
             msg_type=MsgType.event, role=RoleKind.worker,
-            dedup_id=stable_hash({"bf": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "shard": batch.shard_id, "r": res.reason_code}),
+            dedup_id=stable_hash({"bf": base.task_id, "n": base.node_id, "e": base.attempt_epoch, "uid": batch_uid, "r": res.reason_code}),
             task_id=base.task_id, node_id=base.node_id, step_type=role, attempt_epoch=base.attempt_epoch,
-            payload={"kind": EventKind.BATCH_FAILED, "worker_id": WORKER_ID, "batch_id": None,
-                     "reason_code": res.reason_code or "error", "permanent": bool(res.permanent), "error": res.error,
-                     "artifacts_ref": override_artifacts_ref}
+            payload={
+                "kind": EventKind.BATCH_FAILED, "worker_id": WORKER_ID,
+                "batch_uid": batch_uid,
+                "reason_code": res.reason_code or "error",
+                "permanent": bool(res.permanent),
+                "error": res.error,
+                "artifacts_ref": override_artifacts_ref
+            }
         )
         await self._send_status(role, env)
 
@@ -868,7 +889,9 @@ class Worker:
             msg_type=MsgType.event, role=RoleKind.worker,
             dedup_id=stable_hash({"td": base.task_id, "n": base.node_id, "e": base.attempt_epoch}),
             task_id=base.task_id, node_id=base.node_id, step_type=role, attempt_epoch=base.attempt_epoch,
-            payload={"kind": EventKind.TASK_DONE, "worker_id": WORKER_ID, "metrics": metrics or {}, "artifacts_ref": artifacts_ref}
+            payload={"kind": EventKind.TASK_DONE, "worker_id": WORKER_ID,
+                     "metrics": metrics or {}, "artifacts_ref": artifacts_ref,
+                     "final_uid": "__final__"}
         )
         await self._send_status(role, env)
 
@@ -957,11 +980,14 @@ class Worker:
     async def _ensure_indexes(self) -> None:
         try:
             await db.artifacts.create_index([("task_id", 1), ("node_id", 1)], name="ix_artifacts_task_node")
-            await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("shard_id", 1)], unique=True, sparse=True, name="uniq_artifact_shard")
+            await db.artifacts.create_index(
+                [("task_id", 1), ("node_id", 1), ("batch_uid", 1)],
+                unique=True, sparse=True, name="uniq_artifact_batch_uid"
+            )
             await db.stream_progress.create_index(
-                [("task_id", 1), ("consumer_node", 1), ("from_node", 1), ("shard_id", 1)],
+                [("task_id", 1), ("consumer_node", 1), ("from_node", 1), ("batch_uid", 1)],
                 unique=True,
-                name="uniq_stream_claim"
+                name="uniq_stream_claim_batch"
             )
         except Exception:
             pass

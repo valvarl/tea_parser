@@ -1,20 +1,25 @@
-# tests/helpers/pipeline_sim.py
 import asyncio
 import random
 import sys
 import os
 import time
+import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 
 # ====================== tiny logger ======================
-def _ts() -> str: 
+def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
 
 def dbg(tag: str, **kv):
     kvs = " ".join(f"{k}={kv[k]!r}" for k in kv)
     print(f"[{_ts()}] {tag}: {kvs}", flush=True)
+
+def stable_hash(payload: Any) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha1(data.encode("utf-8")).hexdigest()
 
 # ---------------------- Chaos config/engine -----------------------------
 @dataclass
@@ -49,7 +54,6 @@ class ChaosMonkey:
         self.rng = random.Random(cfg.seed)
 
     def _topic_prob(self, topic: str, table: Dict[str, float]) -> float:
-        # match by prefix
         for pref, p in table.items():
             if topic.startswith(pref): return p
         return 0.0
@@ -105,7 +109,7 @@ class InMemKafkaBroker:
         self.chaos = chaos or ChaosMonkey(ChaosConfig())
 
     def reset(self):
-        """Полный сброс состояния брокера без смены объекта."""
+        """Полный сброс состояния брокера без смены объекта (важно для общих хелперов между файлами)."""
         self.topics.clear()
         self.rev.clear()
         self.chaos = ChaosMonkey(ChaosConfig())
@@ -125,7 +129,6 @@ class InMemKafkaBroker:
         return self.rev.get(id(q), "?")
 
     async def produce(self, topic: str, value: Any):
-        # chaos: delay + drop + duplicate
         await self.chaos.broker_jitter()
         payload = value
         msg_type = payload.get("msg_type")
@@ -146,7 +149,7 @@ class InMemKafkaBroker:
 BROKER = InMemKafkaBroker()
 
 def reset_broker():
-    """Полный сброс in-mem Kafka между тестами."""
+    """Полный сброс in-mem Kafka между тестами / файлами."""
     BROKER.reset()
 
 class AIOKafkaProducerMockChaos:
@@ -223,7 +226,6 @@ class AIOKafkaConsumerMock:
 
     async def stop(self):
         dbg("CONSUMER.STOP", group_id=self._group)
-        # NEW: удаляем очередь группы с каждого топика
         for t in self._topics:
             tg = BROKER.topics.get(t)
             if tg:
@@ -281,6 +283,39 @@ class InMemCollection:
             return x.value if isinstance(x, Enum) else x
 
         for k, v in (flt or {}).items():
+            # $elemMatch for graph.nodes
+            if k == "graph.nodes" and isinstance(v, dict) and "$elemMatch" in v:
+                cond = v["$elemMatch"] or {}
+                nodes = (((doc.get("graph") or {}).get("nodes")) or [])
+                node_ok = False
+                for n in nodes:
+                    ok = True
+                    for ck, cv in cond.items():
+                        val = self._get_path(n, ck)
+                        val = _norm(val)
+                        if isinstance(cv, dict):
+                            if "$in" in cv:
+                                in_list = [_norm(x) for x in cv["$in"]]
+                                if val not in in_list: ok = False; break
+                            if "$ne" in cv:
+                                if val == _norm(cv["$ne"]): ok = False; break
+                            if "$lte" in cv:
+                                if not (val is not None and val <= _norm(cv["$lte"])): ok = False; break
+                            if "$lt" in cv:
+                                if not (val is not None and val < _norm(cv["$lt"])): ok = False; break
+                            if "$gte" in cv:
+                                if not (val is not None and val >= _norm(cv["$gte"])): ok = False; break
+                            if "$gt" in cv:
+                                if not (val is not None and val > _norm(cv["$gt"])): ok = False; break
+                        else:
+                            if _norm(cv) != val: ok = False; break
+                    if ok:
+                        node_ok = True
+                        break
+                if not node_ok:
+                    return False
+                continue
+
             val = self._get_path(doc, k)
             val = _norm(val)
 
@@ -293,20 +328,16 @@ class InMemCollection:
                     if val == _norm(v["$ne"]):
                         return False
                 if "$lte" in v:
-                    if not (val is not None and val <= _norm(v["$lte"])):
-                        return False
+                    if not (val is not None and val <= _norm(v["$lte"])): return False
                 if "$lt" in v:
-                    if not (val is not None and val < _norm(v["$lt"])):
-                        return False
+                    if not (val is not None and val < _norm(v["$lt"])): return False
                 if "$gte" in v:
-                    if not (val is not None and val >= _norm(v["$gte"])):
-                        return False
+                    if not (val is not None and val >= _norm(v["$gte"])): return False
                 if "$gt" in v:
-                    if not (val is not None and val > _norm(v["$gt"])):
-                        return False
+                    if not (val is not None and val > _norm(v["$gt"])): return False
                 continue
 
-            # спец-случай для проверки наличия node_id в списке узлов графа
+            # спец-случай для прямой проверки наличия node_id в списке узлов графа
             if k == "graph.nodes.node_id":
                 nodes = (((doc.get("graph") or {}).get("nodes")) or [])
                 if not any((n.get("node_id") == v) for n in nodes):
@@ -319,6 +350,21 @@ class InMemCollection:
         return True
 
     async def insert_one(self, doc):
+        # ── emulate unique constraints for some collections ──
+        if self.name == "stream_progress":
+            # unique (task_id, consumer_node, from_node, batch_uid)
+            tk = (doc.get("task_id"), doc.get("consumer_node"), doc.get("from_node"), doc.get("batch_uid"))
+            for r in self.rows:
+                if (r.get("task_id"), r.get("consumer_node"), r.get("from_node"), r.get("batch_uid")) == tk:
+                    # как в Mongo: бросаем ошибку дубликата, адаптер это ожидает и пропустит батч
+                    raise Exception("duplicate key: stream_progress")
+        elif self.name == "metrics_raw":
+            # unique (task_id, node_id, batch_uid) — опционально, но безопасно
+            tk = (doc.get("task_id"), doc.get("node_id"), doc.get("batch_uid"))
+            for r in self.rows:
+                if (r.get("task_id"), r.get("node_id"), r.get("batch_uid")) == tk:
+                    raise Exception("duplicate key: metrics_raw")
+
         self.rows.append(dict(doc))
         if self.name == "outbox":
             dbg("DB.OUTBOX.INSERT", size=len(self.rows), doc_keys=list(doc.keys()))
@@ -382,7 +428,6 @@ class InMemCollection:
                             cur[p] = [] if parts[i + 1].isdigit() else {}
                         cur = cur[p]
 
-        # $setOnInsert — только при fresh upsert
         if "$setOnInsert" in upd and created:
             for k, v in upd["$setOnInsert"].items():
                 set_path(doc, k, v)
@@ -404,7 +449,7 @@ class InMemCollection:
                 parts = k.split(".")
                 cur = doc
                 for i, p in enumerate(parts):
-                    if p == "$":  # подставляем индекс найденного узла
+                    if p == "$":
                         p = str(node_idx)
                     last = (i == len(parts) - 1)
 
@@ -416,7 +461,6 @@ class InMemCollection:
                             cur[idx] = int((cur[idx] or 0)) + int(v) if isinstance(cur[idx], (int, float)) else int(v)
                         else:
                             if not isinstance(cur[idx], (dict, list)):
-                                # заранее создаём нужный контейнер
                                 cur[idx] = [] if (i + 1 < len(parts) and parts[i + 1].isdigit()) else {}
                             cur = cur[idx]
                     else:
@@ -467,17 +511,21 @@ class InMemCollection:
 
 class InMemDB:
     def __init__(self):
-        self.tasks          = InMemCollection("tasks")
-        self.worker_events  = InMemCollection("worker_events")
-        self.worker_registry= InMemCollection("worker_registry")
-        self.artifacts      = InMemCollection("artifacts")
-        self.outbox         = InMemCollection("outbox")
-        self.metrics_anchors= InMemCollection("metrics_anchors")
-        self.stream_progress= InMemCollection("stream_progress")
+        self.tasks           = InMemCollection("tasks")
+        self.worker_events   = InMemCollection("worker_events")
+        self.worker_registry = InMemCollection("worker_registry")
+        self.artifacts       = InMemCollection("artifacts")
+        self.outbox          = InMemCollection("outbox")
+        self.metrics_anchors = InMemCollection("metrics_anchors")
+        self.stream_progress = InMemCollection("stream_progress")
+        self.metrics_raw     = InMemCollection("metrics_raw")
 
 # ====================== setup helpers ====================
 def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyzer") -> Tuple[Any, Any]:
-    """Подготавливает окружение, патчит Kafka на in-mem и возвращает (coordinator_dag, worker_universal)."""
+    """
+    Подготавливает окружение, патчит Kafka на in-mem и возвращает (coordinator_dag, worker_universal).
+    ВАЖНО: делает жёсткий сброс брокера и переимпорт модулей — чтобы разные файлы тестов не конфликтовали.
+    """
     reset_broker()
 
     monkeypatch.setenv("WORKER_TYPES", worker_types)
@@ -513,7 +561,7 @@ def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyz
     cd.FINALIZER_TICK_SEC = 0.05
     cd.HB_MONITOR_TICK_SEC = 0.2
 
-    # outbox: по умолчанию — байпас в тестах (можно выключить выставив TEST_USE_OUTBOX=1)
+    # outbox: по умолчанию — байпас в тестах (можно выключить, выставив TEST_USE_OUTBOX=1)
     if os.getenv("TEST_USE_OUTBOX", "0") != "1":
         async def _enqueue_direct(self, *, topic: str, key: str, env):
             dbg("OUTBOX.BYPASS", topic=topic)
@@ -572,16 +620,14 @@ def build_graph(total_skus=12, batch_size=5, mini_batch=2) -> Dict[str, Any]:
 def prime_graph(cd, graph: Dict[str, Any]) -> Dict[str, Any]:
     for n in graph.get("nodes", []):
         st = n.get("status")
-        # если нет или None/пустая строка — приводим к queued
         if st is None or (isinstance(st, str) and not st.strip()):
             n["status"] = cd.RunState.queued
-        # остальное оставляем
         n.setdefault("attempt_epoch", 0)
         n.setdefault("stats", {})
         n.setdefault("lease", {})
     return graph
 
-async def wait_task_finished(db: InMemDB, task_id: str, timeout: float = 10.0) -> Dict[str, Any]:
+async def wait_task_finished(db: InMemDB, task_id: str, timeout: float = 10.0) -> Dict[str, Any]: 
     t0 = time.time()
     last_log = 0.0
     while time.time() - t0 < timeout:
@@ -603,7 +649,10 @@ async def wait_task_finished(db: InMemDB, task_id: str, timeout: float = 10.0) -
 
 # ====================== test handlers ===================
 def make_test_handlers(wu) -> Dict[str, Any]:
-    """Хендлеры с эмуляцией адаптера pull.from_artifacts.rechunk:size прямо в тестах."""
+    """
+    Хендлеры с эмуляцией pull.from_artifacts и pull.from_artifacts.rechunk:size прямо в тестах.
+    Теперь ВСЁ batch_uid-based (shard_id удалён полностью).
+    """
     class IndexerHandler(wu.RoleHandler):
         role = "indexer"
         async def load_input(self, ref, inline):
@@ -613,15 +662,13 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             total = int(loaded.get("total_skus", 12))
             bs = int(loaded.get("batch_size", 5))
             skus = [f"sku-{i}" for i in range(total)]
-            shard = 0
-            for i in range(0, total, bs):
-                chunk = skus[i:i+bs]
-                dbg("HNDL.indexer.yield", shard=shard, count=len(chunk))
-                yield wu.Batch(shard_id=f"w1-{shard}", payload={"skus": chunk})
-                shard += 1
+            for idx in range(0, total, bs):
+                chunk = skus[idx:idx+bs]
+                uid = stable_hash({"node": "w1", "idx": idx // bs})
+                dbg("HNDL.indexer.yield", batch_uid=uid, count=len(chunk))
+                yield wu.Batch(batch_uid=uid, payload={"skus": chunk})
         async def process_batch(self, batch, ctx):
-            dbg("HNDL.indexer.proc", shard=batch.shard_id)
-            # ⬇️ NEW: чуть-чуть «реализма», чтобы тест 2 не ломался
+            dbg("HNDL.indexer.proc", batch_uid=batch.batch_uid)
             delay = float(os.getenv("TEST_IDX_PROCESS_SLEEP_SEC", "0.5"))
             await asyncio.sleep(delay)
             return wu.BatchResult(
@@ -630,59 +677,59 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             )
 
     class _PullFromArtifactsMixin:
-        async def _emit_from_artifacts(self, *, from_nodes: List[str], size: int, meta_key: str, poll: float, shard_prefix: str):
-            # ключ -> множество уже отданных элементов
+        async def _emit_from_artifacts(self, *, from_nodes: List[str], size: int, meta_key: str, poll: float, role_tag: str):
+            """
+            Читает partial/complete из in-mem artifacts, режет списки по size.
+            Каждый выходной батч получает batch_uid = sha1({src, parent_uid, idx}),
+            где parent_uid — batch_uid родительского partial-артефакта.
+            """
             if not hasattr(self, "_emitted_items"):
-                self._emitted_items = {}  # {(node, shard): set(items)}
+                self._emitted_items = {}  # {(node, parent_uid): set(items)}
 
-            completed = set()
+            completed_nodes = set()
             while True:
                 progressed = False
-                has_unseen = False  # есть ли где-то ещё невыданные элементы
+                has_unseen = False
 
                 for doc in list(wu.db.artifacts.rows):
                     node_id = doc.get("node_id")
                     if node_id not in from_nodes:
                         continue
 
-                    shard_id = doc.get("shard_id") or ""
-                    key = (node_id, shard_id)
-
-                    meta  = doc.get("meta") or {}
+                    parent_uid = doc.get("batch_uid")  # ключевой идентификатор родителя
+                    meta  = (doc.get("meta") or {})
                     items = list(meta.get(meta_key) or [])
 
                     if doc.get("status") == "complete":
-                        # фиксируем факт завершения источника, но НЕ выходим из цикла,
-                        # пока не убедимся, что в partial-шардах нет невиданных элементов
-                        completed.add(node_id)
+                        completed_nodes.add(node_id)
                         continue
 
-                    # partial-шард
-                    seen = self._emitted_items.get(key, set())
+                    seen_key = (node_id, parent_uid)
+                    seen = self._emitted_items.get(seen_key, set())
                     new_items = [x for x in items if x not in seen]
                     if new_items:
+                        idx_local = 0
                         for i in range(0, len(new_items), size):
                             chunk = new_items[i:i+size]
-                            dbg("HNDL.emit", src=node_id, shard=shard_id, chunk=len(chunk), role=shard_prefix)
+                            chunk_uid = stable_hash({"src": node_id, "parent": parent_uid, "idx": idx_local})
+                            dbg("HNDL.emit", src=node_id, parent_uid=parent_uid, batch_uid=chunk_uid, chunk=len(chunk), role=role_tag)
                             yield wu.Batch(
-                                shard_id=f"{node_id}:{shard_id}:{i//size}",
-                                payload={"items": chunk},
+                                batch_uid=chunk_uid,
+                                payload={"items": chunk, "parent": {"batch_uid": parent_uid, "list_key": meta_key}},
                             )
                             progressed = True
-                        # помечаем выданными только после успешной отдачи
+                            idx_local += 1
                         seen.update(new_items)
-                        self._emitted_items[key] = seen
+                        self._emitted_items[seen_key] = seen
 
-                    # если что-то осталось невиданным — помечаем
                     if any(x not in seen for x in items):
                         has_unseen = True
 
-                # Выходим ТОЛЬКО когда все источники завершены и невиданных элементов нет.
-                if all(n in completed for n in from_nodes) and not has_unseen:
+                if all(n in completed_nodes for n in from_nodes) and not has_unseen:
                     break
                 if not progressed:
                     await asyncio.sleep(poll)
-    
+
     class EnricherHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "enricher"
         async def load_input(self, ref, inline):
@@ -695,7 +742,7 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             size = int(args.get("size", 1))
             meta_key = args.get("meta_list_key", "items")
             poll = float(args.get("poll_ms", 50)) / 1000.0
-            async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, shard_prefix="enricher"):
+            async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="enricher"):
                 yield b
         async def process_batch(self, batch, ctx):
             items = batch.payload.get("items")
@@ -704,7 +751,6 @@ def make_test_handlers(wu) -> Dict[str, Any]:
                 return wu.BatchResult(success=True, metrics={"noop": 1})
             enriched = [{"sku": (x if isinstance(x, str) else x.get("sku", x)), "enriched": True} for x in items]
             dbg("HNDL.enricher.proc", count=len(enriched))
-            # в meta положим enriched → далее OCR будет его читать
             return wu.BatchResult(success=True, metrics={"enriched": enriched, "count": len(enriched)})
 
     class OCRHandler(_PullFromArtifactsMixin, wu.RoleHandler):
@@ -719,7 +765,7 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             size = int(args.get("size", 1))
             meta_key = args.get("meta_list_key", "items")
             poll = float(args.get("poll_ms", 40)) / 1000.0
-            async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, shard_prefix="ocr"):
+            async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="ocr"):
                 yield b
         async def process_batch(self, batch, ctx):
             items = batch.payload.get("items")
@@ -734,24 +780,18 @@ def make_test_handlers(wu) -> Dict[str, Any]:
         role = "analyzer"
         async def load_input(self, ref, inline):
             dbg("HNDL.analyzer.load_input", inline=inline)
-            # ВАЖНО: вернуть сам inline, без дополнительной обёртки,
-            # чтобы воркер увидел input_adapter и включил стриминг.
+            # Возвращаем inline, чтобы можно было использовать адаптер воркера при желании.
             return (inline or {})
         async def iter_batches(self, loaded):
+            # По умолчанию читаем поток как mixin (так надёжнее для юнитов).
             dbg("HNDL.analyzer.iter_batches", inline=loaded)
-            # Читаем поток артефактов как enricher/ocr.
             args = (loaded or {}).get("input_args", {}) or {}
             from_nodes = list(args.get("from_nodes") or [])
-            # По умолчанию у индексера ключ обычно 'items'
             meta_key = args.get("meta_list_key") or "skus"
             size = int(args.get("size") or 3)
             poll = float(args.get("poll_ms", 25) or 25) / 1000.0
             async for b in self._emit_from_artifacts(
-                from_nodes=from_nodes,
-                size=size,
-                meta_key=meta_key,
-                poll=poll,
-                shard_prefix="analyzer",
+                from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="analyzer"
             ):
                 yield b
         async def process_batch(self, batch, ctx):

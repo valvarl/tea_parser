@@ -1,4 +1,4 @@
-# coordinator_dag.py  (v2.0 stream-aware with edges_ex + first-batch start + adapters)
+# coordinator_dag.py  (v2.0 stream-aware; no shard_id; batch_uid-driven)
 from __future__ import annotations
 
 import asyncio
@@ -7,12 +7,11 @@ import os
 import time
 import uuid
 import hashlib
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 from enum import Enum
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ─────────────────────────── App DB (motor) ───────────────────────────
@@ -42,18 +41,10 @@ SCHEDULER_TICK_SEC = float(os.getenv("SCHEDULER_TICK_SEC", "1.0"))
 FINALIZER_TICK_SEC = float(os.getenv("FINALIZER_TICK_SEC", "5.0"))
 HB_MONITOR_TICK_SEC = float(os.getenv("HB_MONITOR_TICK_SEC", "10.0"))
 
-MAX_GLOBAL_RUNNING = int(os.getenv("MAX_GLOBAL_RUNNING", "0"))  # 0 = unlimited
-MAX_TYPE_CONCURRENCY = int(os.getenv("MAX_TYPE_CONCURRENCY", "0"))
-
-# Outbox:
 OUTBOX_DISPATCH_TICK_SEC = float(os.getenv("OUTBOX_DISPATCH_TICK_SEC", "0.25"))
 OUTBOX_MAX_RETRY = int(os.getenv("OUTBOX_MAX_RETRY", "12"))
 OUTBOX_BACKOFF_MIN_MS = int(os.getenv("OUTBOX_BACKOFF_MIN_MS", "250"))
 OUTBOX_BACKOFF_MAX_MS = int(os.getenv("OUTBOX_BACKOFF_MAX_MS", "60000"))
-
-# Streaming:
-STREAM_CHILD_LAUNCH_DEDUP_SEC = int(os.getenv("STREAM_CHILD_LAUNCH_DEDUP_SEC", "60"))
-ARTIFACT_TTL_DAYS = int(os.getenv("ARTIFACT_TTL_DAYS", "14"))
 
 # ─────────────────────────── Helpers ───────────────────────────
 def now_dt() -> datetime:
@@ -73,7 +64,6 @@ def loads(b: bytes) -> Any:
     return json.loads(b.decode("utf-8"))
 
 def _jitter_ms(base_ms: int) -> int:
-    # simple ±20% jitter
     import random
     delta = int(base_ms * 0.2)
     return max(0, base_ms + random.randint(-delta, +delta))
@@ -103,7 +93,6 @@ class EventKind(str, Enum):
     WORKER_OFFLINE = "WORKER_OFFLINE"
     TASK_ACCEPTED = "TASK_ACCEPTED"
     TASK_HEARTBEAT = "TASK_HEARTBEAT"
-    BATCH_CLAIMED = "BATCH_CLAIMED"
     BATCH_OK = "BATCH_OK"
     BATCH_FAILED = "BATCH_FAILED"
     TASK_DONE = "TASK_DONE"
@@ -137,71 +126,72 @@ class Envelope(BaseModel):
     target_worker_id: Optional[str] = None
 
 class CmdTaskStart(BaseModel):
-    cmd: Literal[CommandKind.TASK_START]
+    cmd: CommandKind
     input_ref: Optional[Dict[str, Any]] = None
     input_inline: Optional[Dict[str, Any]] = None
     batching: Optional[Dict[str, Any]] = None
     cancel_token: str
 
 class CmdTaskCancel(BaseModel):
-    cmd: Literal[CommandKind.TASK_CANCEL]
+    cmd: CommandKind
     reason: str
     cancel_token: str
 
 class EvTaskAccepted(BaseModel):
-    kind: Literal[EventKind.TASK_ACCEPTED]
+    kind: EventKind
     worker_id: str
     lease_id: str
     lease_deadline_ts: int
 
 class EvHeartbeat(BaseModel):
-    kind: Literal[EventKind.TASK_HEARTBEAT]
+    kind: EventKind
     worker_id: str
     lease_id: str
     lease_deadline_ts: int
 
 class EvBatchOk(BaseModel):
-    kind: Literal[EventKind.BATCH_OK]
+    kind: EventKind
     worker_id: str
-    batch_id: Optional[int] = None
-    metrics: Dict[str, Any] = Field(default_factory=dict)
+    batch_uid: str
+    metrics: Dict[str, Any] = {}
     artifacts_ref: Optional[Dict[str, Any]] = None
 
 class EvBatchFailed(BaseModel):
-    kind: Literal[EventKind.BATCH_FAILED]
+    kind: EventKind
     worker_id: str
-    batch_id: Optional[int] = None
+    batch_uid: str
     reason_code: str
     permanent: bool = False
     error: Optional[str] = None
     artifacts_ref: Optional[Dict[str, Any]] = None
 
 class EvTaskDone(BaseModel):
-    kind: Literal[EventKind.TASK_DONE]
+    kind: EventKind
     worker_id: str
-    metrics: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, Any] = {}
     artifacts_ref: Optional[Dict[str, Any]] = None
+    final_uid: Optional[str] = None
 
 class EvTaskFailed(BaseModel):
-    kind: Literal[EventKind.TASK_FAILED]
+    kind: EventKind
     worker_id: str
     reason_code: str
     permanent: bool = False
     error: Optional[str] = None
 
 class EvCancelled(BaseModel):
-    kind: Literal[EventKind.CANCELLED]
+    kind: EventKind
     worker_id: str
     reason: str
 
 class QTaskDiscover(BaseModel):
-    query: Literal[QueryKind.TASK_DISCOVER]
+    query: QueryKind
     want_epoch: int
 
 class RTaskSnapshot(BaseModel):
-    reply: Literal[ReplyKind.TASK_SNAPSHOT]
+    reply: ReplyKind
     worker_id: Optional[str] = None
-    run_state: Literal["running", "idle", "finishing", "cancelling"]
+    run_state: str  # "running" | "idle" | "finishing" | "cancelling"
     attempt_epoch: int
     lease: Optional[Dict[str, Any]] = None
     progress: Optional[Dict[str, Any]] = None
@@ -252,29 +242,74 @@ class AdapterError(Exception):
 class CoordinatorAdapters:
     """
     Универсальные функции, которые координатор может вызвать сам (в coordinator_fn нодах)
-    для склейки/агрегации/резки. Здесь нет IO к S3 — работаем через коллекцию artifacts.
+    для склейки/агрегации/метрик. Работаем через коллекцию `artifacts`.
     """
+
     @staticmethod
     async def merge_generic(task_id: str, from_nodes: List[str], target: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Собирает все complete/partial артефакты из from_nodes, помечает target как complete.
-        Идемпотентно: ключ target {'depot','key'} перезаписывается (upsert).
+        Собирает все артефакты из from_nodes и пишет агрегат в target.node_id со статусом complete.
+        Идемпотентно.
         """
-        try:
-            shards: List[Dict[str, Any]] = []
-            cur = db.artifacts.find({"task_id": task_id, "node_id": {"$in": from_nodes}})
-            async for a in cur:
-                shards.append({"node_id": a.get("node_id"), "shard_id": a.get("shard_id"), "status": a.get("status"), "meta": a.get("meta", {})})
-            # Запишем агрегированный артефакт
-            await db.artifacts.update_one(
-                {"task_id": task_id, "node_id": target.get("node_id", "coordinator"), "key": target.get("key")},
-                {"$set": {"status": "complete", "meta": {"merged_from": from_nodes, "shards": len(shards)}, "updated_at": now_dt()},
-                 "$setOnInsert": {"task_id": task_id, "node_id": target.get("node_id", "coordinator"), "attempt_epoch": 0}},
-                upsert=True
-            )
-            return {"ok": True, "count": len(shards)}
-        except Exception as e:
-            raise AdapterError(f"merge_generic failed: {e}") from e
+        if not target or not isinstance(target, dict):
+            raise AdapterError("merge_generic: 'target' must be a dict with at least node_id")
+        target_node = target.get("node_id") or "coordinator"
+
+        partial_batches = 0
+        complete_nodes = set()
+        batch_uids = set()
+
+        cur = db.artifacts.find({"task_id": task_id, "node_id": {"$in": from_nodes}})
+        async for a in cur:
+            st = a.get("status")
+            if st == "complete":
+                complete_nodes.add(a.get("node_id"))
+            elif st == "partial":
+                uid = a.get("batch_uid")
+                if uid:
+                    batch_uids.add(uid)
+                partial_batches += 1
+
+        meta = {
+            "merged_from": from_nodes,
+            "complete_nodes": sorted(list(complete_nodes)),
+            "partial_batches": partial_batches,
+            "distinct_batch_uids": len(batch_uids),
+            "merged_at": now_dt().isoformat(),
+        }
+
+        await db.artifacts.update_one(
+            {"task_id": task_id, "node_id": target_node},
+            {"$set": {"status": "complete", "meta": meta, "updated_at": now_dt()},
+             "$setOnInsert": {"task_id": task_id, "node_id": target_node, "attempt_epoch": 0, "created_at": now_dt()}},
+            upsert=True
+        )
+        return {"ok": True, "meta": meta}
+
+    @staticmethod
+    async def metrics_aggregate(task_id: str, node_id: str, *, mode: str = "sum") -> Dict[str, Any]:
+        cur = db.metrics_raw.find({"task_id": task_id, "node_id": node_id, "failed": {"$ne": True}})
+        acc: Dict[str, float] = {}
+        cnt: Dict[str, int] = {}
+        async for m in cur:
+            for k, v in (m.get("metrics") or {}).items():
+                try:
+                    x = float(v)
+                except Exception:
+                    continue
+                acc[k] = acc.get(k, 0.0) + x
+                cnt[k] = cnt.get(k, 0) + 1
+
+        if mode == "mean":
+            out = {k: (acc[k] / max(1, cnt[k])) for k in acc}
+        else:
+            out = {k: acc[k] for k in acc}
+
+        await db.tasks.update_one(
+            {"id": task_id, "graph.nodes.node_id": node_id},
+            {"$set": {"graph.nodes.$.stats": out, "graph.nodes.$.stats_cached_at": now_dt()}}
+        )
+        return {"ok": True, "mode": mode, "stats": out}
 
     @staticmethod
     async def noop(_: str, **__) -> Dict[str, Any]:
@@ -282,6 +317,7 @@ class CoordinatorAdapters:
 
 ADAPTERS: Dict[str, Any] = {
     "merge.generic": CoordinatorAdapters.merge_generic,
+    "metrics.aggregate":  CoordinatorAdapters.metrics_aggregate,
     "noop": CoordinatorAdapters.noop,
 }
 
@@ -356,7 +392,7 @@ class KafkaBus:
 # ─────────────────────────── Outbox dispatcher ─────────────────────────
 class OutboxDispatcher:
     """
-    Exactly-once для нашей логики: At-least-once outbox + idempotent Kafka producer + consumer-side dedup_id.
+    At-least-once outbox + idempotent Kafka producer + consumer-side dedup_id.
     """
     def __init__(self, bus: KafkaBus) -> None:
         self.bus = bus
@@ -439,7 +475,7 @@ class Coordinator:
         self._status_consumers: Dict[str, AIOKafkaConsumer] = {}
         self._query_reply_consumer: Optional[AIOKafkaConsumer] = None
 
-        self._gid = f"coord.{uuid.uuid4().hex[:6]}"  # NEW: уникальный префикс групп
+        self._gid = f"coord.{uuid.uuid4().hex[:6]}"
 
     # ── Lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -539,7 +575,6 @@ class Coordinator:
                 try:
                     env = Envelope.model_validate(msg.value)
                 except Exception:
-                    # некорректное сообщение — пропускаем
                     await c.commit()
                     continue
 
@@ -547,7 +582,6 @@ class Coordinator:
                 try:
                     await self._record_worker_event(env)
                 except Exception:
-                    # не блокируем поток статусов
                     pass
 
                 # Fencing: ignore stale epoch
@@ -587,9 +621,6 @@ class Coordinator:
                         await self._on_task_failed(env)
                     elif kind == EventKind.CANCELLED:
                         await self._on_cancelled(env)
-                except Exception as e:
-                    # Любая ошибка в обработчике — не падаем, продолжаем поток сообщений
-                    raise e
                 finally:
                     try:
                         await c.commit()
@@ -609,11 +640,9 @@ class Coordinator:
         g = task_doc.get("graph", {})
         edges = g.get("edges") or []
         out = [dst for (src, dst) in edges if src == node_id]
-        # include edges_ex if present
         for ex in (g.get("edges_ex") or []):
             if ex.get("from") == node_id:
                 out.append(ex.get("to"))
-        # dedup
         return list(dict.fromkeys(out))
 
     def _edges_ex_from(self, task_doc: Dict[str, Any], node_id: str) -> List[Dict[str, Any]]:
@@ -622,7 +651,6 @@ class Coordinator:
     # ── Task API ────────────────────────────────────────────────────────
     async def create_task(self, *, params: Dict[str, Any], graph: Dict[str, Any]) -> str:
         task_id = str(uuid.uuid4())
-        # normalize graph keys
         graph.setdefault("nodes", [])
         graph.setdefault("edges", [])
         graph.setdefault("edges_ex", [])
@@ -639,7 +667,7 @@ class Coordinator:
         await db.tasks.insert_one(doc)
         return task_id
 
-    # ── Scheduler / fan-out & fan-in (count:n) + start_when:first_batch ─
+    # ── Scheduler / fan-out & fan-in + start_when:first_batch ──────────
     async def _scheduler_loop(self) -> None:
         try:
             while True:
@@ -648,62 +676,43 @@ class Coordinator:
         except asyncio.CancelledError:
             return
 
-    def _fan_in_satisfied(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> bool:
-        deps = node.get("depends_on") or []
-        if not deps:
-            return True
-        st: Dict[str, RunState] = {}
-        for d in deps:
-            nd = self._get_node(task_doc, d)
-            rs = self._to_runstate((nd or {}).get("status"))
-            st[d] = rs or RunState.queued  # по умолчанию queued
-        fan_in = (node.get("fan_in") or "all").lower()
-        if fan_in == "all":
-            return all(s == RunState.finished for s in st.values())
-        if fan_in == "any":
-            return any(s == RunState.finished for s in st.values())
-        if fan_in.startswith("count:"):
-            try:
-                k = int(fan_in.split(":", 1)[1])
-            except Exception:
-                k = len(deps)
-            return sum(1 for s in st.values() if s == RunState.finished) >= k
-        return False
+    def _to_runstate(self, v):
+        if isinstance(v, RunState): return v
+        if isinstance(v, str):
+            try: return RunState(v)
+            except Exception: return None
+        return None
 
-    async def _artifacts_exist_from_parents(self, task_id: str, parents: List[str]) -> bool:
-        if not parents:
+    async def _first_batch_available(self, task_doc, node) -> bool:
+        io = (node.get("io") or {})
+        inp = (io.get("input_inline") or {})
+        args = (inp.get("input_args") or {})
+        from_nodes = args.get("from_nodes") or (node.get("depends_on") or [])
+        if not from_nodes:
             return False
-        try:
-            doc = await db.artifacts.find_one({"task_id": task_id, "node_id": {"$in": parents}})
-            return bool(doc)
-        except Exception:
-            return False
-
-    def _node_ready_time(self, node: Dict[str, Any]) -> bool:
-        nx = node.get("next_retry_at")
-        return not (nx and now_ts() < int(nx))
+        q = {
+            "task_id": task_doc["id"],
+            "node_id": {"$in": from_nodes},
+            "status": {"$in": ["partial", "complete"]},
+        }
+        return (await db.artifacts.find_one(q)) is not None
 
     async def _node_ready(self, task_doc, node) -> bool:
         status = self._to_runstate(node.get("status"))
         if status not in (RunState.queued, RunState.deferred):
             return False
 
-        fan_in = (node.get("fan_in") or "all").lower()
         io = (node.get("io") or {})
         start_when = (io.get("start_when") or "").lower()
-
-        # ⬇️ FIX: start_when=first_batch должен работать независимо от fan_in
-        # (как только появился partial/complete от ЛЮБОГО предка из from_nodes/depends_on)
         if start_when == "first_batch":
             return await self._first_batch_available(task_doc, node)
 
-        # Обычная логика ожидания завершения родителей
         deps = node.get("depends_on") or []
         dep_states = [
             self._to_runstate((self._get_node(task_doc, d) or {}).get("status"))
             for d in deps
         ]
-
+        fan_in = (node.get("fan_in") or "all").lower()
         if fan_in == "all":
             return all(s == RunState.finished for s in dep_states)
         if fan_in == "any":
@@ -716,28 +725,6 @@ class Coordinator:
             return sum(1 for s in dep_states if s == RunState.finished) >= k
 
         return False
-
-    def _to_runstate(self, v):
-        if isinstance(v, RunState): return v
-        if isinstance(v, str):
-            try: return RunState(v)
-            except Exception: return None
-        return None
-    
-    async def _first_batch_available(self, task_doc, node) -> bool:
-        io = (node.get("io") or {})
-        inp = (io.get("input_inline") or {})
-        args = (inp.get("input_args") or {})
-        from_nodes = args.get("from_nodes") or (node.get("depends_on") or [])
-        if not from_nodes:
-            return False
-        # ищем любой артефакт от любого из предков с partial/complete
-        q = {
-            "task_id": task_doc["id"],
-            "node_id": {"$in": from_nodes},
-            "status": {"$in": ["partial", "complete"]},
-        }
-        return (await db.artifacts.find_one(q)) is not None
 
     async def _schedule_ready_nodes(self) -> None:
         cur = db.tasks.find(
@@ -756,7 +743,6 @@ class Coordinator:
                     await self._preflight_and_maybe_start(t, n)
 
     async def _run_coordinator_fn(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> None:
-        # safe run
         try:
             await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
                                       {"$set": {"graph.nodes.$.status": RunState.running,
@@ -768,7 +754,6 @@ class Coordinator:
             fn = ADAPTERS.get(fn_name)
             if not fn:
                 raise AdapterError(f"adapter '{fn_name}' not registered")
-            # Подготовим target: подставим node_id для явного владельца результата
             if isinstance(fn_args, dict) and "target" in fn_args and isinstance(fn_args["target"], dict):
                 fn_args["target"].setdefault("node_id", node["node_id"])
             await fn(task_doc["id"], **fn_args)
@@ -777,7 +762,6 @@ class Coordinator:
                                                 "graph.nodes.$.finished_at": now_dt(),
                                                 "graph.nodes.$.last_event_ts": now_ts()}})
         except Exception as e:
-            # Координаторные функции не «ломают» всю задачу: переводим в deferred с backoff
             backoff = int(((node.get("retry_policy") or {}).get("backoff_sec") or 300))
             await db.tasks.update_one({"id": task_doc["id"], "graph.nodes.node_id": node["node_id"]},
                                       {"$set": {"graph.nodes.$.status": RunState.deferred,
@@ -815,7 +799,7 @@ class Coordinator:
         except Exception:
             pass
 
-        # DISCOVER: регистрируем ожидание ответа и шлём запрос
+        # DISCOVER snapshot
         discover_env = Envelope(
             msg_type=MsgType.query,
             role=Role.coordinator,
@@ -829,7 +813,6 @@ class Coordinator:
         ev = self.bus.register_reply(discover_env.corr_id)
         await self._enqueue_query(discover_env)
 
-        # ждём хотя бы один ответ, но не дольше окна
         try:
             await asyncio.wait_for(ev.wait(), timeout=DISCOVERY_WINDOW_SEC)
         except asyncio.TimeoutError:
@@ -837,7 +820,7 @@ class Coordinator:
 
         replies = self.bus.collect_replies(discover_env.corr_id)
 
-        # Узел уже активен на старой эпохе → принимаем как running
+        # узел уже активен на старой эпохе → принимаем как running
         active = [r for r in replies if (r.payload.get("run_state") in ("running", "finishing")
                                         and r.payload.get("attempt_epoch") == node.get("attempt_epoch"))]
         if active:
@@ -845,7 +828,7 @@ class Coordinator:
                                     {"$set": {"graph.nodes.$.status": RunState.running}})
             return
 
-        # Если кто-то сообщил, что артефакт уже complete → завершаем
+        # кто-то сообщил complete → завершаем
         complete = any((r.payload.get("artifacts") or {}).get("complete") for r in replies)
         if complete:
             await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
@@ -854,7 +837,7 @@ class Coordinator:
                                                 "graph.nodes.$.attempt_epoch": new_epoch}})
             return
 
-        # Start node
+        # стартуем ноду
         await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},
                                   {"$set": {"graph.nodes.$.status": RunState.running,
                                             "graph.nodes.$.started_at": now_dt(),
@@ -880,7 +863,6 @@ class Coordinator:
     # ── Event handlers ──────────────────────────────────────────────────
     async def _record_worker_event(self, env: Envelope) -> None:
         evh = stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})
-        # upsert вместо insert_one — чтобы дубликат envelope не создавал вторую строку
         try:
             await db.worker_events.update_one(
                 {"task_id": env.task_id, "node_id": env.node_id, "event_hash": evh},
@@ -899,7 +881,6 @@ class Coordinator:
                 upsert=True,
             )
         except Exception:
-            # не блокируем поток
             pass
         await db.tasks.update_one({"id": env.task_id}, {"$max": {"last_event_ts": env.ts}, "$currentDate": {"updated_at": True}})
 
@@ -917,124 +898,10 @@ class Coordinator:
                       "graph.nodes.$.lease.lease_id": p.lease_id,
                       "graph.nodes.$.lease.deadline_ts": p.lease_deadline_ts},
              "$max": {"graph.nodes.$.last_event_ts": env.ts}})
-        
-    async def _anchor_metrics_on_shard_once(self, *, task_id: str, node_id: str, shard_id: Optional[str], kind: str = "BATCH_OK") -> bool:
-        """
-        True — это первое применение метрик для данного shard_id (можно инкрементить),
-        False — уже считали ранее (дубль).
-        Реализовано простым find+insert без спец. операторов — стабильно на in-mem.
-        """
-        try:
-            key = {"task_id": task_id, "node_id": node_id, "kind": kind}
-            if shard_id is not None:
-                key["shard_id"] = shard_id
-            else:
-                # для событий без шарда якоримся на event_hash
-                key["event_hash"] = stable_hash({"t": task_id, "n": node_id, "k": kind})
-
-            exists = await db.metrics_anchors.find_one(key)
-            if exists:
-                return False
-            await db.metrics_anchors.insert_one({**key, "created_at": now_dt()})
-            return True
-        except Exception:
-            # в спорных ситуациях лучше не удваивать метрики
-            return False
-
-    async def _apply_metrics_once(self, env: Envelope, metrics: Dict[str, int], *, artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
-        if not metrics:
-            return
-        # 1) основной якорь — запись в worker_events (best-effort)
-        try:
-            res = await db.worker_events.find_one_and_update(
-                {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
-                {"$set": {"metrics_applied": True}}
-            )
-        except Exception:
-            res = None
-
-        anchor_ok = res is not None
-
-        # 2) фолбэк-якорь — сам артефакт шарда (если есть shard_id)
-        if not anchor_ok and artifacts_ref:
-            shard_id = (artifacts_ref or {}).get("shard_id")
-            if shard_id:
-                try:
-                    ar = await db.artifacts.find_one_and_update(
-                        {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id, "metrics_applied": {"$ne": True}},
-                        {"$set": {"metrics_applied": True}}
-                    )
-                    anchor_ok = ar is not None
-                except Exception:
-                    anchor_ok = False
-
-        if anchor_ok and metrics:
-            inc: Dict[str, int] = {}
-            for k, v in (metrics or {}).items():
-                try:
-                    # допускаем числа и числовые строки
-                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()):
-                        inc[f"graph.nodes.$.stats.{k}"] = int(v)
-                except Exception:
-                    continue
-            if inc:
-                print(f"[COORD] METRICS_APPLY node={env.node_id} inc={inc}", flush=True)
-                await db.tasks.update_one(
-                    {"id": env.task_id, "graph.nodes.node_id": env.node_id},
-                    {"$inc": inc, "$currentDate": {"updated_at": True}}
-                )
-        else:
-            # диагностический лог — поможет увидеть, когда сработал фолбэк или якоря не было
-            try:
-                print("[COORD][WARN] metrics skipped (no anchor)",
-                      "node=", env.node_id, "metrics=", metrics, "shard=",
-                      (artifacts_ref or {}).get("shard_id"))
-            except Exception:
-                pass
-
-    async def _persist_artifact_partial(self, env: Envelope, ref: Dict[str, Any], meta: Dict[str, Any]) -> None:
-        """
-        Идемпотентная запись частичного артефакта. Любые ошибки здесь не должны
-        обрушать обработку событий — они приводят к deferred состояния/ретраю downstream.
-        """
-        try:
-            shard_id = ref.get("shard_id")
-            if not shard_id:
-                # Защита координатора: если шард без id — пометим событие и уйдём
-                await db.worker_events.update_one(
-                    {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
-                    {"$set": {"artifact_error": "missing_shard_id"}}
-                )
-                return
-            await db.artifacts.update_one(
-                {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id},
-                {"$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id,
-                                  "attempt_epoch": env.attempt_epoch, "status": "partial",
-                                  "meta": meta or {}, "payload": None, "worker_id": env.payload.get("worker_id"),
-                                  "created_at": now_dt()},
-                 "$set": {"status": "partial", "updated_at": now_dt()}},
-                upsert=True
-            )
-        except Exception as e:
-            # Не роняем поток: просто зафиксируем ошибку
-            await db.worker_events.update_one(
-                {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
-                {"$set": {"artifact_error": str(e)}}
-            )
 
     async def _maybe_start_children_on_first_batch(self, parent_task: Dict[str, Any], parent_node_id: str) -> None:
-        """
-        На первый батч родителя пытаемся стартовать детей, которые ожидают асинхронный запуск:
-        - edges_ex: mode=async, trigger=on_batch
-        - либо у ребёнка io.start_when=first_batch и он зависит от parent
-        Стартуем атомарно с флагом 'streaming.started_on_first_batch', чтобы не триггерить повторно.
-        """
         task_id = parent_task["id"]
-        graph = parent_task.get("graph", {}) or {}
-        nodes = graph.get("nodes") or []
         edges_ex = self._edges_ex_from(parent_task, parent_node_id)
-
-        # Кандидаты-дети по edges/edges_ex
         direct_children = self._children_of(parent_task, parent_node_id)
         if not direct_children:
             return
@@ -1044,7 +911,6 @@ class Coordinator:
             if not child:
                 continue
 
-            # Применим правила:
             rule_async = any(ex for ex in edges_ex if ex.get("to") == child_id and ex.get("mode") == "async" and ex.get("trigger") == "on_batch")
             sw = (child.get("io", {}) or {}).get("start_when", "ready")
             wants_first_batch = (sw == "first_batch")
@@ -1052,8 +918,6 @@ class Coordinator:
             if not (rule_async or wants_first_batch):
                 continue
 
-            # Попытаемся атомарно пометить, что мы запускаем этого ребёнка "по первому батчу"
-            # Запустим только если он ещё в queued/deferred и не запускался ранним способом.
             q = {"id": task_id, "graph.nodes": {"$elemMatch": {"node_id": child_id,
                                                                 "status": {"$in": [RunState.queued, RunState.deferred]},
                                                                 "streaming.started_on_first_batch": {"$ne": True}}}}
@@ -1063,8 +927,6 @@ class Coordinator:
                           "graph.nodes.$.next_retry_at": 0}},
             )
             if res:
-                # scheduler подберёт через _node_ready (first_batch) → но чтобы ускорить,
-                # можно прямо сейчас инициировать preflight if ready:
                 fresh = await db.tasks.find_one({"id": task_id}, {"id": 1, "graph": 1})
                 ch_node = self._get_node(fresh, child_id) if fresh else None
                 if fresh and ch_node:
@@ -1076,109 +938,81 @@ class Coordinator:
 
     async def _on_batch_ok(self, env: Envelope) -> None:
         p = EvBatchOk.model_validate(env.payload)
-        # 1) СНАЧАЛА идемпотентно записываем partial артефакт — чтобы был материал для отладки
-        if p.artifacts_ref:
-            await self._persist_artifact_partial(env, p.artifacts_ref, p.metrics or {})
-        # 2) Якоримся на шард (один раз)
-        shard_id = (p.artifacts_ref or {}).get("shard_id") if p.artifacts_ref else None
-        first_time = await self._anchor_metrics_on_shard_once(task_id=env.task_id, node_id=env.node_id, shard_id=shard_id)
-        if first_time and (p.metrics or {}):
-            # инкрементим (ровно один раз на шард)
-            inc: Dict[str, int] = {}
-            for k, v in (p.metrics or {}).items():
-                try:
-                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()):
-                        inc[f"graph.nodes.$.stats.{k}"] = int(v)
-                except Exception:
-                    continue
-            if inc:
-                await db.tasks.update_one(
-                    {"id": env.task_id, "graph.nodes.node_id": env.node_id},
-                    {"$inc": inc, "$currentDate": {"updated_at": True}}
-                )
-        # 3) Старую схему используем ТОЛЬКО если новый якорь не поставился.
-        #    Она — молчаливый бэкап, без WARN и без двойных инкрементов.
-        if not first_time and (p.metrics or {}):
-            await self._apply_metrics_once(env, p.metrics or {}, artifacts_ref=p.artifacts_ref)
+        batch_uid = p.batch_uid
 
-        # Попробуем «ранний старт» downstream на первый батч
+        # 1) partial-артефакт по batch_uid
+        if p.artifacts_ref:
+            meta = dict(p.metrics or {})
+            await db.artifacts.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id, "batch_uid": batch_uid},
+                {"$setOnInsert": {
+                    "task_id": env.task_id, "node_id": env.node_id,
+                    "attempt_epoch": env.attempt_epoch, "status": "partial",
+                    "created_at": now_dt()
+                },
+                "$set": {"status": "partial", "meta": meta, "artifacts_ref": p.artifacts_ref, "updated_at": now_dt()}},
+                upsert=True
+            )
+
+        # 2) сырые метрики (дедуп по uniq (task_id,node_id,batch_uid))
+        if p.metrics:
+            doc = {
+                "task_id": env.task_id, "node_id": env.node_id, "batch_uid": batch_uid,
+                "metrics": p.metrics, "attempt_epoch": env.attempt_epoch,
+                "ts": env.ts, "created_at": now_dt()
+            }
+            try:
+                await db.metrics_raw.insert_one(doc)
+            except Exception:
+                pass
+
+        # 3) возможный ранний старт downstream
         try:
             tdoc = await db.tasks.find_one({"id": env.task_id}, {"id": 1, "graph": 1})
             if tdoc:
                 await self._maybe_start_children_on_first_batch(tdoc, env.node_id)
         except Exception:
-            # Не блокируем обработку батчей из-за ошибок триггера
             pass
 
     async def _on_batch_failed(self, env: Envelope) -> None:
         p = EvBatchFailed.model_validate(env.payload)
-        await self._apply_metrics_once(env, {})
-        # Помечаем эпоху как «ошибочную» и переводим ноду в deferred (ретрай)
         try:
-            tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1})
-            node = self._get_node(tdoc, env.node_id) if tdoc else None
-            policy = ((node or {}).get("retry_policy") or {})
-            backoff = int(policy.get("backoff_sec", 300))
-            await db.tasks.update_one(
-                {"id": env.task_id, "graph.nodes.node_id": env.node_id},
-                {"$set": {
-                    "graph.nodes.$.status": RunState.deferred,
-                    "graph.nodes.$.next_retry_at": now_ts() + backoff,
-                    "graph.nodes.$.lease.epoch_failed": env.attempt_epoch,
-                    "graph.nodes.$.last_error": p.reason_code,
-                }}
+            await db.metrics_raw.insert_one({
+                "task_id": env.task_id, "node_id": env.node_id, "batch_uid": p.batch_uid,
+                "metrics": {}, "failed": True, "reason": p.reason_code,
+                "attempt_epoch": env.attempt_epoch, "ts": env.ts, "created_at": now_dt()
+            })
+        except Exception:
+            pass
+        # Пометим partial артефакт этого батча как failed (идемпотентно)
+        try:
+            await db.artifacts.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id, "batch_uid": p.batch_uid},
+                {"$set": {"status": "failed", "error": p.reason_code, "updated_at": now_dt()}},
+                upsert=True
             )
         except Exception:
             pass
-        if p.artifacts_ref:
-            # Можно пометить артефакт как "failed" для шардового мониторинга (без влияния на DAG)
-            try:
-                shard_id = p.artifacts_ref.get("shard_id")
-                if shard_id:
-                    await db.artifacts.update_one(
-                        {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id},
-                        {"$set": {"status": "failed", "updated_at": now_dt(), "error": p.reason_code}},
-                        upsert=True
-                    )
-            except Exception:
-                pass
 
     async def _on_task_done(self, env: Envelope) -> None:
         p = EvTaskDone.model_validate(env.payload)
-        # Если в текущей эпохе уже фиксировалась ошибка — игнорируем TASK_DONE
-        try:
-            tdoc = await db.tasks.find_one({"id": env.task_id}, {"graph": 1})
-            node = self._get_node(tdoc, env.node_id) if tdoc else None
-            lease = (node or {}).get("lease") or {}
-            if int(lease.get("epoch_failed", -1)) == int(env.attempt_epoch):
-                return
-        except Exception:
-            pass
         if p.metrics:
-            # На TASK_DONE метрики часто агрегированы/дублируют BATCH_OK.
-            # Если они есть — применяем только по новому «шардовому» пути.
-            first_time = await self._anchor_metrics_on_shard_once(
-                task_id=env.task_id, node_id=env.node_id, shard_id=None, kind="TASK_DONE")
-            if first_time:
-                inc = {f"graph.nodes.$.stats.{k}": int(v)
-                       for k, v in (p.metrics or {}).items()
-                       if (isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip('-').isdigit()))}
-                if inc:
-                    await db.tasks.update_one(
-                        {"id": env.task_id, "graph.nodes.node_id": env.node_id},
-                        {"$inc": inc, "$currentDate": {"updated_at": True}}
-                    )
-        if p.artifacts_ref:
-            # помечаем результат ноды как complete
             try:
-                await db.artifacts.update_one(
-                    {"task_id": env.task_id, "node_id": env.node_id},
-                    {"$set": {"status": "complete", "meta": p.metrics or {}, "updated_at": now_dt()},
-                     "$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id, "attempt_epoch": env.attempt_epoch}},
-                    upsert=True
-                )
+                await db.metrics_raw.insert_one({
+                    "task_id": env.task_id, "node_id": env.node_id,
+                    "batch_uid": p.final_uid or "__final__",      # унифицированный uid
+                    "metrics": p.metrics, "final": True,
+                    "attempt_epoch": env.attempt_epoch, "ts": env.ts, "created_at": now_dt()
+                })
             except Exception:
                 pass
+        if p.artifacts_ref:
+            await db.artifacts.update_one(
+                {"task_id": env.task_id, "node_id": env.node_id},
+                {"$set": {"status": "complete", "meta": p.metrics or {}, "updated_at": now_dt()},
+                 "$setOnInsert": {"task_id": env.task_id, "node_id": env.node_id, "attempt_epoch": env.attempt_epoch, "created_at": now_dt()}},
+                upsert=True
+            )
         await db.tasks.update_one({"id": env.task_id, "graph.nodes.node_id": env.node_id},
                                   {"$set": {"graph.nodes.$.status": RunState.finished,
                                             "graph.nodes.$.finished_at": now_dt()}})
@@ -1224,7 +1058,7 @@ class Coordinator:
         except asyncio.CancelledError:
             return
 
-    # ── Finalizer (fan-out handling via DAG) ────────────────────────────
+    # ── Finalizer (task-level) ─────────────────────────────────────────
     async def _finalizer_loop(self) -> None:
         try:
             while True:
@@ -1241,7 +1075,6 @@ class Coordinator:
                 result = {"nodes": [{"node_id": n["node_id"], "stats": n.get("stats", {})} for n in nodes]}
                 await db.tasks.update_one({"id": t["id"]},
                     {"$set": {"status": RunState.finished, "finished_at": now_dt(), "result": result}})
-                continue
 
     # ── Cascade cancel (uses Outbox) ────────────────────────────────────
     async def _cascade_cancel(self, task_id: str, *, reason: str) -> None:
@@ -1270,57 +1103,27 @@ class Coordinator:
         cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred, RunState.queued]}} ,
                             {"id": 1, "graph": 1, "status": 1})
         async for _ in cur:
-            # scheduler will adopt/start as needed
-            pass
+            pass  # scheduler will adopt/start as needed
 
     # ── Indexes ─────────────────────────────────────────────────────────
     async def _ensure_indexes(self) -> None:
         try:
             await db.tasks.create_index([("status", 1), ("updated_at", 1)], name="ix_task_status_updated")
-            await db.worker_events.create_index([("task_id", 1), ("node_id", 1), ("event_hash", 1)], unique=True, name="uniq_worker_event")
-            await db.worker_events.create_index([("ts_dt", 1)], name="ttl_worker_events", expireAfterSeconds=14*24*3600)
             await db.worker_registry.create_index([("worker_id", 1)], unique=True, name="uniq_worker")
+
+            # Artifacts (batch_uid only)
             await db.artifacts.create_index([("task_id", 1), ("node_id", 1)], name="ix_artifacts_task_node")
-            await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("shard_id", 1)], unique=True, sparse=True, name="uniq_artifact_shard")
+            await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("batch_uid", 1)],
+                                            unique=True, sparse=True, name="uniq_artifact_batch")
+
+            # Outbox
             await db.outbox.create_index([("fp", 1)], unique=True, name="uniq_outbox_fp")
             await db.outbox.create_index([("state", 1), ("next_attempt_at", 1)], name="ix_outbox_state_next")
-            await db.metrics_anchors.create_index([("task_id", 1), ("node_id", 1), ("kind", 1), ("shard_id", 1)], name="ix_metrics_anchor_shard")
-            await db.metrics_anchors.create_index([("task_id", 1), ("node_id", 1), ("kind", 1), ("event_hash", 1)], name="ix_metrics_anchor_event")
-            await db.metrics_anchors.create_index(
-                [("task_id", 1), ("node_id", 1), ("kind", 1), ("shard_id", 1)],
-                name="uniq_metrics_anchor_shard", unique=True, sparse=True)
-            await db.metrics_anchors.create_index(
-                [("task_id", 1), ("node_id", 1), ("kind", 1), ("event_hash", 1)],
-                name="uniq_metrics_anchor_event", unique=True, sparse=True)
+
+            # Metrics: one doc per batch_uid
+            await db.metrics_raw.create_index([("task_id",1), ("node_id",1), ("batch_uid",1)],
+                                              unique=True, name="uniq_metrics_batch")
+            # TTL for raw metrics (14 days)
+            await db.metrics_raw.create_index([("created_at",1)], name="ttl_metrics_raw", expireAfterSeconds=14*24*3600)
         except Exception:
             pass
-
-# ─────────────────────────── Minimal FastAPI ───────────────────────────
-# app = FastAPI(title="Universal DAG Coordinator (Stream-aware, Outbox, fan-in/out)")
-
-# COORD = Coordinator()
-
-# @app.on_event("startup")
-# async def _startup() -> None:
-#     await COORD.start()
-
-# @app.on_event("shutdown")
-# async def _shutdown() -> None:
-#     await COORD.stop()
-
-# class CreateTaskBody(BaseModel):
-#     params: Dict[str, Any] = Field(default_factory=dict)
-#     graph: Dict[str, Any]
-
-# @app.post("/tasks")
-# async def create_task(b: CreateTaskBody) -> Dict[str, Any]:
-#     task_id = await COORD.create_task(params=b.params, graph=b.graph)
-#     return {"task_id": task_id}
-
-# @app.get("/tasks/{task_id}")
-# async def get_task(task_id: str) -> Dict[str, Any]:
-#     t = await db.tasks.find_one({"id": task_id})
-#     if not t:
-#         raise HTTPException(status_code=404, detail="task not found")
-#     t["_id"] = str(t["_id"])
-#     return t
