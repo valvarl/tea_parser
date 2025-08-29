@@ -544,6 +544,8 @@ def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyz
     from app.services import coordinator_dag as cd
     from app.services import worker_universal as wu
 
+    monkeypatch.setattr(cd, "WORKER_TYPES", [s.strip() for s in worker_types.split(",") if s.strip()], raising=False)
+
     # гарантируем обычный asyncio внутри модулей
     import asyncio as aio
     monkeypatch.setattr(cd, "asyncio", aio, raising=False)
