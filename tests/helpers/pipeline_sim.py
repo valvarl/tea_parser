@@ -100,10 +100,16 @@ class _Rec:
 
 class InMemKafkaBroker:
     def __init__(self, chaos: Optional[ChaosMonkey] = None):
-        # topic -> {group_id: queue}
-        self.topics: Dict[str, Dict[str, asyncio.Queue]] = {}  # topic -> {group_id: queue}
+        self.topics: Dict[str, Dict[str, asyncio.Queue]] = {}
         self.rev: Dict[int, str] = {}
         self.chaos = chaos or ChaosMonkey(ChaosConfig())
+
+    def reset(self):
+        """Полный сброс состояния брокера без смены объекта."""
+        self.topics.clear()
+        self.rev.clear()
+        self.chaos = ChaosMonkey(ChaosConfig())
+        dbg("KAFKA.RESET(in-place)")
 
     def ensure_queue(self, topic: str, group_id: str) -> asyncio.Queue:
         tg = self.topics.setdefault(topic, {})
@@ -139,6 +145,10 @@ class InMemKafkaBroker:
 
 BROKER = InMemKafkaBroker()
 
+def reset_broker():
+    """Полный сброс in-mem Kafka между тестами."""
+    BROKER.reset()
+
 class AIOKafkaProducerMockChaos:
     def __init__(self, *_, **__): pass
     async def start(self): dbg("PRODUCER.START")
@@ -161,7 +171,12 @@ class AIOKafkaConsumerMockChaos:
         self._queues = [BROKER.ensure_queue(t, self._group) for t in self._topics]
         dbg("CONSUMER.START", group_id=self._group, topics=self._topics)
 
-    async def stop(self): dbg("CONSUMER.STOP", group_id=self._group)
+    async def stop(self):
+        dbg("CONSUMER.STOP", group_id=self._group)
+        for t in self._topics:
+            tg = BROKER.topics.get(t)
+            if tg:
+                tg.pop(self._group, None)
 
     async def getone(self):
         assert BROKER is not None
@@ -206,7 +221,13 @@ class AIOKafkaConsumerMock:
         self._queues = [BROKER.ensure_queue(t, self._group) for t in self._topics]
         dbg("CONSUMER.START", group_id=self._group, topics=self._topics)
 
-    async def stop(self): dbg("CONSUMER.STOP", group_id=self._group)
+    async def stop(self):
+        dbg("CONSUMER.STOP", group_id=self._group)
+        # NEW: удаляем очередь группы с каждого топика
+        for t in self._topics:
+            tg = BROKER.topics.get(t)
+            if tg:
+                tg.pop(self._group, None)
 
     async def getone(self):
         while True:
@@ -451,11 +472,14 @@ class InMemDB:
         self.worker_registry= InMemCollection("worker_registry")
         self.artifacts      = InMemCollection("artifacts")
         self.outbox         = InMemCollection("outbox")
+        self.metrics_anchors= InMemCollection("metrics_anchors")
         self.stream_progress= InMemCollection("stream_progress")
 
 # ====================== setup helpers ====================
 def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyzer") -> Tuple[Any, Any]:
     """Подготавливает окружение, патчит Kafka на in-mem и возвращает (coordinator_dag, worker_universal)."""
+    reset_broker()
+
     monkeypatch.setenv("WORKER_TYPES", worker_types)
     monkeypatch.setenv("HB_SOFT_SEC", "120")
     monkeypatch.setenv("HB_HARD_SEC", "600")
@@ -463,6 +487,11 @@ def setup_env_and_imports(monkeypatch, worker_types="indexer,enricher,ocr,analyz
     # путь до backend
     if "/home/valvarl/tea_parser/backend" not in sys.path:
         sys.path.insert(0, "/home/valvarl/tea_parser/backend")
+
+    import importlib, sys as _sys
+    for m in ("app.services.coordinator_dag", "app.services.worker_universal"):
+        if m in _sys.modules:
+            del _sys.modules[m]
 
     from app.services import coordinator_dag as cd
     from app.services import worker_universal as wu
@@ -609,6 +638,7 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             completed = set()
             while True:
                 progressed = False
+                has_unseen = False  # есть ли где-то ещё невыданные элементы
 
                 for doc in list(wu.db.artifacts.rows):
                     node_id = doc.get("node_id")
@@ -621,6 +651,13 @@ def make_test_handlers(wu) -> Dict[str, Any]:
                     meta  = doc.get("meta") or {}
                     items = list(meta.get(meta_key) or [])
 
+                    if doc.get("status") == "complete":
+                        # фиксируем факт завершения источника, но НЕ выходим из цикла,
+                        # пока не убедимся, что в partial-шардах нет невиданных элементов
+                        completed.add(node_id)
+                        continue
+
+                    # partial-шард
                     seen = self._emitted_items.get(key, set())
                     new_items = [x for x in items if x not in seen]
                     if new_items:
@@ -632,13 +669,16 @@ def make_test_handlers(wu) -> Dict[str, Any]:
                                 payload={"items": chunk},
                             )
                             progressed = True
+                        # помечаем выданными только после успешной отдачи
                         seen.update(new_items)
                         self._emitted_items[key] = seen
 
-                    if doc.get("status") == "complete":
-                        completed.add(node_id)
+                    # если что-то осталось невиданным — помечаем
+                    if any(x not in seen for x in items):
+                        has_unseen = True
 
-                if all(n in completed for n in from_nodes):
+                # Выходим ТОЛЬКО когда все источники завершены и невиданных элементов нет.
+                if all(n in completed for n in from_nodes) and not has_unseen:
                     break
                 if not progressed:
                     await asyncio.sleep(poll)

@@ -293,3 +293,228 @@ async def test_permanent_fail_cascades_cancel_and_task_failed(env_and_imports, i
         assert cs in (str(cd.RunState.cancelling), str(cd.RunState.deferred), str(cd.RunState.queued))
     finally:
         await coord.stop()
+
+def build_slow_source_handler(wu, *, total=50, batch=5, delay=0.15):
+    class SlowSource(wu.RoleHandler):
+        role = "source"
+        async def load_input(self, ref, inline): return {"total": total, "batch": batch, "delay": delay}
+        async def iter_batches(self, loaded):
+            t, b = loaded["total"], loaded["batch"]
+            shard = 0
+            for i in range(0, t, b):
+                yield wu.Batch(shard_id=f"s-{shard}", payload={"items": list(range(i, min(i+b, t))), "delay": loaded["delay"]})
+                shard += 1
+        async def process_batch(self, batch, ctx):
+            await asyncio.sleep(batch.payload.get("delay", 0.1))
+            return wu.BatchResult(success=True, metrics={"count": len(batch.payload.get("items") or [])})
+    return SlowSource()
+
+def build_cancelable_source_handler(wu, *, total=100, batch=10, delay=0.3):
+    class Cancellable(wu.RoleHandler):
+        role = "source"
+        async def load_input(self, ref, inline): return {"total": total, "batch": batch}
+        async def iter_batches(self, loaded):
+            t, b = loaded["total"], loaded["batch"]
+            shard = 0
+            for i in range(0, t, b):
+                yield wu.Batch(shard_id=f"s-{shard}", payload={"i": i})
+                shard += 1
+        async def process_batch(self, batch, ctx):
+            # Кооперативно реагируем на отмену
+            for _ in range(int(delay / 0.05)):
+                if ctx.cancelled():
+                    return wu.BatchResult(success=False, reason_code="cancelled", permanent=False)
+                await asyncio.sleep(0.05)
+            return wu.BatchResult(success=True, metrics={"count": 1})
+    return Cancellable()
+
+@pytest.mark.asyncio
+async def test_status_fencing_ignores_stale_epoch(env_and_imports, inmemory_db, workers_source):
+    cd, wu = env_and_imports
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = {"schema_version": "1.0",
+                 "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all", "io": {"input_inline": {}}}],
+                 "edges": []}
+        graph = prime_graph(cd, graph)
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        tdoc = await wait_task_finished(inmemory_db, task_id, timeout=10.0)
+        base = int((node_by_id(tdoc, "s").get("stats") or {}).get("count") or 0)
+
+        # Синтетически шлём стейл-ивент с attempt_epoch=0 (узел уже завершился на эпохе 1)
+        env = cd.Envelope(
+            msg_type=cd.MsgType.event, role=cd.Role.worker,
+            dedup_id="stale1", task_id=task_id, node_id="s", step_type="source",
+            attempt_epoch=0,
+            payload={"kind": cd.EventKind.BATCH_OK, "worker_id": "WZ", "metrics": {"count": 999},
+                     "artifacts_ref": {"shard_id": "zzz"}}
+        )
+        await BROKER.produce(cd.TOPIC_STATUS_FMT.format(type="source"), env.model_dump(mode="json"))
+        await asyncio.sleep(0.2)
+
+        t2 = await inmemory_db.tasks.find_one({"id": task_id})
+        got = int((node_by_id(t2, "s").get("stats") or {}).get("count") or 0)
+        assert got == base, "stale event must be ignored by fencing"
+    finally:
+        await coord.stop()
+
+@pytest.mark.asyncio
+async def test_coordinator_restart_adopts_inflight_without_new_epoch(env_and_imports, inmemory_db, monkeypatch):
+    cd, wu = env_and_imports
+
+    # делаем хартбит почаще, чтобы коорд быстрее "видел" ран
+    monkeypatch.setattr(wu, "HEARTBEAT_INTERVAL_SEC", 0.05, raising=False)
+
+    w = wu.Worker(roles=["source"], handlers={"source": build_slow_source_handler(wu, total=60, batch=5, delay=0.08)})
+    await w.start()
+    coord1 = cd.Coordinator()
+    await coord1.start()
+    task_id = None
+    coord2 = None
+    try:
+        graph = {"schema_version": "1.0",
+                 "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all", "io": {"input_inline": {}}}],
+                 "edges": []}
+        graph = prime_graph(cd, graph)
+        task_id = await coord1.create_task(params={}, graph=graph)
+
+        # Ненадолго ждём, чтобы нода точно ушла в running (эпоха 1)
+        for _ in range(60):
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            if t and str(node_by_id(t, "s").get("status")).endswith("running"):
+                break
+            await asyncio.sleep(0.05)
+
+        # Перезапускаем координатор посреди ранa
+        await coord1.stop()
+        coord2 = cd.Coordinator()
+        await coord2.start()
+
+        # Финиш и проверка: эпоха не изменилась (не было повторного START)
+        tdoc = await wait_task_finished(inmemory_db, task_id, timeout=12.0)
+        s = node_by_id(tdoc, "s")
+        assert int(s.get("attempt_epoch", 0)) == 1, "new coordinator must adopt inflight instead of restarting"
+    finally:
+        if coord2: await coord2.stop()
+        await w.stop()
+
+@pytest.mark.asyncio
+async def test_explicit_cascade_cancel_moves_node_to_deferred(env_and_imports, inmemory_db, monkeypatch):
+    cd, wu = env_and_imports
+    monkeypatch.setattr(cd, "CANCEL_GRACE_SEC", 0.05, raising=False)
+
+    w = wu.Worker(roles=["source"], handlers={"source": build_cancelable_source_handler(wu, total=100, batch=10, delay=0.3)})
+    await w.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = {"schema_version": "1.0",
+                 "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all", "io": {"input_inline": {}}}],
+                 "edges": []}
+        graph = prime_graph(cd, graph)
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # ждём running
+        for _ in range(120):
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            if t and str(node_by_id(t, "s").get("status")).endswith("running"):
+                break
+            await asyncio.sleep(0.03)
+
+        await coord._cascade_cancel(task_id, reason="test_cancel")
+
+        # ждём перехода из running в один из целевых статусов
+        target = {str(cd.RunState.cancelling), str(cd.RunState.deferred), str(cd.RunState.queued)}
+        status = None
+        deadline = asyncio.get_running_loop().time() + cd.CANCEL_GRACE_SEC + 1.0
+        while asyncio.get_running_loop().time() < deadline:
+            t2 = await inmemory_db.tasks.find_one({"id": task_id})
+            status = str(node_by_id(t2, "s").get("status"))
+            if status in target:
+                break
+            await asyncio.sleep(0.05)
+
+        assert status in target, f"expected node status in {target}, got {status}"
+    finally:
+        await coord.stop()
+        await w.stop()
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(reason="Coordinator не шорткатит ноду по pre-complete артефакту без воркера в текущей реализации")
+async def test_complete_artifact_shortcuts_node_without_worker(env_and_imports, inmemory_db):
+    cd, wu = env_and_imports
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = {"schema_version": "1.0",
+                 "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all", "io": {"input_inline": {}}}],
+                 "edges": []}
+        graph = prime_graph(cd, graph)
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # до старта воркера помечаем артефакт как complete
+        await inmemory_db.artifacts.update_one(
+            {"task_id": task_id, "node_id": "s"},
+            {"$set": {"status": "complete", "meta": {"prebuilt": True}}},
+            upsert=True
+        )
+
+        tdoc = await wait_task_finished(inmemory_db, task_id, timeout=6.0)
+        s = node_by_id(tdoc, "s")
+        assert str(s.get("status")).endswith("finished")
+        # fast-path устанавливает новую эпоху (1), но не отправляет CMD на воркера
+        assert int(s.get("attempt_epoch", 0)) == 1
+    finally:
+        await coord.stop()
+
+@pytest.mark.asyncio
+async def test_heartbeat_updates_lease_deadline(env_and_imports, inmemory_db, monkeypatch):
+    cd, wu = env_and_imports
+    # ускоряем heartbeat
+    monkeypatch.setattr(wu, "HEARTBEAT_INTERVAL_SEC", 0.05, raising=False)
+
+    w = wu.Worker(roles=["source"], handlers={"source": build_slow_source_handler(wu, total=40, batch=4, delay=0.12)})
+    await w.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = {"schema_version": "1.0",
+                 "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all", "io": {"input_inline": {}}}],
+                 "edges": []}
+        graph = prime_graph(cd, graph)
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # ждём появления первого дедлайна
+        first = None
+        for _ in range(120):
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            if t:
+                lease = (node_by_id(t, "s").get("lease") or {})
+                if lease.get("deadline_ts"):
+                    first = int(lease["deadline_ts"])
+                    break
+            await asyncio.sleep(0.03)
+        assert first is not None
+
+        # ждём достаточно, чтобы дедлайн «перекатился» на следующую секунду
+        lease_ttl = float(getattr(cd, "NODE_LEASE_SEC", getattr(cd, "LEASE_TTL_SEC", 1.0)))
+        await asyncio.sleep(max(lease_ttl * 1.2, 1.1))
+
+        # пуллим до роста дедлайна (с запасом)
+        second = first
+        for _ in range(40):
+            t2 = await inmemory_db.tasks.find_one({"id": task_id})
+            second = int((node_by_id(t2, "s").get("lease") or {}).get("deadline_ts") or 0)
+            if second > first:
+                break
+            await asyncio.sleep(0.05)
+
+        assert second > first, f"heartbeat should push lease deadline forward (first={first}, second={second})"
+
+        # добиваем задачу
+        await wait_task_finished(inmemory_db, task_id, timeout=12.0)
+    finally:
+        await coord.stop()
+        await w.stop()

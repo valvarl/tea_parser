@@ -266,6 +266,9 @@ class PullAdapters:
         cancel_flag: Optional[asyncio.Event] = None,
     ) -> AsyncIterator[Batch]:
 
+        # На случай «немого» in-mem драйвера сделаем мягкий in-process клейм,
+        # чтобы не дублировать шарды при фолбэке.
+        claimed_mem: set[tuple[str, str, str, str]] = set()
         if not from_nodes:
             return
 
@@ -279,42 +282,82 @@ class PullAdapters:
             got_any = False
             try:
                 for src in from_nodes:
+                    matched = 0
+                    used_fallback = False
                     # Ищем partial-шарды этого src
                     # Берём небольшими пачками, чтобы не держать курсор долго
-                    cur = db.artifacts.find(
-                        {"task_id": task_id, "node_id": src, "status": "partial"},
-                        {"_id": 0, "task_id": 1, "node_id": 1, "shard_id": 1, "meta": 1, "created_at": 1}
-                    ).sort([("created_at", 1)]).limit(200)
+                    try:
+                        cur = db.artifacts.find(
+                            {"task_id": task_id, "node_id": src, "status": "partial"},
+                            {"_id": 0, "task_id": 1, "node_id": 1, "shard_id": 1, "meta": 1, "created_at": 1}
+                        ).sort([("created_at", 1)]).limit(200)
+                        async for a in cur:
+                            shard_id = a.get("shard_id")
+                            if not shard_id:
+                                continue
+                            # Попытка клейма: уникальный insert
+                            try:
+                                await db.stream_progress.insert_one({
+                                    "task_id": task_id,
+                                    "consumer_node": consumer_node,
+                                    "from_node": src,
+                                    "shard_id": shard_id,
+                                    "claimed_at": now_dt()
+                                })
+                            except Exception:
+                                # duplicate или временная ошибка → пропустим
+                                continue
+                            matched += 1
+                            got_any = True
+                            backoff_ms = poll_ms  # сброс бэк-оффа
+                            yield Batch(
+                                shard_id=shard_id,
+                                payload={
+                                    "from_node": src,
+                                    "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
+                                    "meta": a.get("meta") or {}
+                                }
+                            )
+                    except Exception:
+                        used_fallback = True
+                        # Фолбэк на in-mem API: db.artifacts.rows
+                        rows = getattr(getattr(db, "artifacts", None), "rows", None)
+                        if isinstance(rows, list):
+                            for a in list(rows):
+                                if a.get("task_id") != task_id or a.get("node_id") != src or a.get("status") != "partial":
+                                    continue
+                                shard_id = a.get("shard_id")
+                                if not shard_id:
+                                    continue
+                                key = (task_id, consumer_node, src, shard_id)
+                                if key in claimed_mem:
+                                    continue
+                                # Попробуем зафиксировать claim и в коллекции (если есть)
+                                try:
+                                    await db.stream_progress.insert_one({
+                                        "task_id": task_id,
+                                        "consumer_node": consumer_node,
+                                        "from_node": src,
+                                        "shard_id": shard_id,
+                                        "claimed_at": now_dt()
+                                    })
+                                except Exception:
+                                    pass
+                                claimed_mem.add(key)
+                                matched += 1
+                                got_any = True
+                                backoff_ms = poll_ms
+                                yield Batch(
+                                    shard_id=shard_id,
+                                    payload={
+                                        "from_node": src,
+                                        "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
+                                        "meta": (a.get("meta") or {})
+                                    }
+                                )
 
-                    async for a in cur:
-                        if cancel_flag and cancel_flag.is_set():
-                            break
-                        shard_id = a.get("shard_id")
-                        if not shard_id:
-                            continue
-                        # Попытка клейма: уникальный insert
-                        try:
-                            await db.stream_progress.insert_one({
-                                "task_id": task_id,
-                                "consumer_node": consumer_node,
-                                "from_node": src,
-                                "shard_id": shard_id,
-                                "claimed_at": now_dt()
-                            })
-                        except Exception:
-                            # duplicate или временная ошибка → пропустим
-                            continue
-
-                        got_any = True
-                        backoff_ms = poll_ms  # сброс бэк-оффа
-                        yield Batch(
-                            shard_id=shard_id,
-                            payload={
-                                "from_node": src,
-                                "ref": {"task_id": task_id, "node_id": src, "shard_id": shard_id},
-                                "meta": a.get("meta") or {}
-                            }
-                        )
+                    # диагностика по каждому источнику
+                    log(event="pull_scan", consumer=consumer_node, src=src, found=matched, fallback=used_fallback)
 
                 if got_any:
                     continue
@@ -693,6 +736,9 @@ class Worker:
                 adapter_kwargs.setdefault("eof_on_task_done", True)
                 adapter_kwargs.setdefault("backoff_max_ms", PULL_EMPTY_BACKOFF_MS_MAX)
 
+                # Диагностика: видно, пошли в адаптер и что именно он тянет
+                log(event="adapter_selected", node=self.active.node_id, adapter=adapter_name, from_nodes=from_nodes, kwargs=adapter_kwargs)
+
                 async def _iter_batches_adapter() -> AsyncIterator[Batch]:
                     it = INPUT_ADAPTERS[adapter_name](
                         task_id=self.active.task_id,
@@ -702,10 +748,15 @@ class Worker:
                         **adapter_kwargs,  # <-- тут приходят size, meta_list_key и пр.
                     )
                     async for b in it:
+                        # Диагностика: что реально прилетело аналайзеру
+                        if isinstance(b.payload, dict):
+                            _cnt = len(b.payload.get("items") or b.payload.get("skus") or [])
+                            log(event="adapter_batch", node=self.active.node_id, shard=b.shard_id, items=_cnt)
                         yield b
 
                 batch_iter = _iter_batches_adapter()
             else:
+                log(event="handler_iter_batches_fallback", node=self.active.node_id)
                 batch_iter = handler.iter_batches(loaded)
 
             # iterate batches with resilience
@@ -794,6 +845,11 @@ class Worker:
             payload={"kind": EventKind.BATCH_OK, "worker_id": WORKER_ID, "batch_id": None,
                      "metrics": res.metrics or {}, "artifacts_ref": artifacts_ref}
         )
+        try:
+            c = (res.metrics or {}).get("count")
+            log(event="emit_batch_ok", node=base.node_id, shard=batch.shard_id, count=c, metrics=res.metrics)
+        except Exception:
+            pass
         await self._send_status(role, env)
 
     async def _emit_batch_failed(self, role: str, base: Envelope, batch: Batch, res: BatchResult, override_artifacts_ref: Optional[Dict[str, Any]] = None) -> None:

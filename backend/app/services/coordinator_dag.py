@@ -309,20 +309,6 @@ class KafkaBus:
             await self._producer.stop()
         self._producer = None
 
-    def register_reply(self, corr_id: str) -> asyncio.Event:
-        ev = asyncio.Event()
-        self._replies[corr_id] = []
-        self._reply_events[corr_id] = ev
-        return ev
-    
-    def push_reply(self, corr_id: str, env: Envelope) -> None:
-        bucket = self._replies.get(corr_id)
-        if bucket is not None:
-            bucket.append(env)
-        ev = self._reply_events.get(corr_id)
-        if ev:
-            ev.set()
-
     def _topic_cmd(self, step_type: str) -> str:
         return TOPIC_CMD_FMT.format(type=step_type)
 
@@ -353,11 +339,14 @@ class KafkaBus:
         self._replies[corr_id] = []
         self._reply_events[corr_id] = ev
         return ev
-
+    
     def push_reply(self, corr_id: str, env: Envelope) -> None:
         bucket = self._replies.get(corr_id)
         if bucket is not None:
             bucket.append(env)
+        ev = self._reply_events.get(corr_id)
+        if ev:
+            ev.set()
 
     def collect_replies(self, corr_id: str) -> List[Envelope]:
         envs = self._replies.pop(corr_id, [])
@@ -450,6 +439,8 @@ class Coordinator:
         self._status_consumers: Dict[str, AIOKafkaConsumer] = {}
         self._query_reply_consumer: Optional[AIOKafkaConsumer] = None
 
+        self._gid = f"coord.{uuid.uuid4().hex[:6]}"  # NEW: уникальный префикс групп
+
     # ── Lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
         await self._ensure_indexes()
@@ -478,18 +469,18 @@ class Coordinator:
     # ── Consumers ───────────────────────────────────────────────────────
     async def _start_consumers(self) -> None:
         # worker announce
-        self._announce_consumer = await self.bus.new_consumer([TOPIC_WORKER_ANNOUNCE], group_id="coord.announce", manual_commit=True)
+        self._announce_consumer = await self.bus.new_consumer([TOPIC_WORKER_ANNOUNCE], group_id=f"{self._gid}.announce", manual_commit=True)
         self._spawn(self._run_announce_consumer(self._announce_consumer))
 
         # worker status per type
         for t in WORKER_TYPES:
             topic = self.bus._topic_status(t)
-            c = await self.bus.new_consumer([topic], group_id=f"coord.status.{t}", manual_commit=True)
+            c = await self.bus.new_consumer([topic], group_id=f"{self._gid}.status.{t}", manual_commit=True)
             self._status_consumers[t] = c
             self._spawn(self._run_status_consumer(t, c))
 
         # replies (for TASK_DISCOVER snapshots)
-        self._query_reply_consumer = await self.bus.new_consumer([TOPIC_REPLY], group_id="coord.reply", manual_commit=True)
+        self._query_reply_consumer = await self.bus.new_consumer([TOPIC_REPLY], group_id=f"{self._gid}.reply", manual_commit=True)
         self._spawn(self._run_reply_consumer(self._query_reply_consumer))
 
     async def _run_reply_consumer(self, c: AIOKafkaConsumer) -> None:
@@ -926,14 +917,58 @@ class Coordinator:
                       "graph.nodes.$.lease.lease_id": p.lease_id,
                       "graph.nodes.$.lease.deadline_ts": p.lease_deadline_ts},
              "$max": {"graph.nodes.$.last_event_ts": env.ts}})
+        
+    async def _anchor_metrics_on_shard_once(self, *, task_id: str, node_id: str, shard_id: Optional[str], kind: str = "BATCH_OK") -> bool:
+        """
+        True — это первое применение метрик для данного shard_id (можно инкрементить),
+        False — уже считали ранее (дубль).
+        Реализовано простым find+insert без спец. операторов — стабильно на in-mem.
+        """
+        try:
+            key = {"task_id": task_id, "node_id": node_id, "kind": kind}
+            if shard_id is not None:
+                key["shard_id"] = shard_id
+            else:
+                # для событий без шарда якоримся на event_hash
+                key["event_hash"] = stable_hash({"t": task_id, "n": node_id, "k": kind})
 
-    async def _apply_metrics_once(self, env: Envelope, metrics: Dict[str, int]) -> None:
-        res = await db.worker_events.find_one_and_update(
-            {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts}),
-             "metrics_applied": {"$ne": True}},
-            {"$set": {"metrics_applied": True}}
-        )
-        if res and metrics:
+            exists = await db.metrics_anchors.find_one(key)
+            if exists:
+                return False
+            await db.metrics_anchors.insert_one({**key, "created_at": now_dt()})
+            return True
+        except Exception:
+            # в спорных ситуациях лучше не удваивать метрики
+            return False
+
+    async def _apply_metrics_once(self, env: Envelope, metrics: Dict[str, int], *, artifacts_ref: Optional[Dict[str, Any]] = None) -> None:
+        if not metrics:
+            return
+        # 1) основной якорь — запись в worker_events (best-effort)
+        try:
+            res = await db.worker_events.find_one_and_update(
+                {"task_id": env.task_id, "node_id": env.node_id, "event_hash": stable_hash({"dedup_id": env.dedup_id, "ts": env.ts})},
+                {"$set": {"metrics_applied": True}}
+            )
+        except Exception:
+            res = None
+
+        anchor_ok = res is not None
+
+        # 2) фолбэк-якорь — сам артефакт шарда (если есть shard_id)
+        if not anchor_ok and artifacts_ref:
+            shard_id = (artifacts_ref or {}).get("shard_id")
+            if shard_id:
+                try:
+                    ar = await db.artifacts.find_one_and_update(
+                        {"task_id": env.task_id, "node_id": env.node_id, "shard_id": shard_id, "metrics_applied": {"$ne": True}},
+                        {"$set": {"metrics_applied": True}}
+                    )
+                    anchor_ok = ar is not None
+                except Exception:
+                    anchor_ok = False
+
+        if anchor_ok and metrics:
             inc: Dict[str, int] = {}
             for k, v in (metrics or {}).items():
                 try:
@@ -943,10 +978,19 @@ class Coordinator:
                 except Exception:
                     continue
             if inc:
+                print(f"[COORD] METRICS_APPLY node={env.node_id} inc={inc}", flush=True)
                 await db.tasks.update_one(
                     {"id": env.task_id, "graph.nodes.node_id": env.node_id},
                     {"$inc": inc, "$currentDate": {"updated_at": True}}
                 )
+        else:
+            # диагностический лог — поможет увидеть, когда сработал фолбэк или якоря не было
+            try:
+                print("[COORD][WARN] metrics skipped (no anchor)",
+                      "node=", env.node_id, "metrics=", metrics, "shard=",
+                      (artifacts_ref or {}).get("shard_id"))
+            except Exception:
+                pass
 
     async def _persist_artifact_partial(self, env: Envelope, ref: Dict[str, Any], meta: Dict[str, Any]) -> None:
         """
@@ -968,7 +1012,7 @@ class Coordinator:
                                   "attempt_epoch": env.attempt_epoch, "status": "partial",
                                   "meta": meta or {}, "payload": None, "worker_id": env.payload.get("worker_id"),
                                   "created_at": now_dt()},
-                 "$set": {"updated_at": now_dt()}},
+                 "$set": {"status": "partial", "updated_at": now_dt()}},
                 upsert=True
             )
         except Exception as e:
@@ -1032,11 +1076,30 @@ class Coordinator:
 
     async def _on_batch_ok(self, env: Envelope) -> None:
         p = EvBatchOk.model_validate(env.payload)
-        await self._apply_metrics_once(env, p.metrics or {})
-
-        # Идемпотентно фиксируем partial артефакт (шард)
+        # 1) СНАЧАЛА идемпотентно записываем partial артефакт — чтобы был материал для отладки
         if p.artifacts_ref:
             await self._persist_artifact_partial(env, p.artifacts_ref, p.metrics or {})
+        # 2) Якоримся на шард (один раз)
+        shard_id = (p.artifacts_ref or {}).get("shard_id") if p.artifacts_ref else None
+        first_time = await self._anchor_metrics_on_shard_once(task_id=env.task_id, node_id=env.node_id, shard_id=shard_id)
+        if first_time and (p.metrics or {}):
+            # инкрементим (ровно один раз на шард)
+            inc: Dict[str, int] = {}
+            for k, v in (p.metrics or {}).items():
+                try:
+                    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()):
+                        inc[f"graph.nodes.$.stats.{k}"] = int(v)
+                except Exception:
+                    continue
+            if inc:
+                await db.tasks.update_one(
+                    {"id": env.task_id, "graph.nodes.node_id": env.node_id},
+                    {"$inc": inc, "$currentDate": {"updated_at": True}}
+                )
+        # 3) Старую схему используем ТОЛЬКО если новый якорь не поставился.
+        #    Она — молчаливый бэкап, без WARN и без двойных инкрементов.
+        if not first_time and (p.metrics or {}):
+            await self._apply_metrics_once(env, p.metrics or {}, artifacts_ref=p.artifacts_ref)
 
         # Попробуем «ранний старт» downstream на первый батч
         try:
@@ -1091,7 +1154,20 @@ class Coordinator:
                 return
         except Exception:
             pass
-        await self._apply_metrics_once(env, p.metrics or {})
+        if p.metrics:
+            # На TASK_DONE метрики часто агрегированы/дублируют BATCH_OK.
+            # Если они есть — применяем только по новому «шардовому» пути.
+            first_time = await self._anchor_metrics_on_shard_once(
+                task_id=env.task_id, node_id=env.node_id, shard_id=None, kind="TASK_DONE")
+            if first_time:
+                inc = {f"graph.nodes.$.stats.{k}": int(v)
+                       for k, v in (p.metrics or {}).items()
+                       if (isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().lstrip('-').isdigit()))}
+                if inc:
+                    await db.tasks.update_one(
+                        {"id": env.task_id, "graph.nodes.node_id": env.node_id},
+                        {"$inc": inc, "$currentDate": {"updated_at": True}}
+                    )
         if p.artifacts_ref:
             # помечаем результат ноды как complete
             try:
@@ -1208,6 +1284,14 @@ class Coordinator:
             await db.artifacts.create_index([("task_id", 1), ("node_id", 1), ("shard_id", 1)], unique=True, sparse=True, name="uniq_artifact_shard")
             await db.outbox.create_index([("fp", 1)], unique=True, name="uniq_outbox_fp")
             await db.outbox.create_index([("state", 1), ("next_attempt_at", 1)], name="ix_outbox_state_next")
+            await db.metrics_anchors.create_index([("task_id", 1), ("node_id", 1), ("kind", 1), ("shard_id", 1)], name="ix_metrics_anchor_shard")
+            await db.metrics_anchors.create_index([("task_id", 1), ("node_id", 1), ("kind", 1), ("event_hash", 1)], name="ix_metrics_anchor_event")
+            await db.metrics_anchors.create_index(
+                [("task_id", 1), ("node_id", 1), ("kind", 1), ("shard_id", 1)],
+                name="uniq_metrics_anchor_shard", unique=True, sparse=True)
+            await db.metrics_anchors.create_index(
+                [("task_id", 1), ("node_id", 1), ("kind", 1), ("event_hash", 1)],
+                name="uniq_metrics_anchor_event", unique=True, sparse=True)
         except Exception:
             pass
 
