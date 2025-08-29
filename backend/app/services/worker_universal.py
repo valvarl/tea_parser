@@ -728,7 +728,8 @@ class Worker:
             ctx = RunContext(self._cancel_flag, artifacts)
 
             loaded = await handler.load_input(cmd.input_ref, cmd.input_inline)
-            # Встроенная маршрутизация входа: если указан input_adapter — используем наш pull-итератор,
+
+            # Встроенная маршрутизация входа: если указан input_adapter — используем pull-итератор,
             # иначе — делегируем iter_batches хэндлеру.
             input_inline = (loaded or {}).get("input_inline") if isinstance(loaded, dict) else {}
             adapter_name = (input_inline or {}).get("input_adapter")
@@ -748,7 +749,6 @@ class Worker:
                 adapter_kwargs.setdefault("eof_on_task_done", True)
                 adapter_kwargs.setdefault("backoff_max_ms", PULL_EMPTY_BACKOFF_MS_MAX)
 
-                # Диагностика: видно, пошли в адаптер и что именно он тянет
                 log(event="adapter_selected", node=self.active.node_id, adapter=adapter_name, from_nodes=from_nodes, kwargs=adapter_kwargs)
 
                 async def _iter_batches_adapter() -> AsyncIterator[Batch]:
@@ -796,13 +796,14 @@ class Worker:
                         if not artifacts_ref:
                             artifacts_ref = {"batch_uid": uid}
                     await self._emit_batch_ok(role, start_env, batch, res, uid, override_artifacts_ref=artifacts_ref)
-                else:
-                    artifacts_ref = {"batch_uid": uid}
-                    await self._emit_batch_failed(role, start_env, batch, res, uid, override_artifacts_ref=artifacts_ref)
-                    if res.permanent:
-                        raise RuntimeError(f"permanent:{res.reason_code or 'error'}")
+                    continue
 
-            # finalize
+                # --- любой фейл батча: завершаем таску как FAILED и выходим ---
+                await self._emit_batch_failed(role, start_env, batch, res, uid, override_artifacts_ref={"batch_uid": uid})
+                await self._emit_task_failed(role, start_env, res.reason_code or "error", bool(res.permanent), res.error)
+                return  # критично: не вызываем finalize/mark_complete/TASK_DONE
+
+            # дошли до конца без ошибок → финализируем
             fin = await handler.finalize(ctx)
             metrics = (fin.metrics if fin else {}) if fin else {}
             ref = (fin.artifacts_ref if fin else None)

@@ -164,9 +164,27 @@ async def test_idempotent_metrics_on_duplicate_events(env_and_imports, inmemory_
         # Граф — один узел 's' типа 'source'
         graph = {
             "schema_version": "1.0",
-            "nodes": [{"node_id": "s", "type": "source", "depends_on": [], "fan_in": "all",
-                       "io": {"input_inline": {}}}],
-            "edges": []
+            "nodes": [
+                {
+                    "node_id": "s",
+                    "type": "source",
+                    "depends_on": [],
+                    "fan_in": "all",
+                    "io": {"input_inline": {}},
+                },
+                {
+                    # запускается после 's' и агрегирует метрики узла 's'
+                    "node_id": "agg",
+                    "type": "coordinator_fn",
+                    "depends_on": ["s"],
+                    "fan_in": "all",
+                    "io": {
+                        "fn": "metrics.aggregate",
+                        "fn_args": {"node_id": "s", "mode": "sum"}  # агрегируем в stats узла 's'
+                    },
+                },
+            ],
+            "edges": [["s", "agg"]],
         }
         graph = prime_graph(cd, graph)
         task_id = await coord.create_task(params={}, graph=graph)
@@ -177,6 +195,7 @@ async def test_idempotent_metrics_on_duplicate_events(env_and_imports, inmemory_
         dbg("IDEMPOTENT.FINAL", count=got)
         # total=9 (3 батча по 3) — не должно удвоиться
         assert got == 9
+        assert str(node_by_id(tdoc, "agg").get("status")).endswith("finished")
     finally:
         await coord.stop()
 

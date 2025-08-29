@@ -701,6 +701,11 @@ class Coordinator:
         status = self._to_runstate(node.get("status"))
         if status not in (RunState.queued, RunState.deferred):
             return False
+        
+        if status == RunState.deferred:
+            nra = int(node.get("next_retry_at") or 0)
+            if nra and nra > now_ts():
+                return False
 
         io = (node.get("io") or {})
         start_when = (io.get("start_when") or "").lower()
