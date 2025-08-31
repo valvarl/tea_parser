@@ -652,14 +652,22 @@ async def wait_task_finished(db: InMemDB, task_id: str, timeout: float = 10.0) -
 # ====================== test handlers ===================
 def make_test_handlers(wu) -> Dict[str, Any]:
     """
-    Хендлеры с эмуляцией pull.from_artifacts и pull.from_artifacts.rechunk:size прямо в тестах.
-    Теперь ВСЁ batch_uid-based (shard_id удалён полностью).
+    Тестовые хендлеры с task-aware контекстом.
+    Добавлено: init(cfg) сохраняет task_id/attempt_epoch; mixin фильтрует по task_id,
+    а ключ дедупа включает (task_id, attempt_epoch, from_node, parent_uid).
     """
     class IndexerHandler(wu.RoleHandler):
         role = "indexer"
+
+        async def init(self, cfg):
+            self._task_id = cfg["task_id"]
+            self._attempt_epoch = cfg["attempt_epoch"]
+            dbg("HNDL.indexer.init", task_id=self._task_id, epoch=self._attempt_epoch)
+
         async def load_input(self, ref, inline):
             dbg("HNDL.indexer.load_input", inline=inline)
             return inline or {}
+
         async def iter_batches(self, loaded):
             total = int(loaded.get("total_skus", 12))
             bs = int(loaded.get("batch_size", 5))
@@ -667,54 +675,67 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             for idx in range(0, total, bs):
                 chunk = skus[idx:idx+bs]
                 uid = stable_hash({"node": "w1", "idx": idx // bs})
-                dbg("HNDL.indexer.yield", batch_uid=uid, count=len(chunk))
+                dbg("HNDL.indexer.yield", task_id=self._task_id, epoch=self._attempt_epoch, batch_uid=uid, count=len(chunk))
                 yield wu.Batch(batch_uid=uid, payload={"skus": chunk})
+
         async def process_batch(self, batch, ctx):
-            dbg("HNDL.indexer.proc", batch_uid=batch.batch_uid)
+            dbg("HNDL.indexer.proc", task_id=self._task_id, epoch=self._attempt_epoch, batch_uid=batch.batch_uid)
             delay = float(os.getenv("TEST_IDX_PROCESS_SLEEP_SEC", "0.5"))
             await asyncio.sleep(delay)
-            return wu.BatchResult(
-                success=True,
-                metrics={"skus": batch.payload["skus"], "count": len(batch.payload["skus"])}
-            )
+            return wu.BatchResult(success=True, metrics={"skus": batch.payload["skus"], "count": len(batch.payload["skus"])})
 
     class _PullFromArtifactsMixin:
-        async def _emit_from_artifacts(self, *, from_nodes: List[str], size: int, meta_key: str, poll: float, role_tag: str):
+        async def _emit_from_artifacts(
+            self, *,
+            from_nodes: List[str],
+            size: int,
+            meta_key: str,
+            poll: float,
+            role_tag: str
+        ):
             """
-            Читает partial/complete из in-mem artifacts, режет списки по size.
-            Каждый выходной батч получает batch_uid = sha1({src, parent_uid, idx}),
-            где parent_uid — batch_uid родительского partial-артефакта.
+            Читает partial/complete из in-mem artifacts ТОЛЬКО для текущего task_id,
+            режет списки по size. batch_uid = sha1({src, parent_uid, idx}).
+            Дедуп ключ: (task_id, attempt_epoch, src, parent_uid).
             """
             if not hasattr(self, "_emitted_items"):
-                self._emitted_items = {}  # {(node, parent_uid): set(items)}
+                self._emitted_items = {}  # {(task_id, attempt_epoch, node, parent_uid): set(items)}
 
             completed_nodes = set()
+
             while True:
                 progressed = False
                 has_unseen = False
 
                 for doc in list(wu.db.artifacts.rows):
+                    # фильтрация по текущей задаче
+                    if doc.get("task_id") != self._task_id:
+                        continue
+
                     node_id = doc.get("node_id")
                     if node_id not in from_nodes:
                         continue
 
                     parent_uid = doc.get("batch_uid")  # ключевой идентификатор родителя
-                    meta  = (doc.get("meta") or {})
+                    meta = (doc.get("meta") or {})
                     items = list(meta.get(meta_key) or [])
 
                     if doc.get("status") == "complete":
                         completed_nodes.add(node_id)
                         continue
 
-                    seen_key = (node_id, parent_uid)
+                    seen_key = (self._task_id, self._attempt_epoch, node_id, parent_uid)
                     seen = self._emitted_items.get(seen_key, set())
                     new_items = [x for x in items if x not in seen]
+
                     if new_items:
                         idx_local = 0
                         for i in range(0, len(new_items), size):
                             chunk = new_items[i:i+size]
                             chunk_uid = stable_hash({"src": node_id, "parent": parent_uid, "idx": idx_local})
-                            dbg("HNDL.emit", src=node_id, parent_uid=parent_uid, batch_uid=chunk_uid, chunk=len(chunk), role=role_tag)
+                            dbg("HNDL.emit",
+                                role=role_tag, task_id=self._task_id, epoch=self._attempt_epoch,
+                                src=node_id, parent_uid=parent_uid, batch_uid=chunk_uid, chunk=len(chunk))
                             yield wu.Batch(
                                 batch_uid=chunk_uid,
                                 payload={"items": chunk, "parent": {"batch_uid": parent_uid, "list_key": meta_key}},
@@ -734,9 +755,16 @@ def make_test_handlers(wu) -> Dict[str, Any]:
 
     class EnricherHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "enricher"
+
+        async def init(self, cfg):
+            self._task_id = cfg["task_id"]
+            self._attempt_epoch = cfg["attempt_epoch"]
+            dbg("HNDL.enricher.init", task_id=self._task_id, epoch=self._attempt_epoch)
+
         async def load_input(self, ref, inline):
             dbg("HNDL.enricher.load_input", inline=inline)
             return {"input_inline": inline or {}}
+
         async def iter_batches(self, loaded):
             ii = (loaded or {}).get("input_inline") or {}
             args = ii.get("input_args", {})
@@ -746,20 +774,28 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             poll = float(args.get("poll_ms", 50)) / 1000.0
             async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="enricher"):
                 yield b
+
         async def process_batch(self, batch, ctx):
             items = batch.payload.get("items")
             if not items:
-                dbg("HNDL.enricher.proc.noop")
+                dbg("HNDL.enricher.proc.noop", task_id=self._task_id, epoch=self._attempt_epoch)
                 return wu.BatchResult(success=True, metrics={"noop": 1})
             enriched = [{"sku": (x if isinstance(x, str) else x.get("sku", x)), "enriched": True} for x in items]
-            dbg("HNDL.enricher.proc", count=len(enriched))
+            dbg("HNDL.enricher.proc", task_id=self._task_id, epoch=self._attempt_epoch, count=len(enriched))
             return wu.BatchResult(success=True, metrics={"enriched": enriched, "count": len(enriched)})
 
     class OCRHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "ocr"
+
+        async def init(self, cfg):
+            self._task_id = cfg["task_id"]
+            self._attempt_epoch = cfg["attempt_epoch"]
+            dbg("HNDL.ocr.init", task_id=self._task_id, epoch=self._attempt_epoch)
+
         async def load_input(self, ref, inline):
             dbg("HNDL.ocr.load_input", inline=inline)
             return {"input_inline": inline or {}}
+
         async def iter_batches(self, loaded):
             ii = (loaded or {}).get("input_inline") or {}
             args = ii.get("input_args", {})
@@ -769,24 +805,32 @@ def make_test_handlers(wu) -> Dict[str, Any]:
             poll = float(args.get("poll_ms", 40)) / 1000.0
             async for b in self._emit_from_artifacts(from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="ocr"):
                 yield b
+
         async def process_batch(self, batch, ctx):
             items = batch.payload.get("items")
             if not items:
-                dbg("HNDL.ocr.proc.noop")
+                dbg("HNDL.ocr.proc.noop", task_id=self._task_id, epoch=self._attempt_epoch)
                 return wu.BatchResult(success=True, metrics={"noop": 1})
             ocrd = [{"sku": (it["sku"] if isinstance(it, dict) else it), "ocr_ok": True} for it in items]
-            dbg("HNDL.ocr.proc", count=len(ocrd))
+            dbg("HNDL.ocr.proc", task_id=self._task_id, epoch=self._attempt_epoch, count=len(ocrd))
             return wu.BatchResult(success=True, metrics={"ocr": ocrd, "count": len(ocrd)})
 
     class AnalyzerHandler(_PullFromArtifactsMixin, wu.RoleHandler):
         role = "analyzer"
+
+        async def init(self, cfg):
+            self._task_id = cfg["task_id"]
+            self._attempt_epoch = cfg["attempt_epoch"]
+            dbg("HNDL.analyzer.init", task_id=self._task_id, epoch=self._attempt_epoch)
+
         async def load_input(self, ref, inline):
             dbg("HNDL.analyzer.load_input", inline=inline)
             # Возвращаем inline, чтобы можно было использовать адаптер воркера при желании.
             return (inline or {})
+
         async def iter_batches(self, loaded):
             # По умолчанию читаем поток как mixin (так надёжнее для юнитов).
-            dbg("HNDL.analyzer.iter_batches", inline=loaded)
+            dbg("HNDL.analyzer.iter_batches", inline=loaded, task_id=self._task_id, epoch=self._attempt_epoch)
             args = (loaded or {}).get("input_args", {}) or {}
             from_nodes = list(args.get("from_nodes") or [])
             meta_key = args.get("meta_list_key") or "skus"
@@ -796,14 +840,15 @@ def make_test_handlers(wu) -> Dict[str, Any]:
                 from_nodes=from_nodes, size=size, meta_key=meta_key, poll=poll, role_tag="analyzer"
             ):
                 yield b
+
         async def process_batch(self, batch, ctx):
             payload = batch.payload or {}
             items = payload.get("items") or payload.get("skus") or []
             n = len(items)
             if n:
-                dbg("HNDL.analyzer.proc", count=n)
+                dbg("HNDL.analyzer.proc", task_id=self._task_id, epoch=self._attempt_epoch, count=n)
                 return wu.BatchResult(success=True, metrics={"count": n, "sinked": n})
-            dbg("HNDL.analyzer.proc.noop")
+            dbg("HNDL.analyzer.proc.noop", task_id=self._task_id, epoch=self._attempt_epoch)
             return wu.BatchResult(success=True, metrics={"noop": 1})
 
     return {

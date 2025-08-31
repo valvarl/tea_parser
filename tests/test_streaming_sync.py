@@ -130,6 +130,29 @@ def _make_indexer(node_id, total, batch):
         "status": None, "attempt_epoch": 0
     }
 
+def add_metrics_agg(graph: dict, *, target: str = "d", name: str | None = None) -> dict:
+    """
+    Вставляет coordinator_fn-ноду, которая запускается после `target`
+    и агрегирует сырые метрики узла target в graph.nodes.$.stats target’а.
+    """
+    name = name or f"agg_{target}"
+    graph.setdefault("nodes", [])
+    graph.setdefault("edges", [])
+    graph["nodes"].append({
+        "node_id": name,
+        "type": "coordinator_fn",
+        "depends_on": [target],
+        "fan_in": "all",
+        "io": {
+            "fn": "metrics.aggregate",
+            "fn_args": {"node_id": target, "mode": "sum"}
+        },
+        "status": None,
+        "attempt_epoch": 0,
+    })
+    graph["edges"].append([target, name])
+    return graph
+
 # ───────────────────────── Tests ─────────────────────────
 
 @pytest.mark.asyncio
@@ -232,6 +255,7 @@ async def test_multistream_fanin_stream_to_one_downstream(env_and_imports, inmem
         "nodes": [u1,u2,u3,d],
         "edges": [["u1","d"],["u2","d"],["u3","d"]],
     }
+    graph = add_metrics_agg(graph, target="d")
     graph = prime_graph(cd, graph)
 
     task_id = await coord.create_task(params={}, graph=graph)
@@ -295,6 +319,7 @@ async def test_metrics_single_stream_exact_count(env_and_imports, inmemory_db, c
         "status": None, "attempt_epoch": 0
     }
     graph = {"schema_version": "1.0", "nodes": [u, d], "edges": [["u","d"]]}
+    graph = add_metrics_agg(graph, target="d")
     graph = prime_graph(cd, graph)
 
     task_id = await coord.create_task(params={}, graph=graph)
@@ -328,6 +353,7 @@ async def test_metrics_multistream_exact_sum(env_and_imports, inmemory_db, coord
     graph = {"schema_version": "1.0",
              "nodes": [u1, u2, u3, d],
              "edges": [["u1","d"], ["u2","d"], ["u3","d"]]}
+    graph = add_metrics_agg(graph, target="d") 
     graph = prime_graph(cd, graph)
 
     task_id = await coord.create_task(params={}, graph=graph)
@@ -357,6 +383,7 @@ async def test_metrics_partial_batches_exact_count(env_and_imports, inmemory_db,
         "status": None, "attempt_epoch": 0
     }
     graph = {"schema_version": "1.0", "nodes": [u, d], "edges": [["u","d"]]}
+    graph = add_metrics_agg(graph, target="d")
     graph = prime_graph(cd, graph)
 
     task_id = await coord.create_task(params={}, graph=graph)
@@ -385,6 +412,7 @@ async def test_metrics_isolation_between_tasks(env_and_imports, inmemory_db, coo
             "status": None, "attempt_epoch": 0
         }
         g = {"schema_version": "1.0", "nodes": [u, d], "edges": [["u","d"]]}
+        g = add_metrics_agg(g, target="d")
         g = prime_graph(cd, g)
         tid = await coord.create_task(params={}, graph=g)
         tdoc = await wait_task_finished(inmemory_db, tid, timeout=12.0)
@@ -436,6 +464,7 @@ async def test_metrics_idempotent_on_duplicate_status_events(env_and_imports, in
         "status": None, "attempt_epoch": 0
     }
     graph = {"schema_version": "1.0", "nodes": [u, d], "edges": [["u","d"]]}
+    graph = add_metrics_agg(graph, target="d")
     graph = prime_graph(cd, graph)
 
     task_id = await coord.create_task(params={}, graph=graph)

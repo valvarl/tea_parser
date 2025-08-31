@@ -95,6 +95,7 @@ class EventKind(str, Enum):
     TASK_HEARTBEAT = "TASK_HEARTBEAT"
     BATCH_OK = "BATCH_OK"
     BATCH_FAILED = "BATCH_FAILED"
+    TASK_RESUMED = "TASK_RESUMED"
     TASK_DONE = "TASK_DONE"
     TASK_FAILED = "TASK_FAILED"
     CANCELLED = "CANCELLED"
@@ -465,7 +466,7 @@ class OutboxDispatcher:
 
 # ─────────────────────────── Coordinator core ──────────────────────────
 class Coordinator:
-    def __init__(self) -> None:
+    def __init__(self, worker_types: Optional[list[str]] = None) -> None:
         self.bus = KafkaBus(KAFKA_BOOTSTRAP)
         self.outbox = OutboxDispatcher(self.bus)
         self._tasks: set[asyncio.Task] = set()
@@ -476,6 +477,8 @@ class Coordinator:
         self._query_reply_consumer: Optional[AIOKafkaConsumer] = None
 
         self._gid = f"coord.{uuid.uuid4().hex[:6]}"
+
+        self.worker_types: list[str] = list(worker_types or WORKER_TYPES)
 
     # ── Lifecycle ───────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -509,7 +512,7 @@ class Coordinator:
         self._spawn(self._run_announce_consumer(self._announce_consumer))
 
         # worker status per type
-        for t in WORKER_TYPES:
+        for t in self.worker_types:
             topic = self.bus._topic_status(t)
             c = await self.bus.new_consumer([topic], group_id=f"{self._gid}.status.{t}", manual_commit=True)
             self._status_consumers[t] = c
@@ -611,6 +614,8 @@ class Coordinator:
                         await self._on_task_accepted(env)
                     elif kind == EventKind.TASK_HEARTBEAT:
                         await self._on_task_heartbeat(env)
+                    elif kind == EventKind.TASK_RESUMED:
+                        await self._on_task_heartbeat(env)  # семантически приравниваем к HB
                     elif kind == EventKind.BATCH_OK:
                         await self._on_batch_ok(env)
                     elif kind == EventKind.BATCH_FAILED:
@@ -841,6 +846,20 @@ class Coordinator:
                                                 "graph.nodes.$.finished_at": now_dt(),
                                                 "graph.nodes.$.attempt_epoch": new_epoch}})
             return
+
+        # GRACE-GATE: не стартуем новую попытку, если недавно были события по ноде
+        # ВАЖНО: для узла в deferred это правило НЕ применяется (нам нужен ретрай).
+        try:
+            fresh = await db.tasks.find_one({"id": task_id}, {"graph": 1})
+            fresh_node = self._get_node(fresh, node_id) if fresh else None
+            last = int((fresh_node or {}).get("last_event_ts") or 0)
+            status = self._to_runstate((fresh_node or {}).get("status"))
+            if status not in (RunState.deferred,):
+                # даём шанс воркеру резюмировать/ответить DISCOVER, но недолго
+                if now_ts() - last < DISCOVERY_WINDOW_SEC:
+                    return
+        except Exception:
+            pass
 
         # стартуем ноду
         await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": node_id},

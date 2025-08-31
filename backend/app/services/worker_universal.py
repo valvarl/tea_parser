@@ -101,6 +101,7 @@ class EventKind(str, Enum):
     TASK_HEARTBEAT = "TASK_HEARTBEAT"
     BATCH_OK = "BATCH_OK"
     BATCH_FAILED = "BATCH_FAILED"
+    TASK_RESUMED = "TASK_RESUMED"
     TASK_DONE = "TASK_DONE"
     TASK_FAILED = "TASK_FAILED"
     CANCELLED = "CANCELLED"
@@ -183,9 +184,16 @@ class LocalState:
 
 # ─────────────────────────── Role handler API ──────────────────────────
 class RunContext:
-    def __init__(self, cancel_flag: asyncio.Event, artifacts_writer: "ArtifactsWriter"):
+    def __init__(self, cancel_flag: asyncio.Event, artifacts_writer: "ArtifactsWriter",
+                 task_id: str, node_id: str, attempt_epoch: int, worker_id: str):
         self._cancel_flag = cancel_flag
         self.artifacts = artifacts_writer
+        # полезное для хендлеров
+        self.task_id = task_id
+        self.node_id = node_id
+        self.attempt_epoch = attempt_epoch
+        self.worker_id = worker_id
+        self.kv: Dict[str, Any] = {}  # эфемерное хранилище на время ранa
 
     def cancelled(self) -> bool:
         return self._cancel_flag.is_set()
@@ -563,11 +571,9 @@ class Worker:
         # Heartbeat announce (optional every 60s)
         self._spawn(self._periodic_announce())
 
-        # Recover flag (координатор сам решит, что делать с активным ранoм)
+        # Recovery hint only (без занятия слота и без heartbeat):
         if self.active:
-            self._busy = True
-            self._cancel_flag.clear()
-            log(event="recovery_start", task_id=self.active.task_id, node_id=self.active.node_id)
+            log(event="recovery_present", task_id=self.active.task_id, node_id=self.active.node_id)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -659,10 +665,10 @@ class Worker:
                 # already busy → ignore; координатор сделает retry/defer
                 await consumer.commit()
                 return
+            # Если в LocalState лежит "призрак" от другой задачи — сбрасываем и принимаем новую
             if self.active and not (self.active.task_id == env.task_id and self.active.node_id == env.node_id):
-                await consumer.commit()
-                return
-
+                self.active = None
+                await self.state.write_active(None)
             # accept
             lease_id = str(uuid.uuid4())
             lease_deadline = now_ts() + LEASE_TTL_SEC
@@ -723,9 +729,19 @@ class Worker:
             return
 
         try:
-            await handler.init({})
+            await handler.init({
+                "task_id": self.active.task_id,
+                "node_id": self.active.node_id,
+                "attempt_epoch": self.active.attempt_epoch,
+                "worker_id": WORKER_ID,
+                "role": role,
+            })
             artifacts = ArtifactsWriter(self.active.task_id, self.active.node_id, self.active.attempt_epoch, WORKER_ID)
-            ctx = RunContext(self._cancel_flag, artifacts)
+            ctx = RunContext(self._cancel_flag, artifacts,
+                             task_id=self.active.task_id,
+                             node_id=self.active.node_id,
+                             attempt_epoch=self.active.attempt_epoch,
+                             worker_id=WORKER_ID)
 
             loaded = await handler.load_input(cmd.input_ref, cmd.input_inline)
 
@@ -811,12 +827,21 @@ class Worker:
             await self._emit_task_done(role, start_env, metrics, ref)
 
         except asyncio.CancelledError:
-            await self._emit_cancelled(role, start_env, "cancelled")
+            # При штатном shutdown — не шлём CANCELLED и НЕ чистим local state.
+            if self._stopping:
+                log(event="shutdown_preserve_state", node=self.active.node_id if self.active else None)
+            else:
+                await self._emit_cancelled(role, start_env, "cancelled")
+            return
         except Exception as e:
             reason, permanent = handler.classify_error(e) if handler else ("unexpected_error", False)
             await self._emit_task_failed(role, start_env, reason, permanent, str(e))
+            return
         finally:
-            await self._cleanup_after_run()
+            # При штатном останове процесса сохраняем active_run,
+            # чтобы новый процесс мог «усыновить» попытку.
+            if not self._stopping:
+                await self._cleanup_after_run()
 
     async def _cleanup_after_run(self) -> None:
         self._cancel_flag.clear()
