@@ -417,25 +417,29 @@ class OutboxDispatcher:
                 now = now_ts()
                 cur = db.outbox.find(
                     {"state": {"$in": ["pending", "retry"]}, "next_attempt_at": {"$lte": now}},
-                    {"_id": 1, "topic": 1, "key": 1, "envelope": 1, "attempts": 1}
+                    {"_id": 1, "fp": 1, "topic": 1, "key": 1, "envelope": 1, "attempts": 1}
                 ).sort([("next_attempt_at", 1)]).limit(200)
                 any_sent = False
                 async for ob in cur:
                     try:
                         env = Envelope.model_validate(ob["envelope"])
                         await self.bus._raw_send(ob["topic"], ob["key"].encode("utf-8"), env)
-                        await db.outbox.update_one({"_id": ob["_id"]},
+                        # В тестовой InMemDB может не быть _id — используем fp как стабильный ключ
+                        _flt = {"_id": ob["_id"]} if ob.get("_id") is not None else {"fp": ob.get("fp")}
+                        await db.outbox.update_one(_flt,
                             {"$set": {"state": "sent", "sent_at": now_dt(), "updated_at": now_dt()}})
                         any_sent = True
                     except Exception as e:
                         attempts = int(ob.get("attempts", 0)) + 1
                         if attempts >= OUTBOX_MAX_RETRY:
-                            await db.outbox.update_one({"_id": ob["_id"]},
+                            _flt = {"_id": ob.get("_id")} if ob.get("_id") is not None else {"fp": ob.get("fp")}
+                            await db.outbox.update_one(_flt,
                                 {"$set": {"state": "failed", "last_error": str(e), "updated_at": now_dt()}})
                         else:
                             backoff_ms = min(OUTBOX_BACKOFF_MAX_MS, max(OUTBOX_BACKOFF_MIN_MS, (2 ** attempts) * 100))
                             backoff_ms = _jitter_ms(backoff_ms)
-                            await db.outbox.update_one({"_id": ob["_id"]},
+                            _flt = {"_id": ob.get("_id")} if ob.get("_id") is not None else {"fp": ob.get("fp")}
+                            await db.outbox.update_one(_flt,
                                 {"$set": {"state": "retry",
                                           "attempts": attempts,
                                           "last_error": str(e),

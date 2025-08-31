@@ -293,7 +293,7 @@ async def test_outbox_retry_backoff(env_and_imports, inmemory_db, coordinator, m
     # кидаем в outbox
     await coordinator.outbox.enqueue(topic=topic, key=key, env=env)
 
-    # ждём 2 перехода в retry, затем sent
+    # ждём указанный state
     async def wait_state(expect, timeout=4.0):
         t0 = time.time()
         while time.time() - t0 < timeout:
@@ -307,7 +307,17 @@ async def test_outbox_retry_backoff(env_and_imports, inmemory_db, coordinator, m
     assert int(d1.get("attempts", 0)) == 1
     assert int(d1.get("next_attempt_at", 0)) >= int(time.time()) + 1  # backoff ≥1s
 
-    d2 = await wait_state("retry", timeout=3.0)   # после 2-го фейла
+    # дождёмся второй неудачной попытки: attempts должен стать ≥2
+    async def wait_attempts_ge(n, timeout=4.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            d = await inmemory_db.outbox.find_one({"topic": topic, "key": key})
+            if d and d.get("state") == "retry" and int(d.get("attempts", 0)) >= n:
+                return d
+            await asyncio.sleep(0.03)
+        raise AssertionError(f"outbox attempts not >= {n}")
+
+    d2 = await wait_attempts_ge(2, timeout=4.0)   # после 2-го фейла
     assert int(d2.get("attempts", 0)) == 2
     assert int(d2.get("next_attempt_at", 0)) >= int(time.time()) + 1  # снова ≥1s
 

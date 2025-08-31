@@ -294,7 +294,7 @@ def handlers(env_and_imports):
             return inline or {}
         async def iter_batches(self, loaded):
             # один батч на узел
-            yield wu.Batch(shard_id=None, payload={"unit": "one"})
+            yield wu.Batch(batch_uid=None, payload={"unit": "one"})
         async def process_batch(self, batch, ctx):
             await sleepy(0.30)
             return wu.BatchResult(success=True, metrics={"ok": 1})
@@ -303,7 +303,7 @@ def handlers(env_and_imports):
         role = "fast"
         async def load_input(self, ref, inline): return inline or {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id=None, payload={"unit": "one"})
+            yield wu.Batch(batch_uid=None, payload={"unit": "one"})
         async def process_batch(self, batch, ctx):
             await sleepy(0.10)
             return wu.BatchResult(success=True, metrics={"ok": 1})

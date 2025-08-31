@@ -26,7 +26,7 @@ def build_sleepy_handler(wu, role: str, *, batches=1, sleep_s=1.2):
         async def iter_batches(self, loaded):
             # Ровно batches батчей
             for i in range(batches):
-                yield wu.Batch(shard_id=f"{self.role}-{i}", payload={"i": i})
+                yield wu.Batch(batch_uid=f"{self.role}-{i}", payload={"i": i})
         async def process_batch(self, batch, ctx):
             await asyncio.sleep(sleep_s)
             return wu.BatchResult(success=True, metrics={"count": 1})
@@ -44,10 +44,30 @@ def build_noop_query_only_role(wu, role: str):
             self.role = role
         async def load_input(self, ref, inline): return {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id=f"{self.role}-0", payload={})
+            yield wu.Batch(batch_uid=f"{self.role}-0", payload={})
         async def process_batch(self, batch, ctx):
             return wu.BatchResult(success=True, metrics={"noop": 1})
     return Noop(role=role)
+
+def build_flaky_once_handler(wu, role: str):
+    """
+    Первый батч падает (permanent=False), следующая попытка проходит.
+    """
+    class Flaky(wu.RoleHandler):
+        def __init__(self, role):
+            self.role = role
+            self.failed_once = False
+        async def load_input(self, ref, inline): return {}
+        async def iter_batches(self, loaded):
+            yield wu.Batch(batch_uid=f"{self.role}-0", payload={})
+        async def process_batch(self, batch, ctx):
+            if not self.failed_once:
+                self.failed_once = True
+                return wu.BatchResult(success=False, reason_code="transient", permanent=False, error="boom")
+            return wu.BatchResult(success=True, metrics={"count": 1})
+        async def finalize(self, ctx):
+            return wu.FinalizeResult(metrics={})
+    return Flaky(role=role)
 
 # ───────────────────────── Fixtures ─────────────────────────
 
@@ -60,7 +80,7 @@ def env_and_imports(monkeypatch):
     """
     cd, wu = setup_env_and_imports(
         monkeypatch,
-        worker_types="sleepy,noop"
+        worker_types="sleepy,noop,flaky"
     )
 
     # Быстрые циклы координатора
@@ -321,4 +341,199 @@ async def test_task_discover_complete_artifacts_skips_node_start(env_and_imports
         node = [n for n in t["graph"]["nodes"] if n["node_id"] == "x"][0]
         assert str(node.get("status")) == str(cd.RunState.finished), "узел должен быть завершён без запуска"
     finally:
+        await coord.stop()
+
+# ───────────────────────── Test 5: Grace-gate — свежие события блокируют старт (кроме deferred) ───────────
+
+@pytest.mark.asyncio
+async def test_grace_gate_blocks_then_allows_after_window(env_and_imports, inmemory_db, monkeypatch):
+    """
+    Для узла не в deferred: если last_event_ts свежий, координатор ненадолго воздержится от старта.
+    После окна DISCOVERY_WINDOW_SEC — стартует.
+    """
+    cd, wu = env_and_imports
+    # Делаем окно подлиннее, чтобы успеть проверить "не стартовало"
+    cd.DISCOVERY_WINDOW_SEC = 1.0
+    cd.SCHEDULER_TICK_SEC = 0.05
+    # Большие пороги HB, чтобы не мешали
+    cd.HEARTBEAT_SOFT_SEC = 30
+    cd.HEARTBEAT_HARD_SEC = 60
+
+    # Воркер готов к старту
+    w = wu.Worker(roles=["noop"], handlers={"noop": build_noop_query_only_role(wu, "noop")})
+    await w.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = prime_graph(cd, {
+            "schema_version": "1.0",
+            "nodes": [{"node_id": "x", "type": "noop", "depends_on": [], "fan_in": "all",
+                       "io": {"input_inline": {}}}],
+            "edges": []
+        })
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # Сразу после создания last_event_ts свежий — нода должна ещё НЕ быть running
+        await asyncio.sleep(0.2)
+        t = await inmemory_db.tasks.find_one({"id": task_id})
+        node = [n for n in t["graph"]["nodes"] if n["node_id"] == "x"][0]
+        assert str(node.get("status")) != str(cd.RunState.running), "ожидали, что старт отложится grace-gate'ом"
+
+        # После окна — должна стартовать
+        from time import time
+        t0 = time()
+        started = False
+        while time() - t0 < 2.0:
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            node = [n for n in t["graph"]["nodes"] if n["node_id"] == "x"][0]
+            if str(node.get("status")) == str(cd.RunState.running) or str(node.get("status")) == str(cd.RunState.finished):
+                started = True
+                break
+            await asyncio.sleep(0.05)
+        assert started, "ожидали, что после окна координатор запустит узел"
+    finally:
+        await w.stop()
+        await coord.stop()
+
+# ───────────────────────── Test 6: Grace-gate не мешает retrу из deferred ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_deferred_retry_ignores_grace_gate(env_and_imports, inmemory_db):
+    """
+    Узел падает (permanent=False) → уходит в deferred → ретраится сразу (next_retry_at≈0),
+    даже если last_event_ts свежий (grace-gate игнорируется для deferred).
+    """
+    cd, wu = env_and_imports
+    # Окно делаем большим, чтобы увидеть, что ожидания нет
+    cd.DISCOVERY_WINDOW_SEC = 5.0
+    cd.SCHEDULER_TICK_SEC = 0.05
+    cd.FINALIZER_TICK_SEC = 0.05
+    # HB не важен
+    cd.HEARTBEAT_SOFT_SEC = 30
+    cd.HEARTBEAT_HARD_SEC = 60
+
+    w = wu.Worker(roles=["flaky"], handlers={"flaky": build_flaky_once_handler(wu, "flaky")})
+    await w.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = prime_graph(cd, {
+            "schema_version": "1.0",
+            "nodes": [{
+                "node_id": "f", "type": "flaky", "depends_on": [], "fan_in": "all",
+                "retry_policy": {"max": 2, "backoff_sec": 0, "permanent_on": []},
+                "io": {"input_inline": {}}
+            }],
+            "edges": []
+        })
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # Дождёмся завершения — это докажет, что ретрай случился сразу, несмотря на большое окно
+        tdoc = await wait_task_finished(inmemory_db, task_id, timeout=6.0)
+        assert str(tdoc.get("status")) == str(cd.RunState.finished)
+        node = [n for n in tdoc["graph"]["nodes"] if n["node_id"] == "f"][0]
+        assert str(node.get("status")) == str(cd.RunState.finished)
+    finally:
+        await w.stop()
+        await coord.stop()
+
+# ───────────────────────── Test 7: При рестарте воркер НЕ шлёт TASK_RESUMED ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_no_task_resumed_on_worker_restart(env_and_imports, inmemory_db, monkeypatch, tmp_path):
+    """
+    После перезапуска воркер не публикует TASK_RESUMED (мы не занимаем слот и не поднимаем HB).
+    Проверяем по отсутствию такого события в worker_events.
+    """
+    cd, wu = env_and_imports
+    cd.HEARTBEAT_SOFT_SEC = 30
+    cd.HEARTBEAT_HARD_SEC = 60
+
+    worker_id = "w-nores"
+    monkeypatch.setenv("WORKER_ID", worker_id)
+    monkeypatch.setenv("WORKER_STATE_DIR", str(tmp_path))
+
+    w1 = wu.Worker(roles=["sleepy"], handlers={"sleepy": build_sleepy_handler(wu, "sleepy", batches=1, sleep_s=1.0)})
+    await w1.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = prime_graph(cd, {
+            "schema_version": "1.0",
+            "nodes": [{"node_id": "s", "type": "sleepy", "depends_on": [], "fan_in": "all",
+                       "io": {"input_inline": {}}}],
+            "edges": []
+        })
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # Дождёмся running, затем остановим воркер — local state сохранён
+        from time import time
+        t0 = time()
+        while time() - t0 < 2.5:
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            if t:
+                n = [n for n in t["graph"]["nodes"] if n["node_id"] == "s"][0]
+                if str(n.get("status")) == str(cd.RunState.running):
+                    break
+            await asyncio.sleep(0.03)
+        await w1.stop()
+
+        # Стартуем воркер #2 — он не должен публиковать TASK_RESUMED
+        w2 = wu.Worker(roles=["sleepy"], handlers={"sleepy": build_sleepy_handler(wu, "sleepy", batches=1, sleep_s=0.2)})
+        await w2.start()
+        await asyncio.sleep(0.4)
+
+        # Проверим, что в worker_events нет события TASK_RESUMED
+        found = False
+        cur = inmemory_db.worker_events.find({})
+        async for e in cur:
+            if (e.get("payload") or {}).get("kind") == "TASK_RESUMED":
+                found = True
+                break
+        assert not found, "не ожидали TASK_RESUMED после рестарта воркера"
+        await w2.stop()
+    finally:
+        await coord.stop()
+
+# ───────────────────────── Test 8: Heartbeat действительно двигает lease.deadline_ts ──────────────────────
+
+@pytest.mark.asyncio
+async def test_heartbeat_updates_lease_deadline_simple(env_and_imports, inmemory_db, monkeypatch):
+    cd, wu = env_and_imports
+    # Делаем heartbeat частым
+    wu.HEARTBEAT_INTERVAL_SEC = 0.05
+    cd.HEARTBEAT_SOFT_SEC = 5
+    cd.HEARTBEAT_HARD_SEC = 60
+
+    w = wu.Worker(roles=["sleepy"], handlers={"sleepy": build_sleepy_handler(wu, "sleepy", batches=1, sleep_s=0.8)})
+    await w.start()
+    coord = cd.Coordinator()
+    await coord.start()
+    try:
+        graph = prime_graph(cd, {
+            "schema_version": "1.0",
+            "nodes": [{"node_id": "s", "type": "sleepy", "depends_on": [], "fan_in": "all",
+                       "io": {"input_inline": {}}}],
+            "edges": []
+        })
+        task_id = await coord.create_task(params={}, graph=graph)
+
+        # дождёмся первого дедлайна
+        first = None
+        for _ in range(200):
+            t = await inmemory_db.tasks.find_one({"id": task_id})
+            if t:
+                lease = ([n for n in t["graph"]["nodes"] if n["node_id"] == "s"][0].get("lease") or {})
+                if lease.get("deadline_ts"):
+                    first = int(lease["deadline_ts"]); break
+            await asyncio.sleep(0.02)
+        assert first is not None, "ожидали появления первого lease.deadline_ts"
+
+        # через ~несколько heartbeat дедлайн должен увеличиться
+        await asyncio.sleep(1.1)
+        t = await inmemory_db.tasks.find_one({"id": task_id})
+        lease2 = ([n for n in t["graph"]["nodes"] if n["node_id"] == "s"][0].get("lease") or {})
+        assert int(lease2.get("deadline_ts", 0)) > int(first), "heartbeat должен продлевать lease.deadline_ts"
+    finally:
+        await w.stop()
         await coord.stop()

@@ -44,7 +44,7 @@ def build_counting_source_handler(wu, *, total=9, batch=3):
             shard = 0
             for i in range(0, t, b):
                 # payload с фейковыми items; downstream не используется в этом тесте
-                yield wu.Batch(shard_id=f"s-{shard}", payload={"items": list(range(i, min(i+b, t)))})
+                yield wu.Batch(batch_uid=f"s-{shard}", payload={"items": list(range(i, min(i+b, t)))})
                 shard += 1
         async def process_batch(self, batch, ctx):
             n = len(batch.payload.get("items") or [])
@@ -63,7 +63,7 @@ def build_flaky_once_handler(wu):
         def __init__(self): self._failed = False
         async def load_input(self, ref, inline): return {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id="f-0", payload={"x": 1})
+            yield wu.Batch(batch_uid="f-0", payload={"x": 1})
         async def process_batch(self, batch, ctx):
             if not self._failed:
                 self._failed = True
@@ -82,7 +82,7 @@ def build_permanent_fail_handler(wu):
         role = "a"
         async def load_input(self, ref, inline): return {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id="a-0", payload={"x": 1})
+            yield wu.Batch(batch_uid="a-0", payload={"x": 1})
         async def process_batch(self, batch, ctx):
             raise RuntimeError("hard_fail")
         def classify_error(self, exc: BaseException) -> tuple[str, bool]:
@@ -97,7 +97,7 @@ def build_noop_handler(wu, role_name: str):
         role = role_name
         async def load_input(self, ref, inline): return {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id=f"{role_name}-0", payload={})
+            yield wu.Batch(batch_uid=f"{role_name}-0", payload={})
         async def process_batch(self, batch, ctx):
             # До этого теста они обычно не дойдут (зависимость от 'a').
             await asyncio.sleep(0.01)
@@ -321,7 +321,7 @@ def build_slow_source_handler(wu, *, total=50, batch=5, delay=0.15):
             t, b = loaded["total"], loaded["batch"]
             shard = 0
             for i in range(0, t, b):
-                yield wu.Batch(shard_id=f"s-{shard}", payload={"items": list(range(i, min(i+b, t))), "delay": loaded["delay"]})
+                yield wu.Batch(batch_uid=f"s-{shard}", payload={"items": list(range(i, min(i+b, t))), "delay": loaded["delay"]})
                 shard += 1
         async def process_batch(self, batch, ctx):
             await asyncio.sleep(batch.payload.get("delay", 0.1))
@@ -336,7 +336,7 @@ def build_cancelable_source_handler(wu, *, total=100, batch=10, delay=0.3):
             t, b = loaded["total"], loaded["batch"]
             shard = 0
             for i in range(0, t, b):
-                yield wu.Batch(shard_id=f"s-{shard}", payload={"i": i})
+                yield wu.Batch(batch_uid=f"s-{shard}", payload={"i": i})
                 shard += 1
         async def process_batch(self, batch, ctx):
             # Кооперативно реагируем на отмену
@@ -368,7 +368,7 @@ async def test_status_fencing_ignores_stale_epoch(env_and_imports, inmemory_db, 
             dedup_id="stale1", task_id=task_id, node_id="s", step_type="source",
             attempt_epoch=0,
             payload={"kind": cd.EventKind.BATCH_OK, "worker_id": "WZ", "metrics": {"count": 999},
-                     "artifacts_ref": {"shard_id": "zzz"}}
+                     "artifacts_ref": {"batch_uid": "zzz"}}
         )
         await BROKER.produce(cd.TOPIC_STATUS_FMT.format(type="source"), env.model_dump(mode="json"))
         await asyncio.sleep(0.2)
