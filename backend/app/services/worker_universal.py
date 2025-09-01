@@ -34,6 +34,7 @@ TOPIC_STATUS_FMT = os.getenv("TOPIC_STATUS_FMT", "status.{type}.v1")
 TOPIC_WORKER_ANNOUNCE = os.getenv("TOPIC_WORKER_ANNOUNCE", "workers.announce.v1")
 TOPIC_QUERY = os.getenv("TOPIC_QUERY", "query.tasks.v1")
 TOPIC_REPLY = os.getenv("TOPIC_REPLY", "reply.tasks.v1")
+TOPIC_SIGNALS = os.getenv("TOPIC_SIGNALS", "signals.v1")
 
 # Heartbeat / lease
 LEASE_TTL_SEC = int(os.getenv("LEASE_TTL_SEC", "60"))
@@ -50,6 +51,7 @@ PULL_EMPTY_BACKOFF_MS_MAX = int(os.getenv("PULL_EMPTY_BACKOFF_MS_MAX", "4000"))
 # State
 STATE_DIR = os.getenv("WORKER_STATE_DIR", "./.worker_state")
 os.makedirs(STATE_DIR, exist_ok=True)
+DB_CANCEL_POLL_MS = int(os.getenv("DB_CANCEL_POLL_MS", "500"))
 
 # Worker identity
 WORKER_ID = os.getenv("WORKER_ID", f"w-{uuid.uuid4().hex[:8]}")
@@ -138,6 +140,12 @@ class CmdTaskCancel(BaseModel):
     cmd: Literal[CommandKind.TASK_CANCEL]
     reason: str
     cancel_token: str
+
+class SigCancel(BaseModel):
+    sig: Literal["CANCEL"]
+    reason: str
+    cancel_token: Optional[str] = None
+    deadline_ts: Optional[int] = None
 
 # ─────────────────────────── Local persistent state ────────────────────
 @dataclass
@@ -512,6 +520,7 @@ class Worker:
         self._producer: Optional[AIOKafkaProducer] = None
         self._cmd_consumers: Dict[str, AIOKafkaConsumer] = {}
         self._query_consumer: Optional[AIOKafkaConsumer] = None
+        self._signals_consumer: Optional[AIOKafkaConsumer] = None
 
         self._busy = False
         self._busy_lock = asyncio.Lock()
@@ -526,6 +535,7 @@ class Worker:
 
         self._main_tasks: set[asyncio.Task] = set()
         self._stopping = False
+        self._cancel_deadline_ts: Optional[int] = None
 
     # Helper to derive a stable uid when handler/adapter didn't set it
     @staticmethod
@@ -568,6 +578,18 @@ class Worker:
         await self._query_consumer.start()
         self._spawn(self._query_loop(self._query_consumer))
 
+        # Signals consumer (control plane; unique group per worker)
+        self._signals_consumer = AIOKafkaConsumer(
+            TOPIC_SIGNALS,
+            bootstrap_servers=KAFKA_BOOTSTRAP,
+            value_deserializer=loads,
+            enable_auto_commit=False,
+            auto_offset_reset="latest",
+            group_id=f"workers.signals.{WORKER_ID}"
+        )
+        await self._signals_consumer.start()
+        self._spawn(self._signals_loop(self._signals_consumer))
+
         # Heartbeat announce (optional every 60s)
         self._spawn(self._periodic_announce())
 
@@ -582,6 +604,9 @@ class Worker:
         self._main_tasks.clear()
         if self._query_consumer:
             try: await self._query_consumer.stop()
+            except Exception: pass
+        if self._signals_consumer:
+            try: await self._signals_consumer.stop()
             except Exception: pass
         for c in self._cmd_consumers.values():
             try: await c.stop()
@@ -689,8 +714,8 @@ class Worker:
                                         "lease_id": lease_id, "lease_deadline_ts": lease_deadline})
             await self._send_status(role, acc_env)
 
-            # Pause other roles, но НЕ текущую — чтобы CANCEL доходил сразу
-            await self._pause_all_cmd_consumers(except_role=role)
+            # Полностью паузим все cmd-консьюмеры (CANCEL придёт через signals)
+            await self._pause_all_cmd_consumers()
 
             # Start heartbeat + run loop
             self._spawn(self._heartbeat_loop(role))
@@ -707,11 +732,8 @@ class Worker:
             await self.state.write_active(self.active)
         await consumer.commit()
 
-    async def _pause_all_cmd_consumers(self, except_role: str | None = None) -> None:
+    async def _pause_all_cmd_consumers(self) -> None:
         for role, c in self._cmd_consumers.items():
-            if except_role and role == except_role:
-                # оставляем consumer текущей роли активным, чтобы принимать TASK_CANCEL
-                continue
             parts = c.assignment()
             if parts:
                 c.pause(*parts)
@@ -788,6 +810,9 @@ class Worker:
             else:
                 log(event="handler_iter_batches_fallback", node=self.active.node_id)
                 batch_iter = handler.iter_batches(loaded)
+
+            # DB-cancel watcher (failsafe)
+            self._spawn(self._db_cancel_watch_loop())
 
             # iterate batches with resilience
             async for batch in batch_iter:
@@ -1002,6 +1027,58 @@ class Worker:
                     "worker_id": WORKER_ID, "type": ",".join(self.roles),
                     "version": WORKER_VERSION, "capacity": {"tasks": 1}
                 })
+        except asyncio.CancelledError:
+            return
+
+    # ── Signals loop (control plane CANCEL) ─────────────────────────────
+    async def _signals_loop(self, consumer: AIOKafkaConsumer) -> None:
+        try:
+            while True:
+                msg = await consumer.getone()
+                env = Envelope.model_validate(msg.value)
+                # Фильтрация по адресату
+                if env.target_worker_id and env.target_worker_id != WORKER_ID:
+                    await consumer.commit(); continue
+                # Ожидаем payload с sig="CANCEL"
+                pay = env.payload or {}
+                if (pay.get("sig") or "").upper() != "CANCEL":
+                    await consumer.commit(); continue
+                try:
+                    sc = SigCancel.model_validate(pay)
+                except Exception:
+                    await consumer.commit(); continue
+
+                ar = self.active
+                if not ar:
+                    await consumer.commit(); continue
+                # Сверяем адресацию на активный ран (task/node/epoch)
+                if ar.task_id == env.task_id and ar.node_id == env.node_id and ar.attempt_epoch == env.attempt_epoch:
+                    self._cancel_deadline_ts = sc.deadline_ts
+                    self._cancel_flag.set()
+                    ar.state = "cancelling"
+                    await self.state.write_active(ar)
+                await consumer.commit()
+        except asyncio.CancelledError:
+            return
+
+    # ── DB cancel watcher (failsafe) ───────────────────────────────────
+    async def _db_cancel_watch_loop(self) -> None:
+        try:
+            while self._busy and not self._stopping and self.active is not None and not self._cancel_flag.is_set():
+                ar = self.active
+                try:
+                    doc = await db.tasks.find_one({"id": ar.task_id}, {"id": 1, "coordinator": 1, "graph": 1})
+                    if doc:
+                        if (doc.get("coordinator") or {}).get("cancelled") is True:
+                            self._cancel_flag.set(); break
+                        for n in (doc.get("graph", {}) or {}).get("nodes") or []:
+                            if n.get("node_id") == ar.node_id:
+                                if (n.get("coordinator") or {}).get("cancelled") is True or n.get("status") == "cancelling":
+                                    self._cancel_flag.set()
+                                break
+                except Exception:
+                    pass
+                await asyncio.sleep(DB_CANCEL_POLL_MS / 1000.0)
         except asyncio.CancelledError:
             return
 

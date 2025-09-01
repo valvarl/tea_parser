@@ -31,6 +31,7 @@ TOPIC_STATUS_FMT = os.getenv("TOPIC_STATUS_FMT", "status.{type}.v1")
 TOPIC_WORKER_ANNOUNCE = os.getenv("TOPIC_WORKER_ANNOUNCE", "workers.announce.v1")
 TOPIC_QUERY = os.getenv("TOPIC_QUERY", "query.tasks.v1")
 TOPIC_REPLY = os.getenv("TOPIC_REPLY", "reply.tasks.v1")
+TOPIC_SIGNALS = os.getenv("TOPIC_SIGNALS", "signals.v1")
 
 HEARTBEAT_SOFT_SEC = int(os.getenv("HB_SOFT_SEC", "300"))
 HEARTBEAT_HARD_SEC = int(os.getenv("HB_HARD_SEC", "3600"))
@@ -184,6 +185,13 @@ class EvCancelled(BaseModel):
     kind: EventKind
     worker_id: str
     reason: str
+
+class SigCancel(BaseModel):
+    # Контрольный сигнал координатор → воркер
+    sig: str = "CANCEL"
+    reason: str
+    cancel_token: Optional[str] = None
+    deadline_ts: Optional[int] = None
 
 class QTaskDiscover(BaseModel):
     query: QueryKind
@@ -746,6 +754,9 @@ class Coordinator:
             {"id": 1, "graph": 1, "status": 1}
         )
         async for t in cur:
+            # Если задача отменена — ничего нового не стартуем
+            if (t.get("coordinator") or {}).get("cancelled") is True:
+                continue
             if self._to_runstate(t.get("status")) == RunState.queued:
                 await db.tasks.update_one({"id": t["id"]}, {"$set": {"status": RunState.running}})
             for n in (t.get("graph", {}).get("nodes") or []):
@@ -791,6 +802,10 @@ class Coordinator:
     async def _enqueue_query(self, env: Envelope) -> None:
         key = env.task_id
         await self.outbox.enqueue(topic=TOPIC_QUERY, key=key, env=env)
+
+    async def _enqueue_signal(self, *, key_worker_id: str, env: Envelope) -> None:
+        # Сигналы адресуются воркеру по его worker_id (Kafka key)
+        await self.outbox.enqueue(topic=TOPIC_SIGNALS, key=key_worker_id, env=env)
 
     async def _preflight_and_maybe_start(self, task_doc: Dict[str, Any], node: Dict[str, Any]) -> None:
         task_id = task_doc["id"]
@@ -929,6 +944,9 @@ class Coordinator:
 
     async def _maybe_start_children_on_first_batch(self, parent_task: Dict[str, Any], parent_node_id: str) -> None:
         task_id = parent_task["id"]
+        # Не стартуем на отменённой таске
+        if (parent_task.get("coordinator") or {}).get("cancelled") is True:
+            return
         edges_ex = self._edges_ex_from(parent_task, parent_node_id)
         direct_children = self._children_of(parent_task, parent_node_id)
         if not direct_children:
@@ -1096,34 +1114,74 @@ class Coordinator:
             return
 
     async def _finalize_nodes_and_tasks(self) -> None:
-        cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred]}}, {"id": 1, "graph": 1})
+        cur = db.tasks.find({"status": {"$in": [RunState.running, RunState.deferred, RunState.cancelling]}},
+                            {"id": 1, "graph": 1, "coordinator": 1})
         async for t in cur:
             nodes = t.get("graph", {}).get("nodes") or []
-            if nodes and all(self._to_runstate(n.get("status")) == RunState.finished for n in nodes):
+            if not nodes:
+                continue
+            rs = [self._to_runstate(n.get("status")) for n in nodes]
+            all_finished = all(s == RunState.finished for s in rs)
+            cancelled = (t.get("coordinator") or {}).get("cancelled") is True
+            # Для обычных задач — все ноды должны быть finished
+            # Для отменённых задач — допускаем finished/failed/deferred (но не 'cancelling')
+            if all_finished or (cancelled and all(s in (RunState.finished, RunState.failed, RunState.deferred) for s in rs)):
                 result = {"nodes": [{"node_id": n["node_id"], "stats": n.get("stats", {})} for n in nodes]}
-                await db.tasks.update_one({"id": t["id"]},
-                    {"$set": {"status": RunState.finished, "finished_at": now_dt(), "result": result}})
+                await db.tasks.update_one(
+                    {"id": t["id"]},
+                    {"$set": {"status": RunState.finished, "finished_at": now_dt(), "result": result}}
+                )
 
     # ── Cascade cancel (uses Outbox) ────────────────────────────────────
     async def _cascade_cancel(self, task_id: str, *, reason: str) -> None:
+        # Страховочный верхнеуровневый флаг отмены
+        try:
+            await db.tasks.update_one(
+                {"id": task_id},
+                {"$set": {"coordinator.cancelled": True,
+                          "coordinator.cancel_reason": reason,
+                          "coordinator.cancelled_at": now_dt()},
+                 "$currentDate": {"updated_at": True}}
+            )
+        except Exception:
+            pass
+
         doc = await db.tasks.find_one({"id": task_id}, {"graph": 1})
         if not doc: return
         for n in (doc.get("graph", {}).get("nodes") or []):
             if n.get("status") in [RunState.running, RunState.deferred, RunState.queued]:
-                cancel = CmdTaskCancel(cmd=CommandKind.TASK_CANCEL, reason=reason, cancel_token=str(uuid.uuid4()))
-                env = Envelope(
-                    msg_type=MsgType.cmd,
-                    role=Role.coordinator,
-                    dedup_id=stable_hash({"cmd": str(CommandKind.TASK_CANCEL), "task_id": task_id, "node_id": n["node_id"], "epoch": int(n.get("attempt_epoch", 0))}),
-                    task_id=task_id,
-                    node_id=n["node_id"],
-                    step_type=n["type"],
-                    attempt_epoch=int(n.get("attempt_epoch", 0)),
-                    payload=cancel.model_dump()
-                )
-                await self._enqueue_cmd(env)
-                await db.tasks.update_one({"id": task_id, "graph.nodes.node_id": n["node_id"]},
-                                          {"$set": {"graph.nodes.$.status": RunState.cancelling}})
+                # 1) DB-флаг по ноде + статус "cancelling"
+                try:
+                    await db.tasks.update_one(
+                        {"id": task_id, "graph.nodes.node_id": n["node_id"]},
+                        {"$set": {
+                            "graph.nodes.$.status": RunState.cancelling,
+                            "graph.nodes.$.coordinator.cancelled": True,
+                            "graph.nodes.$.cancel_requested_at": now_dt()
+                        }}
+                    )
+                except Exception:
+                    pass
+
+                # 2) Адресный сигнал CANCEL воркеру (если есть lease.worker_id)
+                lease = n.get("lease") or {}
+                worker_id = lease.get("worker_id")
+                if worker_id:
+                    sig = SigCancel(reason=reason, cancel_token=None,
+                                    deadline_ts=now_ts() + CANCEL_GRACE_SEC).model_dump()
+                    env = Envelope(
+                        msg_type=MsgType.event,   # control-plane сигнал
+                        role=Role.coordinator,
+                        dedup_id=stable_hash({"sig":"CANCEL","task_id":task_id,"node":n["node_id"],
+                                              "epoch":int(n.get("attempt_epoch",0)),"worker":worker_id}),
+                        task_id=task_id,
+                        node_id=n["node_id"],
+                        step_type=n["type"],
+                        attempt_epoch=int(n.get("attempt_epoch", 0)),
+                        payload=sig,
+                        target_worker_id=worker_id
+                    )
+                    await self._enqueue_signal(key_worker_id=worker_id, env=env)
         await asyncio.sleep(CANCEL_GRACE_SEC)
 
     # ── Resume inflight ─────────────────────────────────────────────────
@@ -1159,19 +1217,7 @@ class Coordinator:
         # разошлём CANCEL по всем релевантным узлам
         await self._cascade_cancel(task_id, reason=reason)
 
-        # мягко «закроем» задачу, если все узлы уже не running
-        try:
-            fresh = await db.tasks.find_one({"id": task_id}, {"graph": 1, "status": 1})
-            nodes = (fresh or {}).get("graph", {}).get("nodes") or []
-            if nodes and all(self._to_runstate(n.get("status")) in (
-                RunState.finished, RunState.deferred, RunState.failed, RunState.cancelling
-            ) for n in nodes):
-                await db.tasks.update_one(
-                    {"id": task_id},
-                    {"$set": {"status": RunState.finished, "finished_at": now_dt()}}
-                )
-        except Exception:
-            pass
+        # Больше не закрываем задачу “вручную” здесь — дождёмся CANCELLED и финализатора
         return True
 
     # ── Indexes ─────────────────────────────────────────────────────────
