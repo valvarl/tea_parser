@@ -8,6 +8,7 @@ import time
 import uuid
 import signal
 import hashlib
+import subprocess as subproc
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -192,19 +193,210 @@ class LocalState:
 
 # ─────────────────────────── Role handler API ──────────────────────────
 class RunContext:
-    def __init__(self, cancel_flag: asyncio.Event, artifacts_writer: "ArtifactsWriter",
-                 task_id: str, node_id: str, attempt_epoch: int, worker_id: str):
+    """
+    Cancellation-aware runtime utilities for handlers.
+    - Exposes a shared cancel_event and metadata (reason, deadline_ts)
+    - Provides cancellable wrappers for async ops, subprocesses, executors
+    - Tracks cleanup callbacks/resources to ensure fast & safe tear-down
+    """
+    def __init__(
+        self,
+        cancel_flag: asyncio.Event,
+        artifacts_writer: "ArtifactsWriter",
+        *,
+        cancel_meta: Dict[str, Any],
+        task_id: str,
+        node_id: str,
+        attempt_epoch: int,
+        worker_id: str,
+    ):
         self._cancel_flag = cancel_flag
+        self._cancel_meta = cancel_meta  # shared dict: {"reason":..., "deadline_ts": ...}
         self.artifacts = artifacts_writer
-        # полезное для хендлеров
+
+        # Useful context for handlers
         self.task_id = task_id
         self.node_id = node_id
         self.attempt_epoch = attempt_epoch
         self.worker_id = worker_id
-        self.kv: Dict[str, Any] = {}  # эфемерное хранилище на время ранa
+        self.kv: Dict[str, Any] = {}  # ephemeral per-run storage
 
+        # Resource registries for coordinated cleanup
+        self._cleanup_callbacks: List[Callable[[], Any]] = []
+        self._subprocesses: List[Any] = []  # asyncio subprocess handles
+        self._temp_paths: List[str] = []
+
+    # ---------- Cancellation metadata ----------
     def cancelled(self) -> bool:
+        """Cheap check: has a cancel signal been received?"""
         return self._cancel_flag.is_set()
+
+    @property
+    def cancel_reason(self) -> Optional[str]:
+        """Human/machine-friendly reason (e.g., 'user_request', 'db_flag', 'hard_fail:...')."""
+        return self._cancel_meta.get("reason")
+
+    @property
+    def cancel_deadline_ts(self) -> Optional[int]:
+        """Absolute epoch seconds after which the worker may escalate (SIGKILL, etc.)."""
+        return self._cancel_meta.get("deadline_ts")
+
+    def remaining(self) -> Optional[float]:
+        """Seconds left until deadline, or None if no deadline."""
+        dl = self.cancel_deadline_ts
+        if not dl:
+            return None
+        return max(0.0, float(dl - now_ts()))
+
+    # ---------- Convenience guards ----------
+    async def raise_if_cancelled(self) -> None:
+        """Raise asyncio.CancelledError if already cancelled."""
+        if self._cancel_flag.is_set():
+            raise asyncio.CancelledError()
+
+    async def cancellable(self, coro: Any):
+        """
+        Run 'coro' while also watching cancel_event.
+        If cancelled first, cancel the coro task and raise CancelledError.
+        """
+        if self._cancel_flag.is_set():
+            raise asyncio.CancelledError()
+        task = asyncio.create_task(coro)
+        done, pending = await asyncio.wait(
+            {task, asyncio.create_task(self._cancel_flag.wait())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            # Propagate result/exception
+            try:
+                return await task
+            finally:
+                # Ensure the wait-task is cancelled to avoid leaks
+                for p in pending: p.cancel()
+        else:
+            # Cancellation won the race → cancel inner task and raise
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+            raise asyncio.CancelledError()
+
+    # ---------- Subprocess helpers ----------
+    async def run_subprocess(self, *cmd: str, grace_ms: int = 5000) -> int:
+        """
+        Spawn a child process in its own process group and wait for it in a
+        cancellation-aware way. On cancellation:
+          - send SIGTERM/CTRL-BREAK to the group
+          - wait grace_ms
+          - SIGKILL remaining
+        Returns the process' exit code (if not cancelled).
+        """
+        # Prepare platform-specific options for new process group
+        kwargs: Dict[str, Any] = {}
+        if os.name == "posix":
+            kwargs["preexec_fn"] = os.setsid
+        else:
+            # On Windows, CREATE_NEW_PROCESS_GROUP allows CTRL_BREAK_EVENT
+            kwargs["creationflags"] = getattr(subproc, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **kwargs,
+        )
+        self.register_subprocess(proc)
+
+        try:
+            # Wait for completion, but be cancellable
+            await self.cancellable(proc.wait())
+            return proc.returncode or 0
+        except asyncio.CancelledError:
+            # Escalation path on cancel
+            try:
+                await self._terminate_process(proc, grace_ms=grace_ms)
+            finally:
+                raise
+
+    def register_subprocess(self, proc: Any) -> None:
+        """Track subprocess to terminate/kill it on run cleanup."""
+        self._subprocesses.append(proc)
+
+    def register_temp_path(self, path: str) -> None:
+        """Track temp path (file/dir) to remove on cleanup."""
+        self._temp_paths.append(path)
+
+    def on_cleanup(self, cb: Callable[[], Any]) -> None:
+        """Register a no-arg callback to be invoked during cleanup."""
+        self._cleanup_callbacks.append(cb)
+
+    async def _terminate_process(self, proc: Any, *, grace_ms: int = 5000) -> None:
+        """Best-effort graceful termination with escalation."""
+        try:
+            if proc.returncode is not None:
+                return  # already done
+            if os.name == "posix":
+                # Kill the whole process group
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    try: proc.terminate()
+                    except Exception: pass
+            else:
+                # Windows: CTRL_BREAK to the group if possible, fallback to terminate()
+                try:
+                    proc.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+                except Exception:
+                    try: proc.terminate()
+                    except Exception: pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=max(0.001, grace_ms / 1000.0))
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+        except Exception:
+            # Swallow errors on best-effort termination
+            pass
+
+    async def _cleanup_resources(self) -> None:
+        """
+        Run all registered cleanup callbacks, terminate tracked subprocesses,
+        and remove temp paths. This is idempotent and best-effort.
+        """
+        # Callbacks (LIFO gives a more natural unwind)
+        for cb in reversed(self._cleanup_callbacks):
+            try:
+                res = cb()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
+        # Subprocesses
+        for proc in list(self._subprocesses):
+            try:
+                await self._terminate_process(proc, grace_ms=1000)
+            except Exception:
+                pass
+        self._subprocesses.clear()
+        # Temp paths
+        for p in list(self._temp_paths):
+            try:
+                if os.path.isdir(p):
+                    # Avoid shutil import; simple recursive removal is optional
+                    for root, dirs, files in os.walk(p, topdown=False):
+                        for f in files:
+                            try: os.remove(os.path.join(root, f))
+                            except Exception: pass
+                        for d in dirs:
+                            try: os.rmdir(os.path.join(root, d))
+                            except Exception: pass
+                    os.rmdir(p)
+                elif os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        self._temp_paths.clear()
 
 class Batch(BaseModel):
     batch_uid: Optional[str] = None
@@ -256,10 +448,29 @@ class RoleHandler:
 class EchoHandler(RoleHandler):
     role = "echo"
     async def process_batch(self, batch: Batch, ctx: RunContext) -> BatchResult:
-        if ctx.cancelled():
-            return BatchResult(success=False, reason_code="cancelled", permanent=False)
-        await asyncio.sleep(0.05)
-        return BatchResult(success=True, metrics={"echoed": 1})
+        """
+        Example of cooperative cancellation:
+        - Check cancellation frequently
+        - Wrap long awaits with ctx.cancellable(...)
+        - Emit partial checkpoints periodically (idempotent)
+        """
+        await ctx.raise_if_cancelled()
+
+        # Simulate some iterative work that can be cancelled mid-way
+        steps = 5
+        for i in range(steps):
+            # Quick check every iteration
+            await ctx.raise_if_cancelled()
+            # Any long await should be cancellable
+            await ctx.cancellable(asyncio.sleep(0.05))
+            # Optional: periodic partial checkpoint (idempotent)
+            if i and i % 2 == 0 and batch.batch_uid:
+                try:
+                    await ctx.artifacts.upsert_partial(batch.batch_uid, {"echoed": i})
+                except Exception:
+                    pass
+
+        return BatchResult(success=True, metrics={"echoed": steps})
 
 # ─────────────────────────── Pull adapters (streaming) ─────────────────
 class PullAdapters:
@@ -536,6 +747,9 @@ class Worker:
         self._main_tasks: set[asyncio.Task] = set()
         self._stopping = False
         self._cancel_deadline_ts: Optional[int] = None
+        self._cancel_reason: Optional[str] = None
+        # Shared cancel-meta dict passed into RunContext by reference
+        self._cancel_meta: Dict[str, Any] = {"reason": None, "deadline_ts": None}
 
     # Helper to derive a stable uid when handler/adapter didn't set it
     @staticmethod
@@ -699,6 +913,10 @@ class Worker:
             lease_deadline = now_ts() + LEASE_TTL_SEC
             self._busy = True
             self._cancel_flag.clear()
+            self._cancel_deadline_ts = None
+            self._cancel_reason = None
+            self._cancel_meta["reason"] = None
+            self._cancel_meta["deadline_ts"] = None
             self.active = ActiveRun(
                 task_id=env.task_id, node_id=env.node_id, step_type=role,
                 attempt_epoch=env.attempt_epoch, lease_id=lease_id, cancel_token=cmd.cancel_token,
@@ -762,11 +980,16 @@ class Worker:
                 "role": role,
             })
             artifacts = ArtifactsWriter(self.active.task_id, self.active.node_id, self.active.attempt_epoch, WORKER_ID)
-            ctx = RunContext(self._cancel_flag, artifacts,
-                             task_id=self.active.task_id,
-                             node_id=self.active.node_id,
-                             attempt_epoch=self.active.attempt_epoch,
-                             worker_id=WORKER_ID)
+            # Pass a shared cancel_meta dict so future signals can update reason/deadline
+            ctx = RunContext(
+                self._cancel_flag,
+                artifacts,
+                cancel_meta=self._cancel_meta,
+                task_id=self.active.task_id,
+                node_id=self.active.node_id,
+                attempt_epoch=self.active.attempt_epoch,
+                worker_id=WORKER_ID,
+            )
 
             loaded = await handler.load_input(cmd.input_ref, cmd.input_inline)
 
@@ -866,6 +1089,11 @@ class Worker:
             await self._emit_task_failed(role, start_env, reason, permanent, str(e))
             return
         finally:
+            # Always clean up handler-owned resources (subprocesses, temps, callbacks)
+            try:
+                await ctx._cleanup_resources()
+            except Exception:
+                pass
             # При штатном останове процесса сохраняем active_run,
             # чтобы новый процесс мог «усыновить» попытку.
             if not self._stopping:
@@ -876,6 +1104,11 @@ class Worker:
         self.active = None
         await self.state.write_active(None)
         self._busy = False
+        # Reset cancel meta for the next run
+        self._cancel_deadline_ts = None
+        self._cancel_reason = None
+        self._cancel_meta["reason"] = None
+        self._cancel_meta["deadline_ts"] = None
         await self._resume_all_cmd_consumers()
 
     # ── Heartbeat loop ──────────────────────────────────────────────────
@@ -1054,6 +1287,9 @@ class Worker:
                 # Сверяем адресацию на активный ран (task/node/epoch)
                 if ar.task_id == env.task_id and ar.node_id == env.node_id and ar.attempt_epoch == env.attempt_epoch:
                     self._cancel_deadline_ts = sc.deadline_ts
+                    self._cancel_reason = sc.reason
+                    self._cancel_meta["reason"] = sc.reason
+                    self._cancel_meta["deadline_ts"] = sc.deadline_ts
                     self._cancel_flag.set()
                     ar.state = "cancelling"
                     await self.state.write_active(ar)
@@ -1070,10 +1306,17 @@ class Worker:
                     doc = await db.tasks.find_one({"id": ar.task_id}, {"id": 1, "coordinator": 1, "graph": 1})
                     if doc:
                         if (doc.get("coordinator") or {}).get("cancelled") is True:
+                            # DB failsafe: set reason if missing, then cancel
+                            if not self._cancel_reason:
+                                self._cancel_reason = "db_flag"
+                                self._cancel_meta["reason"] = "db_flag"
                             self._cancel_flag.set(); break
                         for n in (doc.get("graph", {}) or {}).get("nodes") or []:
                             if n.get("node_id") == ar.node_id:
                                 if (n.get("coordinator") or {}).get("cancelled") is True or n.get("status") == "cancelling":
+                                    if not self._cancel_reason:
+                                        self._cancel_reason = "db_flag"
+                                        self._cancel_meta["reason"] = "db_flag"
                                     self._cancel_flag.set()
                                 break
                 except Exception:
