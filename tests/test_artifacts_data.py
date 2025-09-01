@@ -316,7 +316,7 @@ def handlers(env_and_imports):
 
     class SourceShardHandler(wu.RoleHandler):
         """
-        Источник: отдаёт N элементов батчами (с shard_id), чтобы воркер делал upsert_partial.
+        Источник: отдаёт N элементов батчами (с batch_uid), чтобы воркер делал upsert_partial.
         В финале — mark_complete с общим счётчиком.
         """
         role = "src"
@@ -331,7 +331,7 @@ def handlers(env_and_imports):
             shard = 0
             for i in range(0, total, bs):
                 part = items[i:i+bs]
-                yield wu.Batch(shard_id=f"s-{shard}", payload={"items": part})
+                yield wu.Batch(batch_uid=f"s-{shard}", payload={"items": part})
                 shard += 1
         async def process_batch(self, batch, ctx):
             lst = batch.payload["items"]
@@ -351,7 +351,7 @@ def handlers(env_and_imports):
             self._seen = 0
             return {"input_inline": inline or {}}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id=None, payload={"bootstrap": True})
+            yield wu.Batch(batch_uid=None, payload={"bootstrap": True})
         async def process_batch(self, batch, ctx):
             items = batch.payload.get("items", [])
             self._seen += len(items)
@@ -363,14 +363,14 @@ def handlers(env_and_imports):
         role = "A"
         async def load_input(self, ref, inline): return inline or {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id="a0", payload={"items": ["a1", "a2"]})
+            yield wu.Batch(batch_uid="a0", payload={"items": ["a1", "a2"]})
         async def process_batch(self, batch, ctx):
             return wu.BatchResult(success=True, metrics={"items": batch.payload["items"]})
     class BHandler(wu.RoleHandler):
         role = "B"
         async def load_input(self, ref, inline): return inline or {}
         async def iter_batches(self, loaded):
-            yield wu.Batch(shard_id="b0", payload={"items": ["b1"]})
+            yield wu.Batch(batch_uid="b0", payload={"items": ["b1"]})
         async def process_batch(self, batch, ctx):
             return wu.BatchResult(success=True, metrics={"items": batch.payload["items"]})
 
@@ -430,7 +430,7 @@ def graph_merge_generic() -> Dict[str, Any]:
 @pytest.mark.asyncio
 async def test_partial_shards_and_finalize_stream_read_all(env_and_imports, inmemory_db, coordinator, workers):
     """
-    Источник w1 (src) выдаёт батчи с shard_id → воркер делает upsert_partial.
+    Источник w1 (src) выдаёт батчи с batch_uid → воркер делает upsert_partial.
     В финале — mark_complete. Коллектор w2 читает через pull.from_artifacts.rechunk:size и
     пишет в свой complete-артефакт total_received.
 

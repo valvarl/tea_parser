@@ -689,8 +689,8 @@ class Worker:
                                         "lease_id": lease_id, "lease_deadline_ts": lease_deadline})
             await self._send_status(role, acc_env)
 
-            # Pause all cmd-consumers to keep single-concurrency strict
-            await self._pause_all_cmd_consumers()
+            # Pause other roles, но НЕ текущую — чтобы CANCEL доходил сразу
+            await self._pause_all_cmd_consumers(except_role=role)
 
             # Start heartbeat + run loop
             self._spawn(self._heartbeat_loop(role))
@@ -707,8 +707,11 @@ class Worker:
             await self.state.write_active(self.active)
         await consumer.commit()
 
-    async def _pause_all_cmd_consumers(self) -> None:
+    async def _pause_all_cmd_consumers(self, except_role: str | None = None) -> None:
         for role, c in self._cmd_consumers.items():
+            if except_role and role == except_role:
+                # оставляем consumer текущей роли активным, чтобы принимать TASK_CANCEL
+                continue
             parts = c.assignment()
             if parts:
                 c.pause(*parts)

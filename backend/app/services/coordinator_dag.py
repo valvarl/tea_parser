@@ -1133,6 +1133,47 @@ class Coordinator:
         async for _ in cur:
             pass  # scheduler will adopt/start as needed
 
+    # ── Public API: cancel whole task ───────────────────────────────────
+    async def cancel_task(self, task_id: str, *, reason: str = "user_request") -> bool:
+        """
+        Каскадная отмена всех активных/ожидающих узлов задачи + мягкое завершение самой задачи.
+        Возвращает False, если задачи нет.
+        """
+        doc = await db.tasks.find_one({"id": task_id}, {"id": 1, "graph": 1, "status": 1})
+        if not doc:
+            return False
+
+        # пометим в координаторской области факт отмены
+        try:
+            await db.tasks.update_one(
+                {"id": task_id},
+                {"$set": {
+                    "coordinator.cancelled": True,
+                    "coordinator.cancel_reason": reason,
+                    "coordinator.cancelled_at": now_dt(),
+                }}
+            )
+        except Exception:
+            pass
+
+        # разошлём CANCEL по всем релевантным узлам
+        await self._cascade_cancel(task_id, reason=reason)
+
+        # мягко «закроем» задачу, если все узлы уже не running
+        try:
+            fresh = await db.tasks.find_one({"id": task_id}, {"graph": 1, "status": 1})
+            nodes = (fresh or {}).get("graph", {}).get("nodes") or []
+            if nodes and all(self._to_runstate(n.get("status")) in (
+                RunState.finished, RunState.deferred, RunState.failed, RunState.cancelling
+            ) for n in nodes):
+                await db.tasks.update_one(
+                    {"id": task_id},
+                    {"$set": {"status": RunState.finished, "finished_at": now_dt()}}
+                )
+        except Exception:
+            pass
+        return True
+
     # ── Indexes ─────────────────────────────────────────────────────────
     async def _ensure_indexes(self) -> None:
         try:

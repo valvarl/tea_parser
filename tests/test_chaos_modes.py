@@ -94,7 +94,7 @@ def handlers(env_and_imports, chaos):
             skus  = [f"sku-{i}" for i in range(total)]
             shard = 0
             for i in range(0, total, bs):
-                yield wu.Batch(shard_id=f"w1-{shard}", payload={"skus": skus[i:i+bs]})
+                yield wu.Batch(batch_uid=f"w1-{shard}", payload={"skus": skus[i:i+bs]})
                 shard += 1
         async def process_batch(self, batch, ctx):
             await chaos.handler_delay()
@@ -103,7 +103,7 @@ def handlers(env_and_imports, chaos):
     class Enricher(wu.RoleHandler):
         role = "enricher"
         async def load_input(self, ref, inline): return {"input_inline": inline or {}}
-        async def iter_batches(self, loaded): yield wu.Batch(shard_id=None, payload={"bootstrap": True})
+        async def iter_batches(self, loaded): yield wu.Batch(batch_uid=None, payload={"bootstrap": True})
         async def process_batch(self, batch, ctx):
             await chaos.handler_delay()
             items = batch.payload.get("items") or []
@@ -117,7 +117,7 @@ def handlers(env_and_imports, chaos):
     class OCR(wu.RoleHandler):
         role = "ocr"
         async def load_input(self, ref, inline): return {"input_inline": inline or {}}
-        async def iter_batches(self, loaded): yield wu.Batch(shard_id=None, payload={"bootstrap": True})
+        async def iter_batches(self, loaded): yield wu.Batch(batch_uid=None, payload={"bootstrap": True})
         async def process_batch(self, batch, ctx):
             await chaos.handler_delay()
             items = batch.payload.get("items") or []
@@ -128,7 +128,7 @@ def handlers(env_and_imports, chaos):
     class Analyzer(wu.RoleHandler):
         role = "analyzer"
         async def load_input(self, ref, inline): return {"input_inline": inline or {}}
-        async def iter_batches(self, loaded): yield wu.Batch(shard_id=None, payload={"bootstrap": True})
+        async def iter_batches(self, loaded): yield wu.Batch(batch_uid=None, payload={"bootstrap": True})
         async def process_batch(self, batch, ctx):
             await chaos.handler_delay()
             items = batch.payload.get("items") or []
